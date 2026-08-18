@@ -1,19 +1,26 @@
 # dsh-subagent-codebuddy
 
-把腾讯 CodeBuddy Code CLI 接入 dsh 作为 **ACP 子代理提供方**：主代理委派时，插件 spawn 一个 `codebuddy --acp` 子进程，按 [Agent Client Protocol](https://agentclientprotocol.com) 驱动它独立完成任务并把结果回传。
+把腾讯 CodeBuddy Code CLI 接入 dsh 作为**子代理提供方**（LLM 适配器架构，对齐 dsh-llm-agy）：
+
+```
+tool-subagent(provider: spawn, backgroundMode: continuable)
+  └─ 子代理 = dsh 进程内 child agent(会话可常驻,send_message 可续聊)
+       └─ 每次 LLM 调用 → CodebuddyLlmAdapter → spawn `codebuddy -p --output-format stream-json`
+            └─ 翻译文本与工具步骤(tool/call + tool/result)回 dsh 会话
+```
 
 ## 能力与边界
 
 | dsh 提供 | 子代理（CodeBuddy）自己拥有 |
 |---|---|
-| 委派 prompt、工作区 cwd（`inheritsParentContext: false`） | 系统提示词、工具面、模型、权限模型 |
-| 子进程环境（凭据 scrub + 显式 env）、权限自动应答、生命周期销毁 | ACP 服务端完整运行时 |
+| 子代理会话生命周期（continuable、`send_message` 续聊、并行互不干扰） | 系统提示词、工具面、模型、权限执行 |
+| 每次调用把该子代理自己的完整历史序列化进 prompt（上下文由 dsh 管理，不依赖 CodeBuddy 存储） | CodeBuddy 进程内自主执行工具 |
 
-子代理是独立运行时：**不使用 dsh 的系统提示词与工具**。dsh 负责编排、持久化与进程生命周期。
+**与"ACP 直接子代理"方案的区别**：子代理是 dsh 进程内 agent——每个子代理是独立会话，**可并行创建、可分别续聊**；上下文连续性由 dsh 子代理会话管理，不存在 CodeBuddy 按 cwd 自动续上下文造成的跨任务串味（实测 `codebuddy --acp` 会按工作目录自动续上一会话，参数无法隔离，故本插件不走 ACP）。
 
 ## 安装（发布后）
 
-插件的 `cordis.patch.yml` 是**模板**（默认不自动插入，避免与 profile 配置重复冲突）。安装后在 profile 的 `cordis.patch.yml` 加入：
+插件的 `cordis.patch.yml` 是**空 patch（模板注释）**——安装后在 profile 的 `cordis.patch.yml` 加入：
 
 ```yaml
 - insert:
@@ -21,14 +28,11 @@
       name: '@dsh-external/dsh-subagent-codebuddy'
       config:
         command: codebuddy
-        args: ['--acp']
+        model: deepseek-v4-flash
+        permissionMode: bypassPermissions
         providerName: codebuddy
         toolName: subagent_codebuddy
-        model: deepseek-v4-flash
-        permission: allow
 ```
-
-或参考 `cordis.patch.yml` 内的注释模板。
 
 ## 本地试跑（link 方式）
 
@@ -36,7 +40,7 @@
 2. 在 profile 目录（如 `~/.dsh/profiles/web`）：
    - `package.json` 的 `dependencies` 加 `"@dsh-external/dsh-subagent-codebuddy": "link:<本插件绝对路径>"`
    - `dsh.profile.bundles` 数组加 `"@dsh-external/dsh-subagent-codebuddy"`
-   - `cordis.patch.yml` 加入上面的配置行模板
+   - `cordis.patch.yml` 加入上面的配置行
 3. `pnpm install`
 4. 重启 dsh web，重开会话后工具列表出现 `subagent_codebuddy`
 
@@ -44,30 +48,16 @@
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `command` | `codebuddy` | 可执行文件 |
-| `args` | `['--acp']` | 启动参数（ACP 模式） |
-| `model` | `deepseek-v4-flash` | CodeBuddy 模型 ID，追加 `--model <id>` |
-| `providerName` | `codebuddy` | ctx.subagents 提供方名 |
+| `command` | `codebuddy` | 可执行文件（Windows 自动解析 npm cmd-shim → `node <真实CLI>`） |
+| `model` | `deepseek-v4-flash` | CodeBuddy 模型 ID（`--model <id>`） |
+| `permissionMode` | `bypassPermissions` | `--permission-mode`：子代理工具调用自动放行 |
+| `extraArgs` | `[]` | 追加的 CodeBuddy 参数 |
+| `providerName` | `codebuddy` | LLM provider 路由名 |
 | `toolName` | `subagent_codebuddy` | 模型可见工具名 |
-| `permission` | `reject` | 子代理权限请求自动应答：`allow` / `reject` |
-| `cwd` | 父会话 cwd | 子进程工作目录覆盖 |
-| `env` | `{}` | 显式子进程环境（叠加在 scrub 后的父环境上） |
-
-```yaml
-- id: subagent-codebuddy
-  name: '@dsh-external/dsh-subagent-codebuddy'
-  config:
-    command: codebuddy
-    args: ['--acp']
-    model: custom-local:gpt-5.6-luna
-    permission: allow
-```
-
-需要多模型并存时,注册多个提供方实例(不同 `providerName`/`toolName`/`model`),
-主代理按工具名选择委派目标。
+| `registerSubagentTools` | `true` | 是否注册委派工具 |
 
 ## 注意
 
 - 需要 CodeBuddy 已登录（子进程继承登录态）。
-- 子代理深度上限由 CodeBuddy 自己管理（`maxDepth: provider-managed`）。
-- 该插件只做 ACP 桥接；CodeBuddy 的模型、网络与配额由 CodeBuddy 侧负责。
+- 子代理权限模式默认 `bypassPermissions`（全自动），如要更保守可改 `acceptEdits` 或 `plan`。
+- 本插件只做 LLM 适配桥接；CodeBuddy 的模型、网络与配额由 CodeBuddy 侧负责。
