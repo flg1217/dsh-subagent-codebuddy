@@ -21,11 +21,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
-import * as toolSubagentPlugin from '@deepseek-ai/dsh-tool-subagent'
 import { CodebuddyLlmAdapter } from './adapter.js'
+import { registerSubagentTool } from './subagent-tool.js'
 
 export const name = 'subagent-codebuddy'
-export const inject = ['llm']
+export const inject = ['llm', 'tools', 'subagents', 'systemPrompt']
 
 export interface Config {
   /** 可执行文件,默认 `codebuddy`。 */
@@ -111,14 +111,28 @@ export function apply(ctx: Context, config: Config): void {
   }))
 
   // 2. 委派工具:spawn 子代理(进程内、continuable 可续聊),模型路由指
-  //    向 codebuddy provider。挂载整个插件模块对象(带 inject),只传
-  //    apply 会丢失注入声明,fiber 加载即失败。
+  //    向 codebuddy provider。自定义注册以在工具描述里内置"完整上下文"
+  //    指引(子代理看不到当前会话、无法追问,委派必须自带全部上下文)。
   if (config.registerSubagentTools !== false) {
-    ctx.plugin(toolSubagentPlugin, {
+    registerSubagentTool(ctx, {
       provider: 'spawn',
       toolName,
-      backgroundMode: 'continuable',
       agentOptions: { provider: providerName, model },
+      description:
+        'Delegate a self-contained task to a CodeBuddy subagent (a separate process running Tencent CodeBuddy with its own tools) '
+        + 'to offload focused, independent work — research, a scoped implementation, an analysis — so it does not consume '
+        + 'this conversation\'s context. The subagent returns its result, not its intermediate steps.\n\n'
+        + 'Provide COMPLETE context for every delegation — the subagent does not see this conversation and cannot ask '
+        + 'follow-up questions: (1) the goal and acceptance criteria; (2) exact file/directory paths to touch or inspect; '
+        + '(3) constraints and boundaries (what NOT to do, what to preserve); (4) the expected output format. Split complex '
+        + 'tasks into independent subagents and run them in parallel. '
+        + 'This tool runs in the background by default: it immediately returns a durable subagent id and keeps the child '
+        + 'conversation available for later turns; when the run settles, the runtime sends you a notice containing its '
+        + 'outcome and any final assistant message. Set `run_in_background: false` only when your next action depends on '
+        + 'receiving the result; `send_message` starts a later turn in the same child conversation.',
+      promptDescription:
+        'The complete, self-contained task for the subagent. It does not share this conversation\'s context, so include '
+        + 'everything it needs: the goal, acceptance criteria, exact file paths, constraints, and the expected output format.',
     })
   }
 }
