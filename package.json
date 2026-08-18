@@ -1,0 +1,52 @@
+{
+  "name": "@dsh-external/dsh-subagent-codebuddy",
+  "version": "0.1.0",
+  "description": "CodeBuddy CLI (Tencent) as a dsh subagent provider via ACP: registers the `codebuddy` subagent provider and the `subagent_codebuddy` tool. The child runs CodeBuddy's own runtime (its prompt, tools, model) in a fresh subprocess driven over the Agent Client Protocol.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-subagent-acp": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tool-subagent": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.0.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^22.0.0",
+    "typescript": "~5.7.2"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/flg1217/dsh-subagent-codebuddy.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "codebuddy",
+    "acp",
+    "agent-client-protocol",
+    "plugin"
+  ]
+}
