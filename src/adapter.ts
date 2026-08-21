@@ -70,7 +70,9 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
   }
 
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const { command, prefixArgs, model, permissionMode } = this.options
+    const { command, prefixArgs, permissionMode } = this.options
+    // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到配置值。
+    const model = options.model ?? this.options.model
     const { prompt, cleanup } = await buildPrompt(this.ctx, options)
 
     // 工作目录对齐子代理会话的工作区,保证文件操作发生在正确目录。

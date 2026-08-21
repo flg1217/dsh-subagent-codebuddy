@@ -23,6 +23,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
 import { CodebuddyLlmAdapter } from './adapter.js'
 import { registerSubagentTool } from './subagent-tool.js'
+import { registerCodebuddyModelsTool } from './models.js'
 
 export const name = 'subagent-codebuddy'
 export const inject = ['llm', 'tools', 'subagents', 'systemPrompt']
@@ -126,6 +127,8 @@ export function apply(ctx: Context, config: Config): void {
         + 'follow-up questions: (1) the goal and acceptance criteria; (2) exact file/directory paths to touch or inspect; '
         + '(3) constraints and boundaries (what NOT to do, what to preserve); (4) the expected output format. Split complex '
         + 'tasks into independent subagents and run them in parallel. '
+        + 'Optionally pass a `model` argument with an exact model id (query `list_codebuddy_models` for the '
+        + 'currently supported ids); omit it to use the plugin-configured default model. '
         + 'This tool runs in the background by default: it immediately returns a durable subagent id and keeps the child '
         + 'conversation available for later turns; when the run settles, the runtime sends you a notice containing its '
         + 'outcome and any final assistant message. Set `run_in_background: false` only when your next action depends on '
@@ -133,6 +136,12 @@ export function apply(ctx: Context, config: Config): void {
       promptDescription:
         'The complete, self-contained task for the subagent. It does not share this conversation\'s context, so include '
         + 'everything it needs: the goal, acceptance criteria, exact file paths, constraints, and the expected output format.',
+    })
+    // 模型查询工具:委派前可先确认当前支持的模型 id。
+    registerCodebuddyModelsTool(ctx, {
+      command: resolved.command,
+      prefixArgs: resolved.args,
+      toolName: 'list_codebuddy_models',
     })
   }
 }

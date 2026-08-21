@@ -66,7 +66,12 @@ dsh plugin --profile web add https://github.com/flg1217/dsh-subagent-codebuddy
         toolName: subagent_codebuddy
 ```
 
-完成后重启 dsh web，重开会话，工具列表出现 `subagent_codebuddy`。
+完成后重启 dsh web，重开会话，工具列表出现 `subagent_codebuddy` 与 `list_codebuddy_models`。
+
+### 动态模型选择
+
+- `subagent_codebuddy` 接受可选参数 `model`：主代理可传入模型 id 覆盖插件默认模型（不传则用配置的 `model`）。
+- `list_codebuddy_models` 从 `codebuddy --help` 实时解析当前支持的模型 id 列表，主代理可先查询再传入准确 id。
 
 ### 配置项
 
@@ -82,8 +87,9 @@ dsh plugin --profile web add https://github.com/flg1217/dsh-subagent-codebuddy
 
 ## 四、典型用法
 
-- **委派设计任务**：主代理把前端/UI 任务委派给 `subagent_codebuddy`（continuable，可复用作图长线会话）。
+- **委派设计任务**：主代理把前端/UI 任务委派给 `subagent_codebuddy`（continuable，可复用作图长线会话），可用 `model` 参数动态指定模型。
 - **并行调研**：拆分独立任务到多个 CodeBuddy 子代理并行执行，结果互不干扰。
+- **模型选择**：委派前先调 `list_codebuddy_models` 查询当前支持的模型 id，再以 `model` 参数传入。
 - **保守权限**：默认 `bypassPermissions` 全自动；如要更保守，改 `acceptEdits` 或 `plan`。
 
 ## 五、工作原理
