@@ -11,8 +11,8 @@ import type { ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import type { Context } from '@deepseek-ai/cordis'
-import { CallId, LlmAdapter, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { CallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { buildPrompt } from './serialize.js'
 import { CodebuddyTranslator } from './translate.js'
 
@@ -106,6 +106,25 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       const turn = ([...events].reverse().find(e => e.type === 'turn/start')?.data.turn ?? 1) as number
       const step = ([...events].reverse().find(e => e.type === 'step/start')?.data.step ?? 1) as number
       const toolCallSeqs = new Map<string, number>()
+      // 消息落地:CodeBuddy 一次进程输出多轮(文本→工具→文本→工具),
+      // 若把文本 chunk 交给 agent-loop,它会把整个 stream 的文本聚合为
+      // 一条消息堆在末尾(工具事件之后),显示顺序错乱。因此适配器
+      // 自己按到达顺序落地 assistant/message:工具调用前 flush 已累积文本。
+      let pendingBlocks: ContentBlock[] = []
+      let pendingSeqs: number[] = []
+      const flushText = (): void => {
+        if (session === undefined || pendingBlocks.length === 0) return
+        session.append('assistant/message', {
+          turn,
+          step,
+          message: createAssistantMessage({
+            content: pendingBlocks,
+            source: { provider: options.provider ?? 'codebuddy', model },
+          }),
+        }, { surfaceOp: 'append', sourceEventSeqs: pendingSeqs })
+        pendingBlocks = []
+        pendingSeqs = []
+      }
 
       const translator = new CodebuddyTranslator()
       try {
@@ -117,10 +136,25 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             break
           }
           const { chunks, toolSteps } = translator.push(line)
-          for (const chunk of chunks) yield chunk
+          for (const chunk of chunks) {
+            if (chunk.type === 'block-start' || chunk.type === 'text-delta' || chunk.type === 'block-end') {
+              // 文本类 chunk:落地为 assistant/chunk(供 token meter 与流式 UI),
+              // 累积成块后在工具调用前 flush 为 assistant/message。
+              if (session !== undefined) {
+                pendingSeqs.push(session.append('assistant/chunk', { turn, step, chunk }).seq)
+              }
+              if (chunk.type === 'block-end') {
+                pendingBlocks.push(chunk.block)
+              }
+              continue
+            }
+            yield chunk
+          }
           for (const stepEvent of toolSteps) {
             if (session === undefined) continue
             if (stepEvent.kind === 'tool/call') {
+              // 工具调用前先落地已累积文本,保证"文本→工具"顺序。
+              flushText()
               const ev = session.append('tool/call', {
                 turn,
                 step,
@@ -151,6 +185,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       }
 
       await closeWithTimeout(proc, options.signal)
+      flushText()
       for (const chunk of translator.end()) yield chunk
     } finally {
       await cleanup()
