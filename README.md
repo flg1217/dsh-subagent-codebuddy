@@ -52,18 +52,12 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 dsh plugin --profile web add https://github.com/flg1217/dsh-subagent-codebuddy
 ```
 
-无论哪种方式，安装后都要在 profile 的 `cordis.patch.yml` 加入插件行：
+插件行由插件自带的 `cordis.patch.yml`(bundle patch)自动注入,默认配置开箱即用。需要覆盖默认值时,在 profile 的 `cordis.patch.yml` 用同 id 覆盖即可:
 
 ```yaml
-- insert:
-    - id: subagent-codebuddy
-      name: '@flg1217/dsh-subagent-codebuddy'
-      config:
-        command: codebuddy
-        model: deepseek-v4-flash
-        permissionMode: bypassPermissions
-        providerName: codebuddy
-        toolName: subagent_codebuddy
+- id: subagent-codebuddy
+  config:
+    model: <其他模型>   # 默认 deepseek-v4-flash
 ```
 
 完成后重启 dsh web，重开会话，工具列表出现 `subagent_codebuddy` 与 `list_codebuddy_models`。

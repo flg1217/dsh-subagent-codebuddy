@@ -7,6 +7,8 @@
  * @module subagent-codebuddy/models
  */
 import type { Context } from '@deepseek-ai/cordis';
+/** 解析 CodeBuddy CLI 的 `--help` 输出,返回支持的模型 id 列表(空 = 解析失败)。 */
+export declare function listCodebuddyModelIds(command: string, prefixArgs: string[]): string[];
 /** 解析 CodeBuddy CLI 的 `--help` 输出,返回当前支持的模型 id 列表文本。 */
 export declare function listCodebuddyModels(command: string, prefixArgs: string[]): string;
 /** 注册模型查询工具(与 subagent_codebuddy 配套)。 */

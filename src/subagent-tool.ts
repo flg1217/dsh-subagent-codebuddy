@@ -70,8 +70,11 @@ export interface SubagentToolOptions {
   provider: string
   /** 模型可见工具名。 */
   toolName: string
-  /** 子代理的模型路由(provider + model)。 */
-  agentOptions: { provider: string; model: string }
+  /**
+   * 子代理的模型路由(provider + model)。
+   * 调用时求值:默认模型改自设置面板后,对新委派实时生效。
+   */
+  agentOptions: () => { provider: string; model: string }
   /** 工具描述(模型可见),已含完整上下文指引。 */
   description: string
   /** prompt 参数描述。 */
@@ -80,7 +83,7 @@ export interface SubagentToolOptions {
 
 /** 注册自定义子代理委派工具(continuable,后台优先)。 */
 export function registerSubagentTool(ctx: Context, options: SubagentToolOptions): void {
-  const { provider, toolName, agentOptions } = options
+  const { provider, toolName } = options
   ctx.tools.register(defineTool({
     name: toolName,
     description: options.description,
@@ -144,8 +147,8 @@ export function registerSubagentTool(ctx: Context, options: SubagentToolOptions)
         prompt: [{ type: 'text', text: args.prompt }] as ContentBlock[],
         parent,
         agentOptions: args.model !== undefined && args.model.length > 0
-          ? { ...agentOptions, model: args.model }
-          : agentOptions,
+          ? { ...options.agentOptions(), model: args.model }
+          : options.agentOptions(),
       }
       if (args.run_in_background !== false) {
         const started = await ctx.subagents.startContinuable({

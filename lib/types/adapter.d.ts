@@ -14,8 +14,8 @@ export interface CodebuddyAdapterOptions {
     command: string;
     /** 前置参数(如解析出的 CLI 路径)。 */
     prefixArgs: string[];
-    /** 传给 `--model` 的模型 ID。 */
-    model: string;
+    /** 读取当前默认模型(调用时求值,设置面板改默认模型后对新请求实时生效)。 */
+    modelOf: () => string;
     /** 传给 `--permission-mode` 的权限模式。 */
     permissionMode: string;
     /** 追加的额外 CodeBuddy 参数。 */

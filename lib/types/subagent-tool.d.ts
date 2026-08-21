@@ -13,8 +13,11 @@ export interface SubagentToolOptions {
     provider: string;
     /** 模型可见工具名。 */
     toolName: string;
-    /** 子代理的模型路由(provider + model)。 */
-    agentOptions: {
+    /**
+     * 子代理的模型路由(provider + model)。
+     * 调用时求值:默认模型改自设置面板后,对新委派实时生效。
+     */
+    agentOptions: () => {
         provider: string;
         model: string;
     };

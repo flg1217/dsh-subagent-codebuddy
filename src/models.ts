@@ -14,8 +14,8 @@ import { spawnSync } from 'node:child_process'
 /** 匹配 `--model` 帮助文本里的支持列表,如 "Currently supported: (a, b, c)"。 */
 const SUPPORTED_MODELS_RE = /Currently supported:\s*\(([^)]+)\)/
 
-/** 解析 CodeBuddy CLI 的 `--help` 输出,返回当前支持的模型 id 列表文本。 */
-export function listCodebuddyModels(command: string, prefixArgs: string[]): string {
+/** 解析 CodeBuddy CLI 的 `--help` 输出,返回支持的模型 id 列表(空 = 解析失败)。 */
+export function listCodebuddyModelIds(command: string, prefixArgs: string[]): string[] {
   const r = spawnSync(command, [...prefixArgs, '--help'], {
     encoding: 'utf8',
     timeout: 15_000,
@@ -23,13 +23,22 @@ export function listCodebuddyModels(command: string, prefixArgs: string[]): stri
   })
   const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`
   const m = SUPPORTED_MODELS_RE.exec(text)
-  if (m === null) {
-    const tail = text.trim().split('\n').slice(-3).join('\n')
-    return `Could not parse supported models from \`${command} --help\` (exit ${r.status ?? '?'}). Raw output tail:\n${tail}`
-  }
-  const ids = m[1].split(',').map(s => s.trim()).filter(s => s.length > 0)
-  if (ids.length === 0) return 'The CodeBuddy CLI listed no supported models.'
-  return ids.map(id => `- ${id}`).join('\n')
+  if (m === null) return []
+  return m[1].split(',').map(s => s.trim()).filter(s => s.length > 0)
+}
+
+/** 解析 CodeBuddy CLI 的 `--help` 输出,返回当前支持的模型 id 列表文本。 */
+export function listCodebuddyModels(command: string, prefixArgs: string[]): string {
+  const ids = listCodebuddyModelIds(command, prefixArgs)
+  if (ids.length > 0) return ids.map(id => `- ${id}`).join('\n')
+  const r = spawnSync(command, [...prefixArgs, '--help'], {
+    encoding: 'utf8',
+    timeout: 15_000,
+    windowsHide: true,
+  })
+  const text = `${r.stdout ?? ''}\n${r.stderr ?? ''}`
+  const tail = text.trim().split('\n').slice(-3).join('\n')
+  return `Could not parse supported models from \`${command} --help\` (exit ${r.status ?? '?'}). Raw output tail:\n${tail}`
 }
 
 /** 注册模型查询工具(与 subagent_codebuddy 配套)。 */

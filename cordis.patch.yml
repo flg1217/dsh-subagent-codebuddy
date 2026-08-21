@@ -1,17 +1,18 @@
-# @flg1217/dsh-subagent-codebuddy bundle patch: EMPTY BY DESIGN.
+# @flg1217/dsh-subagent-codebuddy bundle patch: inserts the subagent-codebuddy
+# plugin row with shipped defaults. Applied automatically when the profile
+# loads this bundle; override any field from the profile patch layer.
 #
-# 该 patch 不插入任何行——安装后在 profile 的 cordis.patch.yml 中
-# 添加配置行(单一配置源,避免 duplicate loader entry id 冲突)。
-# 参考模板:
-#
-# - insert:
-#     - id: subagent-codebuddy
-#       name: '@flg1217/dsh-subagent-codebuddy'
-#       config:
-#         command: codebuddy
-#         args: ['--acp']
-#         providerName: codebuddy
-#         toolName: subagent_codebuddy
-#         model: deepseek-v4-flash
-#         permission: allow
-[]
+# 默认值随插件发布,安装即用。需要改默认模型/权限时,在 profile 的
+# cordis.patch.yml 里用同 id 覆盖 config 字段即可:
+#   - id: subagent-codebuddy
+#     config:
+#       model: <其他模型>
+- insert:
+    - id: subagent-codebuddy
+      name: '@flg1217/dsh-subagent-codebuddy'
+      config:
+        command: codebuddy
+        model: deepseek-v4-flash
+        permissionMode: bypassPermissions
+        providerName: codebuddy
+        toolName: subagent_codebuddy

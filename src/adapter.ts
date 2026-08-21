@@ -22,8 +22,8 @@ export interface CodebuddyAdapterOptions {
   command: string
   /** 前置参数(如解析出的 CLI 路径)。 */
   prefixArgs: string[]
-  /** 传给 `--model` 的模型 ID。 */
-  model: string
+  /** 读取当前默认模型(调用时求值,设置面板改默认模型后对新请求实时生效)。 */
+  modelOf: () => string
   /** 传给 `--permission-mode` 的权限模式。 */
   permissionMode: string
   /** 追加的额外 CodeBuddy 参数。 */
@@ -71,8 +71,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
 
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const { command, prefixArgs, permissionMode } = this.options
-    // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到配置值。
-    const model = options.model ?? this.options.model
+    // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
+    const model = options.model ?? this.options.modelOf()
     const { prompt, cleanup } = await buildPrompt(this.ctx, options)
 
     // 工作目录对齐子代理会话的工作区,保证文件操作发生在正确目录。
