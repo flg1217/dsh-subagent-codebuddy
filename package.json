@@ -1,5 +1,5 @@
 {
-  "name": "@dsh-external/dsh-subagent-codebuddy",
+  "name": "@flg1217/dsh-subagent-codebuddy",
   "version": "0.1.0",
   "description": "CodeBuddy CLI (Tencent) as a dsh subagent provider via ACP: registers the `codebuddy` subagent provider and the `subagent_codebuddy` tool. The child runs CodeBuddy's own runtime (its prompt, tools, model) in a fresh subprocess driven over the Agent Client Protocol.",
   "type": "module",
@@ -47,6 +47,7 @@
   },
   "keywords": [
     "dsh",
+    "dsh-plugin",
     "deepseek-harness",
     "codebuddy",
     "acp",

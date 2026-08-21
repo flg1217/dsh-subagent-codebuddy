@@ -34,8 +34,8 @@ prompt 超过阈值（26K 字符）自动写入临时任务文件，命令行只
 
 ### 系统要求
 
-- dsh `>= 0.1.0-rc.6`
-- CodeBuddy CLI 已安装并登录（子进程继承登录态）
+- dsh `>= 0.1.0-rc.6`(兼容性验证日期:2026-08-21,验证于 dsh rc.8)
+- CodeBuddy CLI 已安装并登录(子进程继承登录态)
 
 ### 安装插件
 
@@ -57,7 +57,7 @@ dsh plugin --profile web add https://github.com/flg1217/dsh-subagent-codebuddy
 ```yaml
 - insert:
     - id: subagent-codebuddy
-      name: '@dsh-external/dsh-subagent-codebuddy'
+      name: '@flg1217/dsh-subagent-codebuddy'
       config:
         command: codebuddy
         model: deepseek-v4-flash
@@ -67,6 +67,17 @@ dsh plugin --profile web add https://github.com/flg1217/dsh-subagent-codebuddy
 ```
 
 完成后重启 dsh web，重开会话，工具列表出现 `subagent_codebuddy` 与 `list_codebuddy_models`。
+
+### 卸载插件
+
+```bash
+dsh plugin --profile web remove @flg1217/dsh-subagent-codebuddy
+```
+
+如残留，手工清理：移除 profile（`~/.dsh/profiles/web`）的 `cordis.patch.yml` 中
+`subagent-codebuddy` 的 `- insert` 块，以及 `package.json` dependencies 中对应的
+`@flg1217/dsh-subagent-codebuddy` 行。卸载后重启 dsh web 即完全移除
+（CodeBuddy CLI 本身不受影响）。
 
 ### 动态模型选择
 

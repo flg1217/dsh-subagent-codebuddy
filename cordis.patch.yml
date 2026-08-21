@@ -1,4 +1,4 @@
-# @dsh-external/dsh-subagent-codebuddy bundle patch: EMPTY BY DESIGN.
+# @flg1217/dsh-subagent-codebuddy bundle patch: EMPTY BY DESIGN.
 #
 # 该 patch 不插入任何行——安装后在 profile 的 cordis.patch.yml 中
 # 添加配置行(单一配置源,避免 duplicate loader entry id 冲突)。
@@ -6,7 +6,7 @@
 #
 # - insert:
 #     - id: subagent-codebuddy
-#       name: '@dsh-external/dsh-subagent-codebuddy'
+#       name: '@flg1217/dsh-subagent-codebuddy'
 #       config:
 #         command: codebuddy
 #         args: ['--acp']
