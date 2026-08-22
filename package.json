@@ -33,17 +33,13 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-subagent": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.0.0"
-  },
   "devDependencies": {
+    "@deepseek-ai/dsh-llm": "link:D:/Projects/DeepseekHarness/repo/packages/llm/llm",
+    "@deepseek-ai/dsh-settings": "link:D:/Projects/DeepseekHarness/repo/packages/settings/settings",
+    "@deepseek-ai/dsh-subagent": "link:D:/Projects/DeepseekHarness/repo/packages/subagent/subagent",
+    "@deepseek-ai/dsh-tools": "link:D:/Projects/DeepseekHarness/repo/packages/core/tools",
+    "@deepseek-ai/schemastery": "^3.0.0",
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6",
     "@types/node": "^22.0.0",
     "typescript": "~5.7.2",
     "vitest": "^3.0.5"
@@ -66,5 +62,12 @@
     "acp",
     "agent-client-protocol",
     "plugin"
-  ]
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-subagent": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "^3.0.0"
+  }
 }

@@ -69,6 +69,21 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     super()
   }
 
+  /**
+   * 绑定模型元数据与分发流入口(rc.2+ 的 LlmAdapter 接口)。
+   * 显式实现而非依赖基类:插件对宿主 dsh-llm 版本保持兼容
+   * (rc.6 宿主不调用此方法;rc.2+ 宿主调用本实现)。
+   */
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
+    model: LlmResolvedModelInfo
+    stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>
+  }> {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: (options) => this.stream(options),
+    }
+  }
+
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const { command, prefixArgs, permissionMode } = this.options
     // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
@@ -198,7 +213,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     }
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+  override resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
       provider,
       id: model,
