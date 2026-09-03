@@ -10,7 +10,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import type { Config } from './index.js';
 /** 模型探测通道的 settingsNs 键(客户端卡片与之对应)。 */
-export declare const CODEBUDDY_SETTINGS_NAMESPACE: never;
+export declare const CODEBUDDY_SETTINGS_NAMESPACE = "codebuddy";
 /** 设置表单 schema(与插件 Config 对齐;设置面板可编辑,重启后生效)。 */
 export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<{
     command: z<string, string>;
@@ -57,4 +57,4 @@ export declare function codebuddyTest(command: string, prefixArgs: string[]): Pr
  * 派发卡片(key = namespace);表单值优先于插件行配置,改动后重启生效。
  * @returns 读取当前生效配置的函数。
  */
-export declare function registerCodebuddySettings(ctx: Context, config: Config): Promise<() => EffectiveCodebuddySettings>;
+export declare function registerCodebuddySettings(ctx: Context, config: Config): () => EffectiveCodebuddySettings;

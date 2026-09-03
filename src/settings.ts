@@ -1,4 +1,3 @@
-// @ts-nocheck -- TODO(专门轮):适配官方 0.1.2 的设置注册新 API;当前仅运行时降级保活。
 /**
  * CodeBuddy 设置面板支持(服务端):
  * - 模型探测通道:客户端卡片按钮走 api.llm.discoverModels({
@@ -17,7 +16,7 @@ import { listCodebuddyModelIds } from './models.js'
 import type { Config } from './index.js'
 
 /** 模型探测通道的 settingsNs 键(客户端卡片与之对应)。 */
-export const CODEBUDDY_SETTINGS_NAMESPACE = 'codebuddy' as never
+export const CODEBUDDY_SETTINGS_NAMESPACE = 'codebuddy'
 
 /** 设置表单 schema(与插件 Config 对齐;设置面板可编辑,重启后生效)。 */
 export const CodebuddySettingsConfig = z.object({
@@ -128,18 +127,26 @@ export function codebuddyTest(command: string, prefixArgs: string[]): Promise<{ 
  * 派发卡片(key = namespace);表单值优先于插件行配置,改动后重启生效。
  * @returns 读取当前生效配置的函数。
  */
-export async function registerCodebuddySettings(ctx: Context, config: Config): Promise<() => EffectiveCodebuddySettings> {
+export function registerCodebuddySettings(ctx: Context, config: Config): () => EffectiveCodebuddySettings {
   let current: () => Record<string, unknown> = () => ({})
-  // TODO(专门轮):适配官方 0.1.2 设置注册新协议;暂动态探测旧 API,缺失则降级跳过。
-  try {
-    const { installSettingsSection } = await import('@deepseek-ai/dsh-settings') as { installSettingsSection?: (ctx: Context, ns: unknown, schema: unknown, defaults: unknown, hooks: unknown) => void }
-    if (installSettingsSection !== undefined) {
-  installSettingsSection(ctx, CODEBUDDY_SETTINGS_NAMESPACE, CodebuddySettingsConfig, {}, {
-    setSource: (source) => { current = source as () => Record<string, unknown> },
-    onChange: () => {},
+  // 官方 0.1.2:设置区经 ctx.settings.installSection 注册(NS 为普通字符串)。
+  ctx.inject(['settings'], (settingsCtx) => {
+    const settings = settingsCtx.get('settings') as {
+      installSection?: (
+        owner: Context,
+        ns: string,
+        schema: unknown,
+        entry: unknown,
+        hooks: { setSource?: (source: () => Record<string, unknown> | undefined) => void; onChange?: () => void },
+      ) => void
+    } | undefined
+    settings?.installSection?.(ctx, CODEBUDDY_SETTINGS_NAMESPACE, CodebuddySettingsConfig, {}, {
+      setSource: (source) => {
+        current = (() => source() ?? {}) as () => Record<string, unknown>
+      },
+      onChange: () => {},
     })
-    }
-  } catch { /* 新版无此 API,降级跳过 */ }
+  })
   const sectionOf = (): EffectiveCodebuddySettings => {
     const s = current() as Partial<EffectiveCodebuddySettings>
     return {

@@ -23,6 +23,7 @@ import { CodebuddyLlmAdapter } from './adapter.js'
 import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
 import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.js'
+import type {} from '@deepseek-ai/dsh-settings'
 
 export const name = 'subagent-codebuddy'
 export const inject = ['llm', 'tools', 'subagents', 'systemPrompt']
@@ -63,14 +64,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // 设置面板通道 + 设置区:卡片显示的前提(该页按 settings namespace 派发卡片);
   // 表单值优先于插件行配置,返回的 thunk 读取当前生效配置。
-  // TODO(专门轮):注册异步化(新版协议);注册完成前用 config 默认值。
-  let settingsReader: () => { command: string; model: string; permissionMode: string } = () => ({
-    command: config.command ?? 'codebuddy',
-    model: config.model ?? 'deepseek-v4-flash',
-    permissionMode: config.permissionMode ?? 'bypassPermissions',
-  })
-  void registerCodebuddySettings(ctx, config).then(reader => { settingsReader = reader as () => { command: string; model: string; permissionMode: string } })
-  const settingsOf = (): { command: string; model: string; permissionMode: string } => settingsReader()
+  const settingsOf = registerCodebuddySettings(ctx, config)
   const eff = settingsOf()
   const model = eff.model
   const resolved = resolveSpawnableCommand(eff.command)
