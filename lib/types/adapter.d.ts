@@ -33,6 +33,14 @@ export interface CodebuddyAdapterOptions {
 export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly ctx;
     private readonly options;
+    /**
+     * dsh 子代理会话 → CodeBuddy 会话 id。
+     *
+     * 首次调用用 `--session-id` 固定会话 id;之后同一子代理会话的每次
+     * stream 都用 `--resume` 续跑同一会话,这样 CodeBuddy 侧的上下文是连
+     * 续的,续聊时不必把整段历史重新塞进 prompt。
+     */
+    private readonly conversationIds;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);
     /**
      * 绑定模型元数据与分发流入口(rc.2+ 的 LlmAdapter 接口)。

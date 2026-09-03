@@ -16,6 +16,26 @@ import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk }
 import { buildPrompt } from './serialize.js'
 import { CodebuddyTranslator } from './translate.js'
 
+/** 续跑指令:会话上下文已在 CLI 侧,只需告知"接着做"。 */
+const CONTINUE_PROMPT = '继续完成之前未完成的任务。基于当前工作区状态继续,不要重复已完成的工作,只报告新做的内容。'
+
+/**
+ * 续跑时的增量 prompt。
+ *
+ * 会话历史已由 CodeBuddy 的会话存储持有(`--resume`),重复整段历史会
+ * 浪费上下文并让模型误以为要重做;因此只发最后一条用户消息(续聊的新
+ * 输入),没有就退回通用续跑指令。
+ */
+function resumePrompt(messages: readonly GenerateOptions['messages'][number][]): string {
+  const last = [...messages].reverse().find(message => message.role === 'user')
+  if (last === undefined) return CONTINUE_PROMPT
+  const text = last.content
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map(block => block.text)
+    .join('')
+  return text.trim().length > 0 ? text : CONTINUE_PROMPT
+}
+
 /** 适配器配置(由 index.ts 传入)。 */
 export interface CodebuddyAdapterOptions {
   /** 可 spawn 的可执行文件(Windows 下已解析为 node + CLI 路径)。 */
@@ -28,6 +48,8 @@ export interface CodebuddyAdapterOptions {
   permissionMode: string
   /** 追加的额外 CodeBuddy 参数。 */
   extraArgs: string[]
+  /** 空闲超时预算(可选,默认 180s);测试注入小值以便压缩时间。 */
+  timeouts?: { idleMs?: number }
 }
 
 /** 进程退出兜底:进程卡死时强制结束,保证 stream 一定结束。 */
@@ -62,6 +84,15 @@ async function closeWithTimeout(
  * 序列化进 prompt,不依赖 CodeBuddy 的会话存储。
  */
 export class CodebuddyLlmAdapter extends LlmAdapter {
+  /**
+   * dsh 子代理会话 → CodeBuddy 会话 id。
+   *
+   * 首次调用用 `--session-id` 固定会话 id;之后同一子代理会话的每次
+   * stream 都用 `--resume` 续跑同一会话,这样 CodeBuddy 侧的上下文是连
+   * 续的,续聊时不必把整段历史重新塞进 prompt。
+   */
+  private readonly conversationIds = new Map<string, string>()
+
   constructor(
     private readonly ctx: Context,
     private readonly options: CodebuddyAdapterOptions,
@@ -88,7 +119,23 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     const { command, prefixArgs, permissionMode } = this.options
     // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
     const model = options.model ?? this.options.modelOf()
-    const { prompt, cleanup } = await buildPrompt(this.ctx, options)
+    // 会话续跑:同一子代理会话复用同一个 CodeBuddy 会话 id。
+    // 首次用 --session-id 固定 id,之后用 --resume 续跑,CodeBuddy 侧的
+    // 上下文保持连续,续聊时不必把整段历史重新塞进 prompt。
+    const dshSessionId = options.sessionId
+    const existing = dshSessionId === undefined ? undefined : this.conversationIds.get(dshSessionId)
+    const isResume = existing !== undefined
+    const conversationId = existing ?? (dshSessionId === undefined ? undefined : `dsh-${dshSessionId}`)
+    if (conversationId !== undefined && dshSessionId !== undefined) {
+      this.conversationIds.set(dshSessionId, conversationId)
+    }
+    const sessionArgs = conversationId === undefined
+      ? []
+      : isResume ? ['--resume', conversationId] : ['--session-id', conversationId]
+    const serialized = isResume
+      ? { prompt: resumePrompt(options.messages), cleanup: async (): Promise<void> => {} }
+      : await buildPrompt(this.ctx, options)
+    const { prompt, cleanup } = serialized
 
     // 工作目录对齐子代理会话的工作区,保证文件操作发生在正确目录。
     const childSession = options.sessionId !== undefined ? this.ctx.get('sessions')?.get(options.sessionId) : undefined
@@ -97,6 +144,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     try {
       const proc: ChildProcess = spawn(command, [
         ...prefixArgs,
+        ...sessionArgs,
         '-p', prompt,
         '--output-format', 'stream-json',
         '--permission-mode', permissionMode,
@@ -119,7 +167,43 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       const session = options.sessionId !== undefined ? this.ctx.get('sessions')?.get(options.sessionId) : undefined
       const events = session?.events ?? []
       const turn = ([...events].reverse().find(e => e.type === 'turn/start')?.data.turn ?? 1) as number
-      const step = ([...events].reverse().find(e => e.type === 'step/start')?.data.step ?? 1) as number
+      let step = ([...events].reverse().find(e => e.type === 'step/start')?.data.step ?? 1) as number
+      // CodeBuddy 一次进程内要跑很多轮(文本→工具→文本→工具…),而 dsh 的
+      // assistant-step 节点是按 step 聚合的:全都塞进同一个 step 会让所有
+      // 文本聚成一个节点、所有 tool 节点被排到它前面,显示顺序与真实发生
+      // 顺序不符。这里每轮工具执行完就闭合当前 step、开启下一个,让每一
+      // 轮拿到自己的 step,从而与 tool 节点交错排序。
+      // 初始 step 由 agent-loop 开启,故起始为 open。
+      let stepOpen = true
+      // agent-loop 会在流结束后往**它自己的初始 step** 再 append 一条最终
+      // assistant/message。本适配器不 yield 文本给它(见流末说明),那条
+      // message 就是空的;但即便为空,它也会把初始 step 的 assistant-step
+      // 节点 anchorSeq 顶到最大、排到会话末尾。所以初始 step 整个让给
+      // agent-loop,本进程的各轮从下一个 step 开始记录。
+      let stepped = false
+      const openNextStep = (): void => {
+        step += 1
+        session?.append('step/start', { turn, step })
+        stepOpen = true
+      }
+      const ensureStep = (): void => {
+        if (session === undefined) return
+        if (!stepped) {
+          // 首次落地:闭合 agent-loop 的初始 step,再从下一个 step 开始。
+          // (初始 stepOpen 为 true,所以这一步必须放在 stepOpen 判断之前。)
+          stepped = true
+          closeStep()
+          openNextStep()
+          return
+        }
+        if (stepOpen) return
+        openNextStep()
+      }
+      const closeStep = (): void => {
+        if (!stepOpen || session === undefined) return
+        session.append('step/end', { turn, step })
+        stepOpen = false
+      }
       const toolCallSeqs = new Map<string, number>()
       // 消息落地:CodeBuddy 一次进程输出多轮(文本→工具→文本→工具),
       // 若把文本 chunk 交给 agent-loop,它会把整个 stream 的文本聚合为
@@ -133,6 +217,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let pendingChunks: StreamChunk[] = []
       const flushText = (): void => {
         if (session === undefined || pendingBlocks.length === 0) return
+        ensureStep()
         const seqs = pendingChunks.map(chunk =>
           session.append('assistant/chunk', { turn, step, chunk }).seq)
         session.append('assistant/message', {
@@ -147,6 +232,22 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         pendingChunks = []
       }
 
+      // 空闲超时(与 llm-agy 的执行器统一):180s 没有任何输出即判定进程
+      // 卡死并终止。CodeBuddy 长任务期间会持续输出,正常任务不会被误杀;
+      // 此前只有 stdout 读完后的 30s 退出兜底,进程静默挂死时 stream 会
+      // 永远挂着。不设总时长——CLI 完成任务自然退出。
+      const IDLE_TIMEOUT_MS = this.options.timeouts?.idleMs ?? 180_000
+      let idleTimedOut = false
+      let idleKiller: ReturnType<typeof setTimeout> | undefined
+      const armIdle = (): void => {
+        if (idleKiller !== undefined) clearTimeout(idleKiller)
+        idleKiller = setTimeout(() => {
+          idleTimedOut = true
+          proc.kill()
+        }, IDLE_TIMEOUT_MS)
+      }
+      armIdle()
+
       const translator = new CodebuddyTranslator()
       try {
         proc.stdout.setEncoding('utf8')
@@ -156,6 +257,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             proc.kill()
             break
           }
+          // 还在出活就续命:只在长时间无输出时才按卡死处理。
+          armIdle()
           const { chunks, toolSteps } = translator.push(line)
           for (const chunk of chunks) {
             if (chunk.type === 'block-start' || chunk.type === 'text-delta' || chunk.type === 'block-end') {
@@ -173,6 +276,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             if (stepEvent.kind === 'tool/call') {
               // 工具调用前先落地已累积文本,保证"文本→工具"顺序。
               flushText()
+              ensureStep()
               const ev = session.append('tool/call', {
                 turn,
                 step,
@@ -195,18 +299,31 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
                 surfaceOp: 'append',
                 ...(seq !== undefined ? { sourceEventSeqs: [seq] } : {}),
               })
+              // 本轮到此结束:闭合 step,下一轮内容会在新 step 里落地。
+              closeStep()
             }
           }
         }
       } finally {
         options.signal?.removeEventListener('abort', onAbort)
+        clearTimeout(idleKiller)
       }
 
       await closeWithTimeout(proc, options.signal)
-      // 流末:剩余文本 yield 给 agent-loop,使其最终 assistant/message 非空
-      // (中间文本已在工具前 flush;无剩余文本时 agent-loop 消息为空,
-      // 表示本流没有任何尾部总结,UI 显示已 flush 的中间消息)。
-      for (const chunk of pendingChunks) yield chunk
+      if (idleTimedOut) {
+        throw new Error(`CodeBuddy 调用超时(空闲 ${IDLE_TIMEOUT_MS / 1000}s 无输出)`)
+      }
+      // 流末:剩余文本**自己**落地到当前 step,不再 yield 给 agent-loop。
+      // yield 过去的话,agent-loop 会把这条尾部总结 append 到它自己的初始
+      // step,于是尾巴跑到会话开头。它最终 append 的那条 message 因此是空
+      // 的——空内容不会覆盖已显示的 blocks(assistant-step 节点按 step 累
+      // 积,追加空块等于不变),初始 step 也就只是一个不显示的空节点。
+      // 注意顺序:必须先落地再闭合 step,否则流末文本会落到一个新开的、
+      // 最后没人闭合的 step 里。
+      flushText()
+      // 收尾:闭合最后一个 step,避免它留在 open 状态被 UI 当成进行中。
+      closeStep()
+      pendingChunks = []
       for (const chunk of translator.end()) yield chunk
     } finally {
       await cleanup()
