@@ -39,10 +39,12 @@
     "@deepseek-ai/dsh-subagent": "link:D:/Projects/DeepseekHarness/repo/packages/subagent/subagent",
     "@deepseek-ai/dsh-tools": "link:D:/Projects/DeepseekHarness/repo/packages/core/tools",
     "@deepseek-ai/schemastery": "^3.0.0",
-    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis": "link:D:/Projects/DeepseekHarness/repo/vendor/cordis",
     "@types/node": "^22.0.0",
     "typescript": "~5.7.2",
-    "vitest": "^3.0.5"
+    "vitest": "^3.0.5",
+    "@deepseek-ai/dsh-util-values": "link:D:/Projects/DeepseekHarness/repo/packages/util/values",
+    "@deepseek-ai/dsh-session": "link:D:/Projects/DeepseekHarness/repo/packages/core/session"
   },
   "files": [
     "lib",

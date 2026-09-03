@@ -11,8 +11,9 @@ import type { ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import type { Context } from '@deepseek-ai/cordis'
-import { CallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { SessionSeq } from '@deepseek-ai/dsh-session'
 import { buildPrompt } from './serialize.js'
 import { CodebuddyTranslator } from './translate.js'
 
@@ -165,7 +166,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
 
       // 工具步骤落地为会话事件所需的 turn/step(从子代理会话推断)。
       const session = options.sessionId !== undefined ? this.ctx.get('sessions')?.get(options.sessionId) : undefined
-      const events = session?.events ?? []
+      const events = session?.ownEvents?.() ?? []
       const turn = ([...events].reverse().find(e => e.type === 'turn/start')?.data.turn ?? 1) as number
       let step = ([...events].reverse().find(e => e.type === 'step/start')?.data.step ?? 1) as number
       // CodeBuddy 一次进程内要跑很多轮(文本→工具→文本→工具…),而 dsh 的
@@ -204,7 +205,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         session.append('step/end', { turn, step })
         stepOpen = false
       }
-      const toolCallSeqs = new Map<string, number>()
+      const toolCallSeqs = new Map<string, SessionSeq>()
       // 消息落地:CodeBuddy 一次进程输出多轮(文本→工具→文本→工具),
       // 若把文本 chunk 交给 agent-loop,它会把整个 stream 的文本聚合为
       // 一条消息堆在末尾(工具事件之后),显示顺序错乱。因此适配器
@@ -280,7 +281,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               const ev = session.append('tool/call', {
                 turn,
                 step,
-                callId: CallId(stepEvent.callId),
+                callId: ToolCallId(stepEvent.callId),
                 name: stepEvent.name ?? 'tool',
                 arguments: stepEvent.argumentsJson ?? '{}',
               })
@@ -291,7 +292,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
                 turn,
                 step,
                 message: createToolResultMessage({
-                  callId: CallId(stepEvent.callId),
+                  callId: ToolCallId(stepEvent.callId),
                   content: [{ type: 'text', text: stepEvent.outputText ?? '' }],
                   isError: stepEvent.isError ?? false,
                 }),

@@ -20,6 +20,10 @@ export interface CodebuddyAdapterOptions {
     permissionMode: string;
     /** 追加的额外 CodeBuddy 参数。 */
     extraArgs: string[];
+    /** 空闲超时预算(可选,默认 180s);测试注入小值以便压缩时间。 */
+    timeouts?: {
+        idleMs?: number;
+    };
 }
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
