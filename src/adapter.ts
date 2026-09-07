@@ -1,29 +1,53 @@
 /**
- * CodeBuddy 模型适配器:provider 路由 `codebuddy`。
- * 对齐 llm-agy/adapter.ts 的结构:LLM 适配器负责 spawn 上游 + 用翻译模块
- * 产出 StreamChunk;CodeBuddy 的工具步骤落地为子代理会话事件
- * (tool/call + tool/result)。
+ * CodeBuddy 模型适配器:provider 路由 `codebuddy`,走 ACP(Agent Client Protocol)。
+ *
+ * 此前是 spawn `codebuddy -p` + 单向解析 stream-json:CLI 内部工具卡死时
+ * 进程树杀不干净(工具子进程持有 stdout 写端),for-await 永久挂起,子代理
+ * 假死且无任何错误反馈(实测,多机复现)。迁移到 ACP 后:
+ *
+ * - **会话生命周期官方化**:`session/new` / `session/load`(历史回放)复用
+ *   长线会话;`session/prompt` 流式 `session/update`(含 thinking 流——
+ *   单向 -p 模式没有的 agent_thought_chunk);
+ * - **协议级取消**:`session/cancel` 对生成流与正在执行的工具都是即时抢占
+ *   (实测),`stopReason: "cancelled"` 与正常结束明确区分;abort 信号驱动
+ *   周期性重发(思考早期单次通知可能被吞);
+ * - **假死防御分层**:进展性 update(消息/思考/工具)重置动态空闲阈值;
+ *   CLI 心跳(session_info/usage/config)不参与续命;静默超阈值先发
+ *   cancel、5s 仍无响应才 kill——进程退出码与 stderr 尾部全程留证。
  * @module subagent-codebuddy/adapter
  */
 
-import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
-import { createInterface } from 'node:readline'
-import { once } from 'node:events'
 import type { Context } from '@deepseek-ai/cordis'
 import { ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionSeq } from '@deepseek-ai/dsh-session'
 import { buildPrompt } from './serialize.js'
-import { CodebuddyTranslator } from './translate.js'
+import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf } from './acp.js'
+import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 
 /** 续跑指令:会话上下文已在 CLI 侧,只需告知"接着做"。 */
 const CONTINUE_PROMPT = '继续完成之前未完成的任务。基于当前工作区状态继续,不要重复已完成的工作,只报告新做的内容。'
 
+/** CodeBuddy CLI 入口(由 index.ts 解析;Windows 下已是 node 可直接执行的 js)。 */
+export interface CodebuddyAdapterOptions {
+  /** 可执行入口(node 脚本绝对路径或命令)。 */
+  command: string
+  /** 前置参数(如解析出的 CLI 路径)。 */
+  prefixArgs: string[]
+  /** 读取当前默认模型(调用时求值,设置面板改默认模型后对新请求实时生效)。 */
+  modelOf: () => string
+  /** 传给 `--permission-mode` 的权限模式。 */
+  permissionMode: string
+  /** 追加的额外 CodeBuddy 参数。 */
+  extraArgs: string[]
+  /** 动态空闲超时预算(可选,默认见 {@link DEFAULT_ACP_RUN_TIMEOUTS})。 */
+  timeouts?: AcpTimeouts
+}
+
 /**
  * 续跑时的增量 prompt。
  *
- * 会话历史已由 CodeBuddy 的会话存储持有(`--resume`),重复整段历史会
+ * 会话历史已由 CodeBuddy 的会话存储持有(`session/load`),重复整段历史会
  * 浪费上下文并让模型误以为要重做;因此只发最后一条用户消息(续聊的新
  * 输入),没有就退回通用续跑指令。
  */
@@ -37,82 +61,29 @@ function resumePrompt(messages: readonly GenerateOptions['messages'][number][]):
   return text.trim().length > 0 ? text : CONTINUE_PROMPT
 }
 
-/** 适配器配置(由 index.ts 传入)。 */
-export interface CodebuddyAdapterOptions {
-  /** 可 spawn 的可执行文件(Windows 下已解析为 node + CLI 路径)。 */
-  command: string
-  /** 前置参数(如解析出的 CLI 路径)。 */
-  prefixArgs: string[]
-  /** 读取当前默认模型(调用时求值,设置面板改默认模型后对新请求实时生效)。 */
-  modelOf: () => string
-  /** 传给 `--permission-mode` 的权限模式。 */
-  permissionMode: string
-  /** 追加的额外 CodeBuddy 参数。 */
-  extraArgs: string[]
-  /**
-   * 超时预算(动态自适应,默认见 {@link DEFAULT_CODEBUDDY_RUN_TIMEOUTS});
-   * 测试注入小值以便压缩时间。
-   */
-  timeouts?: {
-    firstMs?: number
-    idleMinMs?: number
-    idleMaxMs?: number
-    idleFactor?: number
-    idleWarmupLines?: number
-  }
-}
-
-/** 默认超时预算(与 llm-agy 执行器同一套动态算法):CodeBuddy 深度思考期间
- * stream-json 可以长时间不出行(整条 assistant 消息完成后才输出,流式思考
- * 在本地不落任何记录),固定阈值必然误杀——故按本次调用已观测的最大行间隔
- * 自适应,热身行数内一律 idleMaxMs 宽容,样本足够后收紧到
- * clamp(最大间隔 × factor, min, max)。无总时长上限,有输出即续期。 */
-export const DEFAULT_CODEBUDDY_RUN_TIMEOUTS = {
-  firstMs: 60_000,
-  idleMinMs: 150_000,
-  idleMaxMs: 600_000,
-  idleFactor: 3,
-  idleWarmupLines: 6,
-}
-
-/** 进程退出兜底:进程卡死时强制结束,保证 stream 一定结束。 */
-async function closeWithTimeout(
-  proc: ChildProcess,
-  signal: AbortSignal | undefined,
-  timeoutMs = 30_000,
-): Promise<[number | null, string | null]> {
-  const closePromise = once(proc, 'close') as Promise<[number | null, string | null]>
-  let timer: ReturnType<typeof setTimeout> | undefined
-  if (signal?.aborted) {
-    proc.kill()
-  } else {
-    timer = setTimeout(() => {
-      proc.kill()
-    }, timeoutMs)
-  }
-  try {
-    return await closePromise
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-  }
+/** 一条 ACP 消息流(按 messageId 聚合)的中间态。 */
+interface PendingStream {
+  messageId: string
+  blockType: 'text' | 'reasoning'
+  index: number
+  text: string
+  /** 已产出的 chunk(block-start / text-delta)。 */
+  chunks: StreamChunk[]
 }
 
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
- * 序列化 prompt → spawn `codebuddy -p ... --output-format stream-json`
- * → 逐行翻译为 StreamChunk(完整消息,非增量)→ 工具步骤落地为会话事件
- * → usage/finish 收尾。
- *
- * 子代理会话的续聊由 dsh 侧管理:每次调用都把该子代理自己的完整历史
- * 序列化进 prompt,不依赖 CodeBuddy 的会话存储。
+ * spawn `codebuddy --acp` → initialize → session/new(或 session/load 复用)
+ * → session/prompt → 消费 session/update(思考/文本/工具)→ finish 收尾。
+ * 每次调用一个 ACP 进程,用完退出;会话连续性由 CodeBuddy 会话存储 +
+ * session/load 保证(实测回放完整)。
  */
 export class CodebuddyLlmAdapter extends LlmAdapter {
   /**
-   * dsh 子代理会话 → CodeBuddy 会话 id。
+   * dsh 子代理会话 → CodeBuddy ACP sessionId。
    *
-   * 首次调用用 `--session-id` 固定会话 id;之后同一子代理会话的每次
-   * stream 都用 `--resume` 续跑同一会话,这样 CodeBuddy 侧的上下文是连
-   * 续的,续聊时不必把整段历史重新塞进 prompt。
+   * 首次调用 `session/new` 建立并记录;之后同一子代理会话的每次 stream 都
+   * `session/load` 载入同一会话(官方实现会先回放历史事件,回放不落地)。
    */
   private readonly conversationIds = new Map<string, string>()
 
@@ -142,19 +113,10 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     const { command, prefixArgs, permissionMode } = this.options
     // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
     const model = options.model ?? this.options.modelOf()
-    // 会话续跑:同一子代理会话复用同一个 CodeBuddy 会话 id。
-    // 首次用 --session-id 固定 id,之后用 --resume 续跑,CodeBuddy 侧的
-    // 上下文保持连续,续聊时不必把整段历史重新塞进 prompt。
+    // 会话复用:同一子代理会话映射到同一个 CodeBuddy ACP sessionId。
     const dshSessionId = options.sessionId
     const existing = dshSessionId === undefined ? undefined : this.conversationIds.get(dshSessionId)
     const isResume = existing !== undefined
-    const conversationId = existing ?? (dshSessionId === undefined ? undefined : `dsh-${dshSessionId}`)
-    if (conversationId !== undefined && dshSessionId !== undefined) {
-      this.conversationIds.set(dshSessionId, conversationId)
-    }
-    const sessionArgs = conversationId === undefined
-      ? []
-      : isResume ? ['--resume', conversationId] : ['--session-id', conversationId]
     const serialized = isResume
       ? { prompt: resumePrompt(options.messages), cleanup: async (): Promise<void> => {} }
       : await buildPrompt(this.ctx, options)
@@ -165,54 +127,72 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     const cwd = childSession?.header.cwd ?? process.cwd()
 
     try {
-      const proc: ChildProcess = spawn(command, [
-        ...prefixArgs,
-        ...sessionArgs,
-        '-p', prompt,
-        '--output-format', 'stream-json',
-        '--permission-mode', permissionMode,
-        '--model', model,
-        ...this.options.extraArgs,
-      ], {
-        cwd,
-        // stderr 收为管道:CLI 的重试/进度日志走这里,收集尾部用于错误归因。
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
-      if (proc.stdout === null) {
-        proc.kill()
-        throw new Error('subagent-codebuddy: codebuddy process has no stdout stream')
+      // ── update 泵:回调把 update 推进队列,generator 在此处消费 ─────────
+      // capturing 期间(initialize/new/load 完成 before)的 update 全部丢弃——
+      // session/load 会同步回放历史事件,不能落地成新内容。
+      let capturing = true
+      const queue: AcpUpdate[] = []
+      let wake: (() => void) | undefined
+      const onUpdate = (update: AcpUpdate): void => {
+        if (capturing) return
+        queue.push(update)
+        const w = wake
+        wake = undefined
+        w?.()
+      }
+      const waitForUpdate = async (): Promise<void> => {
+        if (queue.length > 0) return
+        await new Promise<void>(resolve => { wake = resolve })
       }
 
-      // CLI 自己的错误信号:退出码。正常完成 code 0;崩溃/自报失败非 0——
-      // 流结束后按退出码立即报错并附 stderr 尾巴,而不是靠计时器猜。
-      let exitCode: number | null | undefined
-      let exitSignal: string | undefined
-      proc.on('close', (code, signal) => {
-        exitCode = code
-        exitSignal = signal ?? undefined
-      })
+      // ── 动态空闲超时:进展性 update 续命;两段收尾(cancel → kill) ──────
+      const to = { ...DEFAULT_ACP_RUN_TIMEOUTS, ...this.options.timeouts }
+      const startedAt = Date.now()
+      let stallTimedOut = false
+      let firstTimer: ReturnType<typeof setTimeout> | undefined
+      let idleTimer: ReturnType<typeof setTimeout> | undefined
+      let killTimer: ReturnType<typeof setTimeout> | undefined
+      let maxGapMs = 0
+      let lastProgressAt = startedAt
+      let progressSamples = 0
+      let lastBudgetMs = to.idleMaxMs
+      let acpSessionId = ''
+      const kill = (): void => { try { thisConn.kill() } catch { /* 已退出 */ } }
+      const failStall = (): void => {
+        stallTimedOut = true
+        // 第一段:协议级取消(CLI 事件循环若还活着就能收尾)。
+        if (acpSessionId !== '') thisConn.notify('session/cancel', { sessionId: acpSessionId })
+        // 第二段:5s 仍无响应才杀进程——纯死挂只有这一条路。
+        if (killTimer === undefined) {
+          killTimer = setTimeout(kill, 5_000)
+        }
+      }
+      const touch = (): void => {
+        if (firstTimer !== undefined) {
+          clearTimeout(firstTimer)
+          firstTimer = undefined
+        }
+        if (idleTimer !== undefined) clearTimeout(idleTimer)
+        idleTimer = setTimeout(failStall, lastBudgetMs)
+      }
+      const armIdle = (): void => {
+        const now = Date.now()
+        maxGapMs = Math.max(maxGapMs, now - lastProgressAt)
+        lastProgressAt = now
+        progressSamples += 1
+        lastBudgetMs = progressSamples <= to.idleWarmupLines
+          ? to.idleMaxMs
+          : Math.min(Math.max(maxGapMs * to.idleFactor, to.idleMinMs), to.idleMaxMs)
+        touch()
+      }
 
-      const onAbort = (): void => { proc.kill() }
-      options.signal?.addEventListener('abort', onAbort, { once: true })
-
-      // 工具步骤落地为会话事件所需的 turn/step(从子代理会话推断)。
+      // ── 会话事件落地所需的 turn/step(从子代理会话推断) ─────────────────
       const session = options.sessionId !== undefined ? this.ctx.get('sessions')?.get(options.sessionId) : undefined
       const events = session?.ownEvents?.() ?? []
       const turn = ([...events].reverse().find(e => e.type === 'turn/start')?.data.turn ?? 1) as number
       let step = ([...events].reverse().find(e => e.type === 'step/start')?.data.step ?? 1) as number
-      // CodeBuddy 一次进程内要跑很多轮(文本→工具→文本→工具…),而 dsh 的
-      // assistant-step 节点是按 step 聚合的:全都塞进同一个 step 会让所有
-      // 文本聚成一个节点、所有 tool 节点被排到它前面,显示顺序与真实发生
-      // 顺序不符。这里每轮工具执行完就闭合当前 step、开启下一个,让每一
-      // 轮拿到自己的 step,从而与 tool 节点交错排序。
-      // 初始 step 由 agent-loop 开启,故起始为 open。
+      // 每轮工具执行完闭合当前 step、下一轮内容开新 step(与 tool 节点交错排序)。
       let stepOpen = true
-      // agent-loop 会在流结束后往**它自己的初始 step** 再 append 一条最终
-      // assistant/message。本适配器不 yield 文本给它(见流末说明),那条
-      // message 就是空的;但即便为空,它也会把初始 step 的 assistant-step
-      // 节点 anchorSeq 顶到最大、排到会话末尾。所以初始 step 整个让给
-      // agent-loop,本进程的各轮从下一个 step 开始记录。
       let stepped = false
       const openNextStep = (): void => {
         step += 1
@@ -223,7 +203,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         if (session === undefined) return
         if (!stepped) {
           // 首次落地:闭合 agent-loop 的初始 step,再从下一个 step 开始。
-          // (初始 stepOpen 为 true,所以这一步必须放在 stepOpen 判断之前。)
           stepped = true
           closeStep()
           openNextStep()
@@ -238,179 +217,226 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         stepOpen = false
       }
       const toolCallSeqs = new Map<string, SessionSeq>()
-      // 消息落地:CodeBuddy 一次进程输出多轮(文本→工具→文本→工具),
-      // 若把文本 chunk 交给 agent-loop,它会把整个 stream 的文本聚合为
-      // 一条消息堆在末尾(工具事件之后),显示顺序错乱。因此适配器
-      // 自己按到达顺序落地 assistant/message:工具调用前 flush 已累积文本。
-      // 流末剩余文本不自己落地,而是 yield 给 agent-loop——agent-loop 在
-      // 流结束后总会 append 一条 assistant/message(聚合整个 stream 的 yield
-      // 文本),若其为空,UI 实时渲染会把已显示的 blocks 覆盖为空
-      // (assistant-step 节点按 step 聚合,最后一条 message 胜出)。
+      const pendingToolCalls = new Map<string, { name: string; rawInput: Record<string, unknown> }>()
       let pendingBlocks: ContentBlock[] = []
-      let pendingChunks: StreamChunk[] = []
-      const flushText = (): void => {
-        if (session === undefined || pendingBlocks.length === 0) return
+      let currentStream: PendingStream | undefined
+      let nextBlockIndex = 0
+
+      /** 落地已累积的流(块收尾 + assistant/chunk + assistant/message)。 */
+      const flushPending = (): void => {
+        if (currentStream === undefined) return
+        const { index, text, chunks, blockType } = currentStream
+        const closed: StreamChunk[] = [...chunks, { type: 'block-end', index, block: blockType === 'text' ? { type: 'text', text } : { type: 'reasoning', text } }]
+        currentStream = undefined
+        if (session === undefined) return
         ensureStep()
-        const seqs = pendingChunks.map(chunk =>
-          session.append('assistant/chunk', { turn, step, chunk }).seq)
-        session.append('assistant/message', {
-          turn,
-          step,
-          message: createAssistantMessage({
-            content: pendingBlocks,
-            source: { provider: options.provider ?? 'codebuddy', model },
-          }),
-        }, { surfaceOp: 'append', sourceEventSeqs: seqs })
-        pendingBlocks = []
-        pendingChunks = []
-      }
-
-      // 动态空闲超时(与 llm-agy 执行器同一套算法):CodeBuddy 深度思考/
-      // 长工具执行期间 stream-json 可以长时间不出行——流式思考在本地不落
-      // 任何记录,固定阈值必然误杀。stdout 每行重置静默计时并采样;静默
-      // 阈值按本次调用已观测的最大行间隔自适应 clamp(最大间隔 × factor,
-      // min, max),热身行数内一律 idleMaxMs 宽容(任务早期的历史间隔还
-      // 不足以预测后续的长静默)。无总时长上限——有输出就永远续期。
-      const to = { ...DEFAULT_CODEBUDDY_RUN_TIMEOUTS, ...this.options.timeouts }
-      const startedAt = Date.now()
-      let idleTimedOut = false
-      let firstTimer: ReturnType<typeof setTimeout> | undefined
-      let idleTimer: ReturnType<typeof setTimeout> | undefined
-      let maxGapMs = 0
-      let lastLineAt = startedAt
-      let lineSamples = 0
-      let lastBudgetMs = to.idleMaxMs
-      const failIdle = (): void => {
-        idleTimedOut = true
-        try { proc.kill() } catch { /* 已退出 */ }
-        // 进程树残留可能仍持有 stdout 写端,必须同时关流,for-await 才能结束。
-        try { proc.stdout?.destroy() } catch { /* 已关闭 */ }
-      }
-      const touch = (): void => {
-        // 续命:按当前预算重置静默计时;首个活动同时撤销首包超时。
-        if (firstTimer !== undefined) {
-          clearTimeout(firstTimer)
-          firstTimer = undefined
+        const seqs = closed.map(chunk => session.append('assistant/chunk', { turn, step, chunk }).seq)
+        if (text.length > 0) {
+          pendingBlocks.push(blockType === 'text' ? { type: 'text', text } : { type: 'reasoning', text })
+          session.append('assistant/message', {
+            turn,
+            step,
+            message: createAssistantMessage({
+              content: pendingBlocks,
+              source: { provider: options.provider ?? 'codebuddy', model },
+            }),
+          }, { surfaceOp: 'append', sourceEventSeqs: seqs })
+          pendingBlocks = []
         }
-        if (idleTimer !== undefined) clearTimeout(idleTimer)
-        idleTimer = setTimeout(failIdle, lastBudgetMs)
-      }
-      const armIdle = (): void => {
-        const now = Date.now()
-        maxGapMs = Math.max(maxGapMs, now - lastLineAt)
-        lastLineAt = now
-        lineSamples += 1
-        lastBudgetMs = lineSamples <= to.idleWarmupLines
-          ? to.idleMaxMs
-          : Math.min(Math.max(maxGapMs * to.idleFactor, to.idleMinMs), to.idleMaxMs)
-        touch()
-      }
-      touch()
-
-      // stderr 只收集不续命:CLI 工具(Bash 等)的孙进程会继承 stderr 写端,
-      // 长进程(如 dev server)的零星输出会让 touch() 无限续命、永不超时——
-      // 这是实测复现的假死。任务进展的唯一真信号是 stdout 的 stream-json 行;
-      // stderr 仅作为错误归因证据。
-      let stderrTail = ''
-      if (proc.stderr !== null && proc.stderr !== undefined) {
-        proc.stderr.setEncoding('utf8')
-        proc.stderr.on('data', (chunk: string) => {
-          stderrTail = (stderrTail + chunk).slice(-4000)
-        })
       }
 
-      const translator = new CodebuddyTranslator()
-      try {
-        proc.stdout.setEncoding('utf8')
-        const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity })
-        for await (const line of rl) {
-          if (options.signal?.aborted) {
-            proc.kill()
-            break
-          }
-          // 还在出活就续命:只在长时间无输出时才按卡死处理。
-          armIdle()
-          const { chunks, toolSteps } = translator.push(line)
-          for (const chunk of chunks) {
-            if (chunk.type === 'block-start' || chunk.type === 'text-delta' || chunk.type === 'block-end') {
-              // 文本类 chunk:累积,由 flushText 落地为 assistant/chunk + message。
-              if (chunk.type === 'block-end') {
-                pendingBlocks.push(chunk.block)
+      /** 处理一条 ACP update:续命 + 会话事件落地 + 流累积。 */
+      const handleUpdate = (update: AcpUpdate): void => {
+        if (isProgressUpdate(update)) armIdle()
+        switch (update.sessionUpdate) {
+          case 'agent_thought_chunk':
+          case 'agent_message_chunk': {
+            const text = update.content?.text ?? ''
+            if (text.length === 0) return
+            const blockType = update.sessionUpdate === 'agent_thought_chunk' ? 'reasoning' : 'text'
+            const messageId = update.messageId ?? `${blockType}-anonymous`
+            if (currentStream === undefined) {
+              currentStream = {
+                messageId,
+                blockType,
+                index: nextBlockIndex++,
+                text: '',
+                chunks: [{ type: 'block-start', index: nextBlockIndex - 1, blockType }],
               }
-              pendingChunks.push(chunk)
-              continue
+            } else if (currentStream.messageId !== messageId || currentStream.blockType !== blockType) {
+              flushPending()
+              currentStream = {
+                messageId,
+                blockType,
+                index: nextBlockIndex++,
+                text: '',
+                chunks: [{ type: 'block-start', index: nextBlockIndex - 1, blockType }],
+              }
             }
-            yield chunk
+            currentStream.text += text
+            currentStream.chunks.push({ type: 'text-delta', index: currentStream.index, text })
+            return
           }
-          for (const stepEvent of toolSteps) {
-            if (session === undefined) continue
-            if (stepEvent.kind === 'tool/call') {
-              // 工具调用前先落地已累积文本,保证"文本→工具"顺序。
-              flushText()
+          case 'tool_call': {
+            if (update.toolCallId === undefined) return
+            const name = toolNameOf(update)
+            const rawInput = update.rawInput ?? {}
+            const known = pendingToolCalls.get(update.toolCallId)
+            // pending(参数完整)覆盖 in_progress 的占位;call 事件只落地一次。
+            if (known === undefined) {
+              pendingToolCalls.set(update.toolCallId, { name, rawInput })
+              flushPending()
               ensureStep()
-              const ev = session.append('tool/call', {
+              const ev = session?.append('tool/call', {
                 turn,
                 step,
-                callId: ToolCallId(stepEvent.callId),
-                name: stepEvent.name ?? 'tool',
-                arguments: stepEvent.argumentsJson ?? '{}',
+                callId: ToolCallId(update.toolCallId),
+                name,
+                arguments: JSON.stringify(rawInput),
               })
-              toolCallSeqs.set(stepEvent.callId, ev.seq)
+              if (ev !== undefined) toolCallSeqs.set(update.toolCallId, ev.seq)
             } else {
-              const seq = toolCallSeqs.get(stepEvent.callId)
-              session.append('tool/result', {
-                turn,
-                step,
-                message: createToolResultMessage({
-                  callId: ToolCallId(stepEvent.callId),
-                  content: [{ type: 'text', text: stepEvent.outputText ?? '' }],
-                  isError: stepEvent.isError ?? false,
-                }),
-              }, {
-                surfaceOp: 'append',
-                ...(seq !== undefined ? { sourceEventSeqs: [seq] } : {}),
-              })
-              // 本轮到此结束:闭合 step,下一轮内容会在新 step 里落地。
-              closeStep()
+              // 参数补全:更新记忆(rawInput 完整版),call 事件已落地不重发。
+              pendingToolCalls.set(update.toolCallId, { name: known.name, rawInput })
             }
+            return
           }
+          case 'tool_call_update': {
+            if (update.toolCallId === undefined) return
+            if (update.status !== 'completed' && update.status !== 'failed') return
+            const known = pendingToolCalls.get(update.toolCallId)
+            if (known === undefined) return
+            pendingToolCalls.delete(update.toolCallId)
+            const outputText = update.rawOutput?.text ?? ''
+            flushPending()
+            const seq = toolCallSeqs.get(update.toolCallId)
+            session?.append('tool/result', {
+              turn,
+              step,
+              message: createToolResultMessage({
+                callId: ToolCallId(update.toolCallId),
+                content: [{ type: 'text', text: outputText.slice(0, 2000) }],
+                isError: update.status === 'failed',
+              }),
+            }, {
+              surfaceOp: 'append',
+              ...(seq !== undefined ? { sourceEventSeqs: [seq] } : {}),
+            })
+            // 本轮到此结束:闭合 step,下一轮内容在新 step 里落地。
+            closeStep()
+            return
+          }
+          default:
+            return
         }
+      }
+
+      // ── 建 ACP 进程 + 握手 + 会话 ────────────────────────────────────────
+      const conn = new AcpConnection(
+        [command, ...prefixArgs, '--acp', '--model', model, '--dangerously-skip-permissions', ...this.options.extraArgs],
+        cwd,
+        onUpdate,
+      )
+      const thisConn = conn
+      touch()
+      let exitError: Error | undefined
+      conn.onExit(info => {
+        if (conn.wasKilled || stallTimedOut) return
+        exitError = new Error(
+          `CodeBuddy ACP 进程退出(code ${info.code ?? 'null'}${info.signal !== null ? `,signal ${info.signal}` : ''})${conn.stderrNote()}`,
+        )
+        const w = wake
+        wake = undefined
+        w?.()
+      })
+
+      // abort → 周期性 session/cancel(思考早期单次通知可能被吞,实测)。
+      const onAbort = (): void => {
+        const loop = setInterval(() => {
+          if (acpSessionId !== '') conn.notify('session/cancel', { sessionId: acpSessionId })
+        }, 1_000)
+        // prompt 收尾后由 finally 清理;这里存到外部即可。
+        cancelLoopTimer = loop
+      }
+      let cancelLoopTimer: ReturnType<typeof setInterval> | undefined
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+
+      try {
+        await conn.request('initialize', {
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        }, to.firstMs)
+
+        if (isResume && existing !== undefined) {
+          // 历史回放:load 响应前的 update 已被 capturing 丢弃。
+          await conn.request('session/load', { sessionId: existing, cwd, mcpServers: [] })
+          acpSessionId = existing
+        } else {
+          const created = await conn.request<{ sessionId: string }>('session/new', { cwd, mcpServers: [] }, to.firstMs)
+          acpSessionId = created.sessionId
+          if (dshSessionId !== undefined) this.conversationIds.set(dshSessionId, acpSessionId)
+        }
+        capturing = false
+
+        // ── prompt:消费 update 直到响应到达 ────────────────────────────────
+        let promptResult: AcpPromptResult | undefined
+        let promptError: Error | undefined
+        const promptPromise = conn.request<{ stopReason?: string; errorMessage?: string }>(
+          'session/prompt',
+          { sessionId: acpSessionId, prompt: [{ type: 'text', text: prompt }] },
+        ).then(
+          v => { promptResult = v },
+          e => { promptError = e instanceof Error ? e : new Error(String(e)) },
+        )
+
+        while (promptResult === undefined && promptError === undefined && exitError === undefined && !stallTimedOut) {
+          while (queue.length > 0) {
+            const update = queue.shift()
+            if (update !== undefined) handleUpdate(update)
+          }
+          if (promptResult !== undefined || promptError !== undefined || exitError !== undefined || stallTimedOut) break
+          await Promise.race([waitForUpdate(), new Promise<void>(resolve => setTimeout(resolve, 100))])
+        }
+        // 抽干尾巴(cancel/exit 后可能还有少量 update)。
+        while (queue.length > 0) {
+          const update = queue.shift()
+          if (update !== undefined) handleUpdate(update)
+        }
+
+        // stall 收尾:等 kill 补刀后返回错误。
+        if (stallTimedOut) {
+          if (killTimer !== undefined) clearTimeout(killTimer)
+          kill()
+          throw new Error(`CodeBuddy ACP 调用超时(已等待 ${Math.round((Date.now() - startedAt) / 1000)}s;`
+            + `静默超过 ${Math.round(lastBudgetMs / 1000)}s 无进展,本次历史最大进展间隔 ${Math.round(maxGapMs / 1000)}s,`
+            + `阈值 = clamp(间隔 × ${to.idleFactor}, ${Math.round(to.idleMinMs / 1000)}s, ${Math.round(to.idleMaxMs / 1000)}s),`
+            + `已收 ${progressSamples} 次进展${conn.stderrNote()})`)
+        }
+        if (promptError !== undefined) throw promptError
+        if (exitError !== undefined) throw exitError
+
+        const stopReason = promptResult?.stopReason
+        const errorMessage = promptResult?.errorMessage
+        flushPending()
+        closeStep()
+        if (errorMessage !== undefined && errorMessage.length > 0) {
+          yield {
+            type: 'finish',
+            reason: { kind: 'error', failure: { message: `codebuddy 执行失败: ${errorMessage.slice(0, 500)}`, code: 'CODEBUDDY_EXEC_ERROR' } },
+          }
+          return
+        }
+        // cancelled:调用方 abort 驱动;end_turn:正常完成。两者都正常收尾。
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        void stopReason
       } finally {
-        options.signal?.removeEventListener('abort', onAbort)
         if (firstTimer !== undefined) clearTimeout(firstTimer)
         if (idleTimer !== undefined) clearTimeout(idleTimer)
+        if (killTimer !== undefined) clearTimeout(killTimer)
+        if (cancelLoopTimer !== undefined) clearInterval(cancelLoopTimer)
+        options.signal?.removeEventListener('abort', onAbort)
+        conn.kill()
       }
-
-      await closeWithTimeout(proc, options.signal)
-      // CLI 没来得及自报就死掉的两类:静默死挂(动态超时)与异常退出码。
-      // 流内 result.is_error 已由 translator 走 finish error,不在此重复。
-      const stderrNote = stderrTail.trim().length > 0
-        ? `;stderr: ${stderrTail.trim().slice(-500)}`
-        : ''
-      if (idleTimedOut) {
-        throw new Error(`CodeBuddy 调用超时(已等待 ${Math.round((Date.now() - startedAt) / 1000)}s;`
-          + `静默超过 ${Math.round(lastBudgetMs / 1000)}s 无输出,本次历史最大行间隔 ${Math.round(maxGapMs / 1000)}s,`
-          + `阈值 = clamp(间隔 × ${to.idleFactor}, ${Math.round(to.idleMinMs / 1000)}s, ${Math.round(to.idleMaxMs / 1000)}s),`
-          + `已收 ${lineSamples} 行${lineSamples === 0 ? '(首包未到)' : ''})${stderrNote}`)
-      }
-      if (!options.signal?.aborted && translator.resultError === undefined
-        && exitCode !== undefined && exitCode !== null && exitCode !== 0) {
-        throw new Error(
-          `CodeBuddy 进程异常退出(code ${exitCode}${exitSignal !== undefined ? `,signal ${exitSignal}` : ''})${stderrNote}`,
-        )
-      }
-      // 流末:剩余文本**自己**落地到当前 step,不再 yield 给 agent-loop。
-      // yield 过去的话,agent-loop 会把这条尾部总结 append 到它自己的初始
-      // step,于是尾巴跑到会话开头。它最终 append 的那条 message 因此是空
-      // 的——空内容不会覆盖已显示的 blocks(assistant-step 节点按 step 累
-      // 积,追加空块等于不变),初始 step 也就只是一个不显示的空节点。
-      // 注意顺序:必须先落地再闭合 step,否则流末文本会落到一个新开的、
-      // 最后没人闭合的 step 里。
-      flushText()
-      // 收尾:闭合最后一个 step,避免它留在 open 状态被 UI 当成进行中。
-      closeStep()
-      pendingChunks = []
-      for (const chunk of translator.end()) yield chunk
     } finally {
       await cleanup()
     }

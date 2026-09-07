@@ -1,16 +1,28 @@
 /**
- * CodeBuddy 模型适配器:provider 路由 `codebuddy`。
- * 对齐 llm-agy/adapter.ts 的结构:LLM 适配器负责 spawn 上游 + 用翻译模块
- * 产出 StreamChunk;CodeBuddy 的工具步骤落地为子代理会话事件
- * (tool/call + tool/result)。
+ * CodeBuddy 模型适配器:provider 路由 `codebuddy`,走 ACP(Agent Client Protocol)。
+ *
+ * 此前是 spawn `codebuddy -p` + 单向解析 stream-json:CLI 内部工具卡死时
+ * 进程树杀不干净(工具子进程持有 stdout 写端),for-await 永久挂起,子代理
+ * 假死且无任何错误反馈(实测,多机复现)。迁移到 ACP 后:
+ *
+ * - **会话生命周期官方化**:`session/new` / `session/load`(历史回放)复用
+ *   长线会话;`session/prompt` 流式 `session/update`(含 thinking 流——
+ *   单向 -p 模式没有的 agent_thought_chunk);
+ * - **协议级取消**:`session/cancel` 对生成流与正在执行的工具都是即时抢占
+ *   (实测),`stopReason: "cancelled"` 与正常结束明确区分;abort 信号驱动
+ *   周期性重发(思考早期单次通知可能被吞);
+ * - **假死防御分层**:进展性 update(消息/思考/工具)重置动态空闲阈值;
+ *   CLI 心跳(session_info/usage/config)不参与续命;静默超阈值先发
+ *   cancel、5s 仍无响应才 kill——进程退出码与 stderr 尾部全程留证。
  * @module subagent-codebuddy/adapter
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
-/** 适配器配置(由 index.ts 传入)。 */
+import type { AcpTimeouts } from './acp.js';
+/** CodeBuddy CLI 入口(由 index.ts 解析;Windows 下已是 node 可直接执行的 js)。 */
 export interface CodebuddyAdapterOptions {
-    /** 可 spawn 的可执行文件(Windows 下已解析为 node + CLI 路径)。 */
+    /** 可执行入口(node 脚本绝对路径或命令)。 */
     command: string;
     /** 前置参数(如解析出的 CLI 路径)。 */
     prefixArgs: string[];
@@ -20,48 +32,24 @@ export interface CodebuddyAdapterOptions {
     permissionMode: string;
     /** 追加的额外 CodeBuddy 参数。 */
     extraArgs: string[];
-    /**
-     * 超时预算(动态自适应,默认见 {@link DEFAULT_CODEBUDDY_RUN_TIMEOUTS});
-     * 测试注入小值以便压缩时间。
-     */
-    timeouts?: {
-        firstMs?: number;
-        idleMinMs?: number;
-        idleMaxMs?: number;
-        idleFactor?: number;
-        idleWarmupLines?: number;
-    };
+    /** 动态空闲超时预算(可选,默认见 {@link DEFAULT_ACP_RUN_TIMEOUTS})。 */
+    timeouts?: AcpTimeouts;
 }
-/** 默认超时预算(与 llm-agy 执行器同一套动态算法):CodeBuddy 深度思考期间
- * stream-json 可以长时间不出行(整条 assistant 消息完成后才输出,流式思考
- * 在本地不落任何记录),固定阈值必然误杀——故按本次调用已观测的最大行间隔
- * 自适应,热身行数内一律 idleMaxMs 宽容,样本足够后收紧到
- * clamp(最大间隔 × factor, min, max)。无总时长上限,有输出即续期。 */
-export declare const DEFAULT_CODEBUDDY_RUN_TIMEOUTS: {
-    firstMs: number;
-    idleMinMs: number;
-    idleMaxMs: number;
-    idleFactor: number;
-    idleWarmupLines: number;
-};
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
- * 序列化 prompt → spawn `codebuddy -p ... --output-format stream-json`
- * → 逐行翻译为 StreamChunk(完整消息,非增量)→ 工具步骤落地为会话事件
- * → usage/finish 收尾。
- *
- * 子代理会话的续聊由 dsh 侧管理:每次调用都把该子代理自己的完整历史
- * 序列化进 prompt,不依赖 CodeBuddy 的会话存储。
+ * spawn `codebuddy --acp` → initialize → session/new(或 session/load 复用)
+ * → session/prompt → 消费 session/update(思考/文本/工具)→ finish 收尾。
+ * 每次调用一个 ACP 进程,用完退出;会话连续性由 CodeBuddy 会话存储 +
+ * session/load 保证(实测回放完整)。
  */
 export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly ctx;
     private readonly options;
     /**
-     * dsh 子代理会话 → CodeBuddy 会话 id。
+     * dsh 子代理会话 → CodeBuddy ACP sessionId。
      *
-     * 首次调用用 `--session-id` 固定会话 id;之后同一子代理会话的每次
-     * stream 都用 `--resume` 续跑同一会话,这样 CodeBuddy 侧的上下文是连
-     * 续的,续聊时不必把整段历史重新塞进 prompt。
+     * 首次调用 `session/new` 建立并记录;之后同一子代理会话的每次 stream 都
+     * `session/load` 载入同一会话(官方实现会先回放历史事件,回放不落地)。
      */
     private readonly conversationIds;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);
