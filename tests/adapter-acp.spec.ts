@@ -89,9 +89,9 @@ const thought = (text: string, messageId = 'm-thought'): Record<string, unknown>
 const message = (text: string, messageId = 'm-msg'): Record<string, unknown> => ({
   sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId,
 })
-const toolCall = (id: string, toolName: string, rawInput: Record<string, unknown>, status = 'in_progress'): Record<string, unknown> => ({
+const toolCall = (id: string, toolName: string, rawInput: Record<string, unknown>, status = 'pending'): Record<string, unknown> => ({
   sessionUpdate: 'tool_call', toolCallId: id, title: `\`${JSON.stringify(rawInput)}\``, kind: 'execute', status,
-  rawInput, _meta: { 'codebuddy.ai/toolName': toolName },
+  rawInput, _meta: { 'codebuddy.ai/toolName': toolName, 'codebuddy.ai/toolArgumentsComplete': status === 'pending' },
 })
 const toolUpdate = (id: string, status: 'completed' | 'failed', output: string): Record<string, unknown> => ({
   sessionUpdate: 'tool_call_update', toolCallId: id, status, rawOutput: { type: 'text', text: output },
@@ -108,6 +108,7 @@ function autoHandshake(f: FakeAcp): void {
 
 function makeAdapter(timeouts?: Record<string, number>): { adapter: CodebuddyLlmAdapter; appended: string[] } {
   const appended: string[] = []
+
   const session = {
     header: { cwd: process.cwd() },
     append: (type: string, data: unknown, opts?: unknown) => {
@@ -208,6 +209,7 @@ describe('adapter(ACP):工具落地', () => {
       autoHandshake(p)
       setTimeout(() => {
         p.update(thought('跑个命令'))
+        p.update(toolCall('call_1', 'Bash', {}, 'in_progress'))
         p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }, 'pending'))
         p.update(toolUpdate('call_1', 'completed', 'Command: echo hi\nStdout: hi'))
         p.update(message('完成了'))
@@ -216,7 +218,10 @@ describe('adapter(ACP):工具落地', () => {
       return p as unknown as ReturnType<typeof spawn>
     })
     for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('Bash') && a.includes('echo hi'))).toBe(true)
+    expect(appended.filter(a => a.startsWith('tool/call@')).length).toBe(1)
+    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('bash') && !a.includes('Bash'))).toBe(true)
+    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('echo hi'))).toBe(true)
+    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('{}'))).toBe(false)
     expect(appended.some(a => a.startsWith('tool/result@') && a.includes('Stdout: hi'))).toBe(true)
     // 工具 result 后闭合 step,工具后的文本开新 step
     expect(appended.some(a => a.startsWith('step/end@'))).toBe(true)
@@ -253,7 +258,8 @@ describe('adapter(ACP):取消与错误', () => {
     setTimeout(() => controller.abort(), 1500)
     const chunks = await streamPromise
     expect(lastFake!.notifications().filter(n => n.method === 'session/cancel').length).toBeGreaterThanOrEqual(1)
-    expect(chunks.some(c => c.includes('"stop"'))).toBe(true)
+    // abort 语义:流直接结束(不产 finish,调用方主动取消)。
+    expect(chunks.some(c => c.includes('error'))).toBe(false)
   }, 15_000)
 
   it('进程中途异常退出 → 抛错并附退出码', async () => {
@@ -264,22 +270,22 @@ describe('adapter(ACP):取消与错误', () => {
       return p as unknown as ReturnType<typeof spawn>
     })
     const { adapter } = makeAdapter()
-    await expect(async () => {
-      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    }).rejects.toThrow(/退出|exit/i)
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
+    expect(chunks.some(c => c.includes('CODEBUDDY_EXEC_ERROR') && (c.includes('退出') || c.includes('exit')))).toBe(true)
   }, 15_000)
 
   it('静默无进展 → 先 cancel 后 kill,抛出明确超时错误', async () => {
-    const { adapter } = makeAdapter({ firstMs: 100, idleMaxMs: 200, idleMinMs: 100, idleFactor: 2, idleWarmupLines: 0 })
+    const { adapter } = makeAdapter({ firstMs: 100, idleMaxMs: 200, idleMinMs: 100, idleFactor: 2, idleWarmupLines: 0, maxAttempts: 1, retryDelayMs: 10 })
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
       // prompt 永不响应、永不推 update(纯死挂)
       return p as unknown as ReturnType<typeof spawn>
     })
-    await expect(async () => {
-      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    }).rejects.toThrow(/超时/)
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
+    expect(chunks.some(c => c.includes('CODEBUDDY_EXEC_ERROR') && c.includes('超时'))).toBe(true)
     expect(lastFake!.notifications().filter(n => n.method === 'session/cancel').length).toBeGreaterThanOrEqual(1)
   }, 25_000)
 

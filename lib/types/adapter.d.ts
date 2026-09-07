@@ -11,16 +11,20 @@
  * - **协议级取消**:`session/cancel` 对生成流与正在执行的工具都是即时抢占
  *   (实测),`stopReason: "cancelled"` 与正常结束明确区分;abort 信号驱动
  *   周期性重发(思考早期单次通知可能被吞);
+ * - **静默失败自动重试**:CodeBuddy 服务端偶发静默失败(实测高频)——
+ *   end_turn 但零思考零文本零工具、或只有思考没有产出。空跑会让主代理
+ *   以为子代理完成了(用户看到"莫名中断、发继续没反应")。可重试失败
+ *   自动恢复同一会话续跑(ACP session/load 回放),用尽才显式报错;
  * - **假死防御分层**:进展性 update(消息/思考/工具)重置动态空闲阈值;
- *   CLI 心跳(session_info/usage/config)不参与续命;静默超阈值先发
- *   cancel、5s 仍无响应才 kill——进程退出码与 stderr 尾部全程留证。
+ *   CLI 心跳(session_info/usage/config)与 stderr 不参与续命;静默超
+ *   阈值先发 cancel、5s 仍无响应才 kill——进程退出码与 stderr 全程留证。
  * @module subagent-codebuddy/adapter
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { AcpTimeouts } from './acp.js';
-/** CodeBuddy CLI 入口(由 index.ts 解析;Windows 下已是 node 可直接执行的 js)。 */
+/** CodeBuddy CLI 入口配置(由 index.ts 解析)。 */
 export interface CodebuddyAdapterOptions {
     /** 可执行入口(node 脚本绝对路径或命令)。 */
     command: string;
@@ -34,13 +38,17 @@ export interface CodebuddyAdapterOptions {
     extraArgs: string[];
     /** 动态空闲超时预算(可选,默认见 {@link DEFAULT_ACP_RUN_TIMEOUTS})。 */
     timeouts?: AcpTimeouts;
+    /** 静默失败自动重试次数(默认 2:首次 + 1 次续跑)。 */
+    maxAttempts?: number;
+    /** 重试间隔(毫秒,默认 3s)。 */
+    retryDelayMs?: number;
 }
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
  * spawn `codebuddy --acp` → initialize → session/new(或 session/load 复用)
  * → session/prompt → 消费 session/update(思考/文本/工具)→ finish 收尾。
  * 每次调用一个 ACP 进程,用完退出;会话连续性由 CodeBuddy 会话存储 +
- * session/load 保证(实测回放完整)。
+ * session/load 保证(实测回放完整);静默失败自动恢复会话续跑。
  */
 export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly ctx;
@@ -63,5 +71,12 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
         stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>;
     }>;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /**
+     * 带重试的委托执行。可重试失败(静默空跑/半途终止/进程退出/超时)时
+     * 恢复同一会话续跑;用尽后以显式错误收尾,让主代理知道子代理实际状态。
+     */
+    private streamWithRetry;
+    /** 单次委托尝试:进程 + 握手 + prompt + update 消费。 */
+    private streamOnce;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
 }

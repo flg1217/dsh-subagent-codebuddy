@@ -61,7 +61,9 @@ export interface AcpExitInfo {
     code: number | null;
     signal: string | null;
 }
-/** 从 update 提取 CodeBuddy 私有工具名。 */
+/** 从 update 提取 CodeBuddy 私有工具名,并归一化为 dsh 工具名
+ * (Read→read、TodoWrite→todo_write、WebSearch→web_search),
+ * 让子代理窗口复用 dsh 原生工具的可视化渲染器。 */
 export declare function toolNameOf(update: AcpUpdate): string;
 /** 进展性事件:代表任务真实推进,重置动态空闲计时。 */
 export declare function isProgressUpdate(update: AcpUpdate): boolean;
