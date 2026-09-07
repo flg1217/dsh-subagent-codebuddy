@@ -29,9 +29,7 @@ import { buildPrompt } from './serialize.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf } from './acp.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 
-/** 续跑指令:会话上下文已在 CLI 侧,只需告知"接着做"。
- * 明确要求持续推进——实测 glm 系模型在模糊的"继续"下每轮只做一小步
- * 就停下汇报,长任务被拆成大量一轮两三个动作的碎片。 */
+/** 续跑兜底:仅当消息里找不到用户输入时使用(resumePrompt 的 fallback)。 */
 const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推进直到任务完全完成或遇到必须用户决策的阻塞——不要每轮只做一小步就停下汇报。基于当前工作区状态继续,不要重复已完成的工作;全部完成后给出最终结果报告。'
 
 /** 可重试的委托失败:恢复同一会话续跑(ACP session/load)即可,不重复已完成部分。 */
@@ -165,9 +163,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     const dshSessionId = options.sessionId
     const existing = dshSessionId === undefined ? undefined : this.conversationIds.get(dshSessionId)
     const isResume = existing !== undefined
-    // 首次 attempt 用完整任务 prompt;重试 attempt 发续跑指令(历史已载入)。
-    const serialized = isResume || attempt > 1
-      ? { prompt: attempt > 1 ? CONTINUE_PROMPT : resumePrompt(options.messages), cleanup: async (): Promise<void> => {} }
+    const serialized = isResume
+      ? { prompt: resumePrompt(options.messages), cleanup: async (): Promise<void> => {} }
       : await buildPrompt(this.ctx, options)
     const { prompt, cleanup } = serialized
 
@@ -447,11 +444,15 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         capturing = false
 
         // ── prompt:消费 update 直到响应到达 ────────────────────────────────
+        // session/prompt 是长活请求:不设请求超时(传 0),生命周期由动态空闲
+        // 超时(cancel → kill → 进程退出 reject)与 abort 保护——固定超时会
+        // 误杀长任务(实测 180s 掐死 3 分钟以上的任务)。
         let promptResult: AcpPromptResult | undefined
         let promptError: Error | undefined
         const promptPromise = conn.request<{ stopReason?: string; errorMessage?: string }>(
           'session/prompt',
           { sessionId: acpSessionId, prompt: [{ type: 'text', text: prompt }] },
+          0,
         ).then(
           v => { promptResult = v },
           e => { promptError = e instanceof Error ? e : new Error(String(e)) },
