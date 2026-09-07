@@ -82,6 +82,13 @@ export declare class AcpConnection {
     constructor(argvPrefix: readonly string[], cwd: string, onUpdate: (update: AcpUpdate) => void);
     /** 进程退出(含退出码);已在退出后调用则立即返回。 */
     onExit(listener: (info: AcpExitInfo) => void): void;
+    /**
+     * 发起一次 JSON-RPC 请求。
+     * @param timeoutMs 超时毫秒;**<= 0 表示不设请求超时**——`session/prompt`
+     * 这类长活请求(整个任务期间)必须传 0,它的生命周期由动态空闲超时
+     * (cancel → kill → 进程退出 reject)与 abort 保护,固定超时会误杀长任务
+     * (实测:默认 180s 把 3 分钟以上的子代理任务全部掐死)。
+     */
     request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T>;
     notify(method: string, params: Record<string, unknown>): void;
     /** stderr 尾部(有内容才带分号前缀)。 */

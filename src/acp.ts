@@ -153,16 +153,26 @@ export class AcpConnection {
     else this.exitWaiters.push(listener)
   }
 
+  /**
+   * 发起一次 JSON-RPC 请求。
+   * @param timeoutMs 超时毫秒;**<= 0 表示不设请求超时**——`session/prompt`
+   * 这类长活请求(整个任务期间)必须传 0,它的生命周期由动态空闲超时
+   * (cancel → kill → 进程退出 reject)与 abort 保护,固定超时会误杀长任务
+   * (实测:默认 180s 把 3 分钟以上的子代理任务全部掐死)。
+   */
   request<T>(method: string, params: Record<string, unknown>, timeoutMs = 180_000): Promise<T> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`ACP ${method} 超时(${Math.round(timeoutMs / 1000)}s)${this.stderrNote()}`))
-      }, timeoutMs)
+      let timer: ReturnType<typeof setTimeout> | undefined
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          this.pending.delete(id)
+          reject(new Error(`ACP ${method} 超时(${Math.round(timeoutMs / 1000)}s)${this.stderrNote()}`))
+        }, timeoutMs)
+      }
       this.pending.set(id, {
-        resolve: v => { clearTimeout(timer); resolve(v as T) },
-        reject: e => { clearTimeout(timer); reject(e) },
+        resolve: v => { if (timer !== undefined) clearTimeout(timer); resolve(v as T) },
+        reject: e => { if (timer !== undefined) clearTimeout(timer); reject(e) },
       })
       this.proc.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
     })
