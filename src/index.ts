@@ -102,7 +102,9 @@ export function apply(ctx: Context, config: Config): void {
         + 'receiving the result; `send_message` starts a later turn in the same child conversation.',
       promptDescription:
         'The complete, self-contained task for the subagent. It does not share this conversation\'s context, so include '
-        + 'everything it needs: the goal, acceptance criteria, exact file paths, constraints, and the expected output format.',
+        + 'everything it needs: the goal, acceptance criteria, exact file paths, constraints, and the expected output format. '
+        + 'Always instruct the subagent to keep working until the task is FULLY complete — no interim stop-and-report rounds; '
+        + 'it should only stop on a blocking decision that only the user can make.',
     })
     // 模型查询工具:委派前可先确认当前支持的模型 id。
     registerCodebuddyModelsTool(ctx, {
