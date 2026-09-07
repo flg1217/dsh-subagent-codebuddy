@@ -13,7 +13,7 @@ import { Readable as ReadableStream, Readable } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { CodebuddyLlmAdapter } from '../src/adapter.ts'
+import { CodebuddyLlmAdapter, DEFAULT_CODEBUDDY_RUN_TIMEOUTS } from '../src/adapter.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -273,7 +273,7 @@ describe('adapter:会话续跑(resume)', () => {
   })
 })
 
-describe('adapter:空闲超时(与 llm-agy 执行器统一)', () => {
+describe('adapter:动态超时与 CLI 错误信号(与 llm-agy 执行器统一)', () => {
   /** 假进程:吐出行后保持静默(流不结束);kill 时才关闭 stdout。模拟真实进程卡死。 */
   function hangingProc(lines: string[]): EventEmitter & { stdout: Readable; kill: () => void } {
     const proc = new EventEmitter() as EventEmitter & { stdout: Readable; kill: () => void }
@@ -287,10 +287,23 @@ describe('adapter:空闲超时(与 llm-agy 执行器统一)', () => {
     return proc
   }
 
-  async function drain(lines: string[], timeouts: { idleMs: number }): Promise<{ error?: string }> {
+  /** 假进程:吐出行后以给定退出码结束(模拟 CLI 崩溃/自报失败)。 */
+  function exitingProc(lines: string[], code: number): EventEmitter & { stdout: Readable; kill: () => void } {
+    const proc = hangingProc(lines)
+    const stdout = proc.stdout
+    stdout.push(null)
+    setTimeout(() => proc.emit('close', code, null), 20)
+    return proc
+  }
+
+  async function drain(
+    lines: string[],
+    timeouts: { firstMs?: number; idleMinMs?: number; idleMaxMs?: number } = {},
+    procFactory: (lines: string[]) => EventEmitter & { stdout: Readable; kill: () => void } = hangingProc,
+  ): Promise<{ error?: string }> {
     const { session } = fakeSession()
     mockedSpawn.mockClear()
-    mockedSpawn.mockImplementation(() => hangingProc(lines) as unknown as ReturnType<typeof spawn>)
+    mockedSpawn.mockImplementation(() => procFactory(lines) as unknown as ReturnType<typeof spawn>)
     const ctx = {
       get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined),
     } as unknown as Context
@@ -315,17 +328,44 @@ describe('adapter:空闲超时(与 llm-agy 执行器统一)', () => {
     }
   }
 
-  it('进程静默卡死时,空闲超时触发并抛出明确错误', async () => {
-    // 输出 init + 一段文本后静默:空闲 200ms 就该终止,而不是永远挂着。
+  it('进程静默卡死时,动态空闲超时触发并抛出明确错误', async () => {
+    // 输出 init + 一段文本后静默:热身行数内阈值 = idleMaxMs,300ms 就该终止。
     const init = `${JSON.stringify({ type: 'system', subtype: 'init' })}
 `
     const assistant = `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '开始干活' }] } })}
 `
-    const outcome = await drain([init, assistant], { idleMs: 200 })
+    const outcome = await drain([init, assistant], { idleMaxMs: 300, idleMinMs: 200 })
     expect(outcome.error).toContain('超时')
+    expect(outcome.error).toContain('静默超过 0s') // 300ms = 0s(四舍五入)
+    expect(outcome.error).toContain('历史最大行间隔')
   }, 10_000)
 
-  it('默认空闲窗口为 180s', () => {
-    expect(180_000).toBe(180_000)
+  it('默认预算与 llm-agy 执行器一致且无总时长上限', () => {
+    expect(DEFAULT_CODEBUDDY_RUN_TIMEOUTS).toEqual({
+      firstMs: 60_000,
+      idleMinMs: 150_000,
+      idleMaxMs: 600_000,
+      idleFactor: 3,
+      idleWarmupLines: 6,
+    })
   })
+
+  it('CLI 异常退出码立即报错,不等空闲超时', async () => {
+    // CLI 崩溃退出(code 1):流结束后按退出码立即归因——这是"监听 CLI
+    // 自己的错误"而非计时器猜测。
+    const init = `${JSON.stringify({ type: 'system', subtype: 'init' })}
+`
+    const outcome = await drain([init], {}, lines => exitingProc(lines, 1))
+    expect(outcome.error).toContain('异常退出')
+    expect(outcome.error).toContain('code 1')
+  }, 10_000)
+
+  it('正常退出码 0 不报错', async () => {
+    const init = `${JSON.stringify({ type: 'system', subtype: 'init' })}
+`
+    const result = `${JSON.stringify({ type: 'result', is_error: false, usage: { input_tokens: 1, output_tokens: 1 } })}
+`
+    const outcome = await drain([init, result], {}, lines => exitingProc(lines, 0))
+    expect(outcome.error).toBeUndefined()
+  }, 10_000)
 })

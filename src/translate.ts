@@ -113,7 +113,13 @@ export class CodebuddyTranslator {
       for (const block of content) {
         switch (block.type) {
           case 'thinking': {
-            const text = typeof block.text === 'string' ? block.text : ''
+            // CLI 的 thinking 块字段名是 `thinking`(实测 stream-json:
+            // {type:'thinking', thinking:'...', signature}),不是 text;
+            // 之前读 block.text 永远为空,reasoning 块从未产出,子代理
+            // 窗口因此只剩一排工具调用卡。
+            const text = typeof block.thinking === 'string'
+              ? block.thinking
+              : typeof block.text === 'string' ? block.text : ''
             if (text.length > 0) chunks.push(...this.pushReasoning(text))
             break
           }

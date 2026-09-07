@@ -20,11 +20,30 @@ export interface CodebuddyAdapterOptions {
     permissionMode: string;
     /** 追加的额外 CodeBuddy 参数。 */
     extraArgs: string[];
-    /** 空闲超时预算(可选,默认 180s);测试注入小值以便压缩时间。 */
+    /**
+     * 超时预算(动态自适应,默认见 {@link DEFAULT_CODEBUDDY_RUN_TIMEOUTS});
+     * 测试注入小值以便压缩时间。
+     */
     timeouts?: {
-        idleMs?: number;
+        firstMs?: number;
+        idleMinMs?: number;
+        idleMaxMs?: number;
+        idleFactor?: number;
+        idleWarmupLines?: number;
     };
 }
+/** 默认超时预算(与 llm-agy 执行器同一套动态算法):CodeBuddy 深度思考期间
+ * stream-json 可以长时间不出行(整条 assistant 消息完成后才输出,流式思考
+ * 在本地不落任何记录),固定阈值必然误杀——故按本次调用已观测的最大行间隔
+ * 自适应,热身行数内一律 idleMaxMs 宽容,样本足够后收紧到
+ * clamp(最大间隔 × factor, min, max)。无总时长上限,有输出即续期。 */
+export declare const DEFAULT_CODEBUDDY_RUN_TIMEOUTS: {
+    firstMs: number;
+    idleMinMs: number;
+    idleMaxMs: number;
+    idleFactor: number;
+    idleWarmupLines: number;
+};
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
  * 序列化 prompt → spawn `codebuddy -p ... --output-format stream-json`

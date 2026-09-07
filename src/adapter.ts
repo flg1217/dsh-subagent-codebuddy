@@ -49,8 +49,30 @@ export interface CodebuddyAdapterOptions {
   permissionMode: string
   /** 追加的额外 CodeBuddy 参数。 */
   extraArgs: string[]
-  /** 空闲超时预算(可选,默认 180s);测试注入小值以便压缩时间。 */
-  timeouts?: { idleMs?: number }
+  /**
+   * 超时预算(动态自适应,默认见 {@link DEFAULT_CODEBUDDY_RUN_TIMEOUTS});
+   * 测试注入小值以便压缩时间。
+   */
+  timeouts?: {
+    firstMs?: number
+    idleMinMs?: number
+    idleMaxMs?: number
+    idleFactor?: number
+    idleWarmupLines?: number
+  }
+}
+
+/** 默认超时预算(与 llm-agy 执行器同一套动态算法):CodeBuddy 深度思考期间
+ * stream-json 可以长时间不出行(整条 assistant 消息完成后才输出,流式思考
+ * 在本地不落任何记录),固定阈值必然误杀——故按本次调用已观测的最大行间隔
+ * 自适应,热身行数内一律 idleMaxMs 宽容,样本足够后收紧到
+ * clamp(最大间隔 × factor, min, max)。无总时长上限,有输出即续期。 */
+export const DEFAULT_CODEBUDDY_RUN_TIMEOUTS = {
+  firstMs: 60_000,
+  idleMinMs: 150_000,
+  idleMaxMs: 600_000,
+  idleFactor: 3,
+  idleWarmupLines: 6,
 }
 
 /** 进程退出兜底:进程卡死时强制结束,保证 stream 一定结束。 */
@@ -153,13 +175,23 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         ...this.options.extraArgs,
       ], {
         cwd,
-        stdio: ['ignore', 'pipe', 'inherit'],
+        // stderr 收为管道:CLI 的重试/进度日志走这里,收集尾部用于错误归因。
+        stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
       if (proc.stdout === null) {
         proc.kill()
         throw new Error('subagent-codebuddy: codebuddy process has no stdout stream')
       }
+
+      // CLI 自己的错误信号:退出码。正常完成 code 0;崩溃/自报失败非 0——
+      // 流结束后按退出码立即报错并附 stderr 尾巴,而不是靠计时器猜。
+      let exitCode: number | null | undefined
+      let exitSignal: string | undefined
+      proc.on('close', (code, signal) => {
+        exitCode = code
+        exitSignal = signal ?? undefined
+      })
 
       const onAbort = (): void => { proc.kill() }
       options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -233,21 +265,58 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         pendingChunks = []
       }
 
-      // 空闲超时(与 llm-agy 的执行器统一):180s 没有任何输出即判定进程
-      // 卡死并终止。CodeBuddy 长任务期间会持续输出,正常任务不会被误杀;
-      // 此前只有 stdout 读完后的 30s 退出兜底,进程静默挂死时 stream 会
-      // 永远挂着。不设总时长——CLI 完成任务自然退出。
-      const IDLE_TIMEOUT_MS = this.options.timeouts?.idleMs ?? 180_000
+      // 动态空闲超时(与 llm-agy 执行器同一套算法):CodeBuddy 深度思考/
+      // 长工具执行期间 stream-json 可以长时间不出行——流式思考在本地不落
+      // 任何记录,固定阈值必然误杀。stdout 每行重置静默计时并采样;静默
+      // 阈值按本次调用已观测的最大行间隔自适应 clamp(最大间隔 × factor,
+      // min, max),热身行数内一律 idleMaxMs 宽容(任务早期的历史间隔还
+      // 不足以预测后续的长静默)。无总时长上限——有输出就永远续期。
+      const to = { ...DEFAULT_CODEBUDDY_RUN_TIMEOUTS, ...this.options.timeouts }
+      const startedAt = Date.now()
       let idleTimedOut = false
-      let idleKiller: ReturnType<typeof setTimeout> | undefined
-      const armIdle = (): void => {
-        if (idleKiller !== undefined) clearTimeout(idleKiller)
-        idleKiller = setTimeout(() => {
-          idleTimedOut = true
-          proc.kill()
-        }, IDLE_TIMEOUT_MS)
+      let firstTimer: ReturnType<typeof setTimeout> | undefined
+      let idleTimer: ReturnType<typeof setTimeout> | undefined
+      let maxGapMs = 0
+      let lastLineAt = startedAt
+      let lineSamples = 0
+      let lastBudgetMs = to.idleMaxMs
+      const failIdle = (): void => {
+        idleTimedOut = true
+        try { proc.kill() } catch { /* 已退出 */ }
+        // 进程树残留可能仍持有 stdout 写端,必须同时关流,for-await 才能结束。
+        try { proc.stdout?.destroy() } catch { /* 已关闭 */ }
       }
-      armIdle()
+      const touch = (): void => {
+        // 续命:按当前预算重置静默计时;首个活动同时撤销首包超时。
+        if (firstTimer !== undefined) {
+          clearTimeout(firstTimer)
+          firstTimer = undefined
+        }
+        if (idleTimer !== undefined) clearTimeout(idleTimer)
+        idleTimer = setTimeout(failIdle, lastBudgetMs)
+      }
+      const armIdle = (): void => {
+        const now = Date.now()
+        maxGapMs = Math.max(maxGapMs, now - lastLineAt)
+        lastLineAt = now
+        lineSamples += 1
+        lastBudgetMs = lineSamples <= to.idleWarmupLines
+          ? to.idleMaxMs
+          : Math.min(Math.max(maxGapMs * to.idleFactor, to.idleMinMs), to.idleMaxMs)
+        touch()
+      }
+      touch()
+
+      // stderr 活动(CLI 重试/进度日志)只续命不采样:密集日志不应把
+      // stdout 行间隔样本污染收紧,但它确实证明进程活着。
+      let stderrTail = ''
+      if (proc.stderr !== null && proc.stderr !== undefined) {
+        proc.stderr.setEncoding('utf8')
+        proc.stderr.on('data', (chunk: string) => {
+          stderrTail = (stderrTail + chunk).slice(-4000)
+          touch()
+        })
+      }
 
       const translator = new CodebuddyTranslator()
       try {
@@ -307,12 +376,27 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }
       } finally {
         options.signal?.removeEventListener('abort', onAbort)
-        clearTimeout(idleKiller)
+        if (firstTimer !== undefined) clearTimeout(firstTimer)
+        if (idleTimer !== undefined) clearTimeout(idleTimer)
       }
 
       await closeWithTimeout(proc, options.signal)
+      // CLI 没来得及自报就死掉的两类:静默死挂(动态超时)与异常退出码。
+      // 流内 result.is_error 已由 translator 走 finish error,不在此重复。
+      const stderrNote = stderrTail.trim().length > 0
+        ? `;stderr: ${stderrTail.trim().slice(-500)}`
+        : ''
       if (idleTimedOut) {
-        throw new Error(`CodeBuddy 调用超时(空闲 ${IDLE_TIMEOUT_MS / 1000}s 无输出)`)
+        throw new Error(`CodeBuddy 调用超时(已等待 ${Math.round((Date.now() - startedAt) / 1000)}s;`
+          + `静默超过 ${Math.round(lastBudgetMs / 1000)}s 无输出,本次历史最大行间隔 ${Math.round(maxGapMs / 1000)}s,`
+          + `阈值 = clamp(间隔 × ${to.idleFactor}, ${Math.round(to.idleMinMs / 1000)}s, ${Math.round(to.idleMaxMs / 1000)}s),`
+          + `已收 ${lineSamples} 行${lineSamples === 0 ? '(首包未到)' : ''})${stderrNote}`)
+      }
+      if (!options.signal?.aborted && translator.resultError === undefined
+        && exitCode !== undefined && exitCode !== null && exitCode !== 0) {
+        throw new Error(
+          `CodeBuddy 进程异常退出(code ${exitCode}${exitSignal !== undefined ? `,signal ${exitSignal}` : ''})${stderrNote}`,
+        )
       }
       // 流末:剩余文本**自己**落地到当前 step,不再 yield 给 agent-loop。
       // yield 过去的话,agent-loop 会把这条尾部总结 append 到它自己的初始
