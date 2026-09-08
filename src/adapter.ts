@@ -30,7 +30,7 @@ import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf }
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 
 /** 续跑兜底:仅当消息里找不到用户输入时使用(resumePrompt 的 fallback)。 */
-const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推进直到任务完全完成或遇到必须用户决策的阻塞——不要每轮只做一小步就停下汇报。基于当前工作区状态继续,不要重复已完成的工作;全部完成后给出最终结果报告。'
+const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推进直到任务完全完成或遇到必须用户决策的阻塞——不要每轮只做一小步就停下汇报。基于当前工作区状态继续,不要重复已完成的工作;全部完成后给出最终结果报告。启动 dev server 等长驻进程时必须用 Bash 的 run_in_background: true 参数后台运行——前台运行永不返回会卡死整个任务。'
 
 /** 可重试的委托失败:恢复同一会话续跑(ACP session/load)即可,不重复已完成部分。 */
 class RetryableError extends Error {}
