@@ -148,7 +148,7 @@ beforeEach(() => {
 })
 
 describe('adapter(ACP):基本对话', () => {
-  it('thinking 与文本流落地为 chunk + message,finish stop 收尾', async () => {
+  it('thinking 与文本落地为内嵌 stream 的 message(0.1.3 无 chunk 事件),finish stop 收尾', async () => {
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
@@ -164,8 +164,12 @@ describe('adapter(ACP):基本对话', () => {
     for await (const chunk of adapter.stream(makeOptions('s1'))) {
       chunks.push(JSON.stringify(chunk))
     }
-    expect(appended.some(a => a.startsWith('assistant/chunk') && a.includes('reasoning'))).toBe(true)
-    expect(appended.some(a => a.startsWith('assistant/message') && a.includes('你好'))).toBe(true)
+    expect(appended.some(a => a.startsWith('assistant/chunk'))).toBe(false)
+    const messages = appended.filter(a => a.startsWith('assistant/message'))
+    expect(messages.length).toBe(2)
+    expect(messages.some(a => a.includes('分析中'))).toBe(true)
+    expect(messages.some(a => a.includes('你好'))).toBe(true)
+    expect(messages.every(a => a.includes('"stream"'))).toBe(true)
     expect(chunks.some(c => c.includes('"stop"'))).toBe(true)
   }, 15_000)
 })

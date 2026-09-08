@@ -22,8 +22,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { AssistantStreamAccumulator, ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import type { AssistantStreamRecord, ContentBlock, GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { SessionSeq } from '@deepseek-ai/dsh-session'
 import { buildPrompt } from './serialize.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf } from './acp.js'
@@ -269,9 +269,15 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         chunks: StreamChunk[]
       } | undefined
       let nextBlockIndex = 0
+      let lastStreamTime = 0
 
-      /** 落地已累积的流(块收尾 + assistant/chunk + assistant/message)。 */
-      const flushPending = (): void => {
+      /**
+       * 落地已累积的流(块收尾 + assistant/message)。
+       * 0.1.3 起 `assistant/chunk` 持久事件已移除:精确模型流以 AssistantStreamRecord[]
+       * (AssistantStreamAccumulator 打包)内嵌于 `assistant/message.stream`,live 逐字
+       * 由 agent-loop 的 stream 帧通道负责——ACP 场景退化为块级到达,内容无损。
+       */
+      const flushPending = (interrupted?: true): void => {
         if (currentStream === undefined) return
         const { index, text, chunks, blockType } = currentStream
         const closed: StreamChunk[] = [...chunks, {
@@ -281,9 +287,14 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }]
         currentStream = undefined
         if (session === undefined) return
-        ensureStep()
-        const seqs = closed.map(chunk => session.append('assistant/chunk', { turn, step, chunk }).seq)
         if (text.length > 0) {
+          ensureStep()
+          const accumulator = new AssistantStreamAccumulator()
+          for (const chunk of closed) {
+            const time = Math.max(Date.now(), lastStreamTime + 1)
+            lastStreamTime = time
+            accumulator.push({ time, chunk })
+          }
           pendingBlocks.push(blockType === 'text' ? { type: 'text', text } : { type: 'reasoning', text })
           session.append('assistant/message', {
             turn,
@@ -292,7 +303,9 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               content: pendingBlocks,
               source: { provider: options.provider ?? 'codebuddy', model },
             }),
-          }, { surfaceOp: 'append', sourceEventSeqs: seqs })
+            stream: [...accumulator.snapshot()] as AssistantStreamRecord[],
+            ...(interrupted ? { interrupted } : {}),
+          }, { surfaceOp: 'append' })
           pendingBlocks = []
           if (blockType === 'text') textLanded += 1
         }
@@ -482,7 +495,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         if (promptError !== undefined) throw new RetryableError(`CodeBuddy ACP 请求失败:${promptError.message}${conn.stderrNote()}`)
         if (exitError !== undefined) throw exitError
         if (options.signal?.aborted === true) {
-          flushPending()
+          // 中止:已交付的文本/思考前缀按 0.1.3 语义标 interrupted 落地。
+          flushPending(true)
           closeStep()
           return
         }
