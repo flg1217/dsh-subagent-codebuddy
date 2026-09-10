@@ -121,8 +121,10 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
   private async *streamWithRetry(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const maxAttempts = this.options.maxAttempts ?? 2
     const retryDelayMs = this.options.retryDelayMs ?? 3_000
-    // 会话级 step 状态跨 attempt 连续(重试的续跑是同一子代理任务的延续)。
-    const stepState = { stepped: false, toolCallSeqs: new Map<string, SessionSeq>() }
+    // 会话级 step 状态跨 attempt 连续(重试的续跑是同一子代理任务的延续);
+    // maxGapMs 同享:重试不应忘掉已学到的进展间隔,否则每次 attempt 都从
+    // 下限预算重新开始,长任务会被反复误杀。
+    const stepState = { stepped: false, toolCallSeqs: new Map<string, SessionSeq>(), maxGapMs: 0 }
 
     for (let attempt = 1; ; attempt++) {
       const isLast = attempt >= maxAttempts
@@ -154,7 +156,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
   private async *streamOnce(
     options: GenerateOptions,
     attempt: number,
-    stepState: { stepped: boolean; toolCallSeqs: Map<string, SessionSeq> },
+    stepState: { stepped: boolean; toolCallSeqs: Map<string, SessionSeq>; maxGapMs: number },
   ): AsyncIterable<StreamChunk> {
     const { command, prefixArgs } = this.options
     // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
@@ -198,7 +200,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let firstTimer: ReturnType<typeof setTimeout> | undefined
       let idleTimer: ReturnType<typeof setTimeout> | undefined
       let killTimer: ReturnType<typeof setTimeout> | undefined
-      let maxGapMs = 0
+      let maxGapMs = stepState.maxGapMs
       let lastProgressAt = startedAt
       let progressSamples = 0
       let lastBudgetMs = to.idleMaxMs
@@ -223,9 +225,13 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       const armIdle = (): void => {
         const now = Date.now()
         maxGapMs = Math.max(maxGapMs, now - lastProgressAt)
+        stepState.maxGapMs = maxGapMs
         lastProgressAt = now
         progressSamples += 1
-        lastBudgetMs = progressSamples <= to.idleWarmupLines
+        // 工具在途(tool_call 已到、completion 未到)期间用满预算:ACP 的工具
+        // 只有 start/complete 两个事件,长工具(分钟级)中途没有任何心跳,
+        // 收紧的动态预算会把正常运行的子代理误判为静默并杀掉。
+        lastBudgetMs = pendingToolCalls.size > 0 || progressSamples <= to.idleWarmupLines
           ? to.idleMaxMs
           : Math.min(Math.max(maxGapMs * to.idleFactor, to.idleMinMs), to.idleMaxMs)
         touch()
@@ -346,6 +352,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             const known = pendingToolCalls.get(update.toolCallId)
             if (known === undefined) {
               pendingToolCalls.set(update.toolCallId, { name, rawInput, landed: false })
+              // 在途工具即刻放宽空闲预算(switch 前的 armIdle 还不知道它存在)。
+              armIdle()
               if (!complete) return
             }
             const entry = pendingToolCalls.get(update.toolCallId)!
@@ -388,6 +396,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               if (ev !== undefined) stepState.toolCallSeqs.set(update.toolCallId, ev.seq)
             }
             pendingToolCalls.delete(update.toolCallId)
+            // 工具收尾:退回动态预算(此更新本身是进展,计时从此刻重新起算)。
+            armIdle()
             const outputText = update.rawOutput?.text ?? ''
             flushPending()
             const seq = stepState.toolCallSeqs.get(update.toolCallId)
@@ -490,7 +500,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           throw new RetryableError(`CodeBuddy ACP 调用超时(已等待 ${Math.round((Date.now() - startedAt) / 1000)}s;`
             + `静默超过 ${Math.round(lastBudgetMs / 1000)}s 无进展,本次历史最大进展间隔 ${Math.round(maxGapMs / 1000)}s,`
             + `阈值 = clamp(间隔 × ${to.idleFactor}, ${Math.round(to.idleMinMs / 1000)}s, ${Math.round(to.idleMaxMs / 1000)}s),`
-            + `已收 ${progressSamples} 次进展${conn.stderrNote()})`)
+            + `已收 ${progressSamples} 次进展,在途工具 ${pendingToolCalls.size} 个${conn.stderrNote()})`)
         }
         if (promptError !== undefined) throw new RetryableError(`CodeBuddy ACP 请求失败:${promptError.message}${conn.stderrNote()}`)
         if (exitError !== undefined) throw exitError
