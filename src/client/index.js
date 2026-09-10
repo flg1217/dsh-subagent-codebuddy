@@ -72,8 +72,8 @@ window.__ModuleLoader__.load({
       { label: 'npm (global)', cmd: 'npm install -g @tencent-ai/codebuddy-code' },
     ]
     const TOOLS = [
-      { name: 'subagent_codebuddy', desc: '委派独立任务给 CodeBuddy 子代理(独立进程 + 自带工具;continuable 可复用长线会话;可选 model 参数动态指定模型)' },
-      { name: 'list_codebuddy_models', desc: '列出 CodeBuddy CLI 当前支持的模型 id,委派前先查询再传准确 id' },
+      { name: 'subagent_codebuddy (opt-in)', desc: '委派独立任务给 CodeBuddy 子代理(独立进程 + 自带工具;continuable 可复用长线会话;可选 model 参数动态指定模型)——在上方开关开启后注册,推荐用通用 subagent 工具' },
+      { name: 'list_codebuddy_models (opt-in)', desc: '列出 CodeBuddy CLI 当前支持的模型 id,委派前先查询再传准确 id;通用工具的模型目录由模型选择器/list_subagent_models 提供' },
     ]
 
     /** 安装命令行:label + code + 复制按钮(带已复制状态)。 */
@@ -123,6 +123,8 @@ window.__ModuleLoader__.load({
       const [detailText, setDetailText] = react.useState('')
       const [loadingModels, setLoadingModels] = react.useState(false)
       const [pickerOpen, setPickerOpen] = react.useState(false)
+      // 旧版自定义子代理工具开关(registerSubagentTools,默认关闭)。
+      const [legacyTools, setLegacyTools] = react.useState(false)
 
       // 初始值与明细:走 settings.describe(结构化、经网关校验;不走 discoverModels,
       // 避免响应 schema 校验失败导致解析出垃圾值)。
@@ -132,6 +134,7 @@ window.__ModuleLoader__.load({
           const model = v.model ?? ''
           setCurrentModel(model)
           setSavedModel(model)
+          setLegacyTools(v.registerSubagentTools === true)
           setDetailText(`命令:${v.command ?? 'codebuddy'} | 权限:${v.permissionMode ?? 'bypassPermissions'}`)
         } catch { /* 忽略 */ }
       }, [scope])
@@ -157,6 +160,17 @@ window.__ModuleLoader__.load({
           loadConfig()
         } catch { /* 写失败回读还原 */ loadConfig() }
       }, [scope, loadConfig])
+
+      // 旧版工具开关:开 = set(true),关 = unset(回落 schema 默认 false)。
+      const toggleLegacyTools = react.useCallback(async () => {
+        const next = !legacyTools
+        setLegacyTools(next)
+        try {
+          if (next) await scope.set('registerSubagentTools', true)
+          else await scope.unset('registerSubagentTools')
+        } catch { /* 写失败回读还原 */ }
+        loadConfig()
+      }, [legacyTools, scope, loadConfig])
 
       // 手动输入:输入时只更新本地,失焦提交;与已保存值一致时跳过。
       const onModelInput = react.useCallback((e) => setCurrentModel(e.target.value), [])
@@ -185,7 +199,7 @@ window.__ModuleLoader__.load({
         },
           react.createElement('span', { className: C.headText },
             react.createElement('span', { className: C.name }, 'CodeBuddy'),
-            react.createElement('span', { className: C.description }, '默认配置、检测安装/登录、连通性测试、安装命令与工具说明'),
+            react.createElement('span', { className: C.description }, 'CodeBuddy 作为主模型(模型选择器可选)与子代理 provider;默认配置、检测安装/登录、连通性测试、安装命令与工具说明'),
           ),
           react.createElement(IconChevronDownOutline14, { className: `${C.chevron} ${open ? C.chevronOpen : ''}` }),
         ),
@@ -224,7 +238,21 @@ window.__ModuleLoader__.load({
               className: C.modelField,
             }),
             detailText !== '' && react.createElement('p', { className: C.hint, style: { fontFamily: 'var(--dsw-font-family-code, monospace)' } }, detailText),
-            react.createElement('p', { className: C.hint }, '可直接输入模型 id(失焦保存),或点"获取模型"从弹窗选择;作为新委派子代理的默认模型,实时生效'),
+            react.createElement('p', { className: C.hint }, '可直接输入模型 id(失焦保存),或点"获取模型"从弹窗选择;作为委派子代理的默认模型(实时生效);主会话可直接在模型选择器中选择 CodeBuddy 的任意模型'),
+          ),
+
+          // 旧版子代理工具开关(默认关闭,实时生效)
+          react.createElement('div', { className: C.field },
+            react.createElement('div', { className: C.fieldHead },
+              react.createElement('span', { className: C.label }, '旧版子代理工具'),
+              react.createElement(Button, {
+                size: 'sm',
+                variant: legacyTools ? undefined : 'ghost',
+                onClick: toggleLegacyTools,
+              }, legacyTools ? '已开启(点按关闭)' : '已关闭(点按开启)'),
+            ),
+            react.createElement('p', { className: C.hint },
+              '提供 subagent_codebuddy / list_codebuddy_models 自定义工具;默认关闭——推荐用通用 subagent 工具(provider: codebuddy + 模型选择)。开启/关闭对新会话生效。'),
           ),
 
           // 安装命令

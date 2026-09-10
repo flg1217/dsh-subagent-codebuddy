@@ -22,8 +22,22 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
-import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { SessionEvent } from '@deepseek-ai/dsh-session';
+import { ConversationStore } from './conversations.js';
 import type { AcpTimeouts } from './acp.js';
+/**
+ * 会话中最后一个已打开(尚无配对 step/end)的 turn/step。
+ *
+ * adapter 只在检测到调用方(agent-loop)已打开的 step 时直写事件——
+ * 自己绝不创建 step,否则会与循环的 step 记账交错,破坏严格 v2 关系校验。
+ * @param events - 会话自身的已提交事件(ownEvents)。
+ * @returns 打开的 turn/step,没有则为 undefined。
+ */
+export declare function findOpenStep(events: readonly SessionEvent[]): {
+    turn: number;
+    step: number;
+} | undefined;
 /** CodeBuddy CLI 入口配置(由 index.ts 解析)。 */
 export interface CodebuddyAdapterOptions {
     /** 可执行入口(node 脚本绝对路径或命令)。 */
@@ -42,24 +56,42 @@ export interface CodebuddyAdapterOptions {
     maxAttempts?: number;
     /** 重试间隔(毫秒,默认 3s)。 */
     retryDelayMs?: number;
+    /** 中途插入轮询间隔(毫秒,默认 1200;测试用小值)。 */
+    steerPollMs?: number;
+    /** 续接映射存储(默认持久化到 `~/.dsh/codebuddy/conversations.json`;测试传纯内存)。 */
+    store?: ConversationStore;
+    /** 原生会话文件根目录(默认 `~/.codebuddy/projects`;测试注入临时目录)。 */
+    nativeBaseDir?: string;
 }
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
  * spawn `codebuddy --acp` → initialize → session/new(或 session/load 复用)
  * → session/prompt → 消费 session/update(思考/文本/工具)→ finish 收尾。
  * 每次调用一个 ACP 进程,用完退出;会话连续性由 CodeBuddy 会话存储 +
- * session/load 保证(实测回放完整);静默失败自动恢复会话续跑。
+ * session/load 保证(实测回放完整);续接映射持久化,服务重启后自动恢复;
+ * 静默失败自动恢复会话续跑。
  */
 export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly ctx;
     private readonly options;
     /**
-     * dsh 子代理会话 → CodeBuddy ACP sessionId。
+     * dsh 会话 → CodeBuddy ACP 会话的续接映射(持久化,跨服务重启恢复)。
      *
-     * 首次调用 `session/new` 建立并记录;之后同一子代理会话的每次 stream 都
+     * 首次调用 `session/new` 建立并记录;之后同一会话的每次 stream 都
      * `session/load` 载入同一会话(官方实现会先回放历史事件,回放不落地)。
      */
-    private readonly conversationIds;
+    private readonly conversations;
+    /** listModels 缓存与并发合并(目录拉取热路径)。 */
+    private modelCache;
+    private modelFetch;
+    /** 中继回退:同一会话最多保留的转发 id 数(防无界增长)。 */
+    private static readonly FORWARDED_CAP;
+    /** dsh 会话 → todo 列表状态(CodeBuddy 任务工具折算整表快照,跨轮复用)。 */
+    private readonly todoStates;
+    /** dsh 会话 → 已转发的插入消息 id(续聊补发时跳过,防重复)。 */
+    private readonly forwardedInsertions;
+    /** 标记一条插入为已转发;已标记过返回 false。 */
+    private markForwarded;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);
     /**
      * 绑定模型元数据与分发流入口(rc.2+ 的 LlmAdapter 接口)。
@@ -70,6 +102,8 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
         model: LlmResolvedModelInfo;
         stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>;
     }>;
+    /** 取(或建)某会话的 todo 状态;首建时从已提交事件折叠最新 todo/write 播种。 */
+    private todoStateFor;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
     /**
      * 带重试的委托执行。可重试失败(静默空跑/半途终止/进程退出/超时)时
@@ -79,4 +113,17 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     /** 单次委托尝试:进程 + 握手 + prompt + update 消费。 */
     private streamOnce;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
+    /** 主模型选择器里的 provider 分组名。 */
+    providerInfo(provider: string): {
+        id: string;
+        name: string;
+    };
+    /**
+     * 主模型选择器的模型目录:`codebuddy --help` 解析出的 id ∪ 设置里的默认模型。
+     *
+     * 目录路径会在客户端每次拉取时被调用,且 CLI 可能缺失/挂起——因此
+     * 异步 spawn + 超时、成功缓存 10 分钟、失败缓存 60 秒、并发合并,
+     * 并且**永不抛错**:CLI 不可用时回退到配置模型,保证 provider 仍可选择。
+     */
+    listModels(provider: string): Promise<readonly LlmModelInfo[]>;
 }

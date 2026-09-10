@@ -16,3 +16,5 @@
         permissionMode: bypassPermissions
         providerName: codebuddy
         toolName: subagent_codebuddy
+        # 自定义委派工具默认关闭:统一走 dsh 通用 subagent 工具 + subagent-model-selection
+        registerSubagentTools: false

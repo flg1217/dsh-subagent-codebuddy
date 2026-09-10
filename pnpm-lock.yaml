@@ -9,26 +9,29 @@ importers:
   .:
     devDependencies:
       '@deepseek-ai/cordis':
-        specifier: link:D:/Projects/DeepseekHarness/repo/vendor/cordis
-        version: link:../../repo/vendor/cordis
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/vendor/cordis
+        version: link:../deepseek-harness/vendor/cordis
       '@deepseek-ai/dsh-llm':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/llm/llm
-        version: link:../../repo/packages/llm/llm
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/llm/llm
+        version: link:../deepseek-harness/packages/llm/llm
       '@deepseek-ai/dsh-session':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/core/session
-        version: link:../../repo/packages/core/session
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/core/session
+        version: link:../deepseek-harness/packages/core/session
+      '@deepseek-ai/dsh-session-format-v0-to-v1':
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/session/session-format-v0-to-v1
+        version: link:../deepseek-harness/packages/session/session-format-v0-to-v1
       '@deepseek-ai/dsh-settings':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/settings/settings
-        version: link:../../repo/packages/settings/settings
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/settings/settings
+        version: link:../deepseek-harness/packages/settings/settings
       '@deepseek-ai/dsh-subagent':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/subagent/subagent
-        version: link:../../repo/packages/subagent/subagent
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/subagent/subagent
+        version: link:../deepseek-harness/packages/subagent/subagent
       '@deepseek-ai/dsh-tools':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/core/tools
-        version: link:../../repo/packages/core/tools
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/core/tools
+        version: link:../deepseek-harness/packages/core/tools
       '@deepseek-ai/dsh-util-values':
-        specifier: link:D:/Projects/DeepseekHarness/repo/packages/util/values
-        version: link:../../repo/packages/util/values
+        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/util/values
+        version: link:../deepseek-harness/packages/util/values
       '@deepseek-ai/schemastery':
         specifier: ^3.0.0
         version: 3.18.1

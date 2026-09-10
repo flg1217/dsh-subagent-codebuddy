@@ -30,6 +30,15 @@ export interface AcpTimeouts {
     idleMaxMs?: number;
     idleFactor?: number;
     idleWarmupLines?: number;
+    /**
+     * 在途工具期间的空闲硬顶(毫秒,默认 30 分钟;<=0 关闭)。
+     * 正常长工具无心跳,空闲计时在工具在途时整体暂停;但工具**永不返回**
+     * (CLI 卡死)+ 消费方被回收时,没有这层硬顶就会永久泄漏进程、
+     * 子会话回合悬空(实测:侧边栏判定"目录损坏")。
+     * 只咬「完全静默」的工具段——有任何中间 update 都会重置计时;超顶走
+     * stall 重试(自动续跑),被误杀的工具通常工作已落盘,重跑代价可控。
+     */
+    guardCapMs?: number;
 }
 /** ACP session/update 里我们消费的 update 类型(其余类型仅作活动判定时忽略)。 */
 export interface AcpUpdate {

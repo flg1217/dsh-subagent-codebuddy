@@ -23,6 +23,7 @@ export const CodebuddySettingsConfig = z.object({
   command: z.string().default('codebuddy').description('codebuddy 可执行文件命令(默认 codebuddy)'),
   model: z.string().default('deepseek-v4-flash').description('子代理使用的默认模型(委派时可传 model 参数覆盖)'),
   permissionMode: z.string().default('bypassPermissions').description('--permission-mode:子代理工具调用自动放行'),
+  registerSubagentTools: z.boolean().default(false).description('提供旧版自定义委派工具(subagent_codebuddy / list_codebuddy_models);默认关闭,推荐用通用 subagent 工具 + 模型选择'),
 })
 
 /** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
@@ -30,6 +31,7 @@ export interface EffectiveCodebuddySettings {
   command: string
   model: string
   permissionMode: string
+  registerSubagentTools: boolean
 }
 
 /**
@@ -125,9 +127,16 @@ export function codebuddyTest(command: string, prefixArgs: string[]): Promise<{ 
  * 注册设置区与模型探测通道(客户端卡片按钮走 api.llm.discoverModels,不落会话)。
  * 设置区是卡片在"设置 → 插件"页出现的前提:该页按 settings namespace
  * 派发卡片(key = namespace);表单值优先于插件行配置,改动后重启生效。
+ * @param ctx - 插件上下文。
+ * @param config - 插件行配置(兜底值)。
+ * @param onSettingsChange - 设置保存后的回调(用于实时同步 opt-in 工具注册)。
  * @returns 读取当前生效配置的函数。
  */
-export function registerCodebuddySettings(ctx: Context, config: Config): () => EffectiveCodebuddySettings {
+export function registerCodebuddySettings(
+  ctx: Context,
+  config: Config,
+  onSettingsChange?: () => void,
+): () => EffectiveCodebuddySettings {
   let current: () => Record<string, unknown> = () => ({})
   // 官方 0.1.2:设置区经 ctx.settings.installSection 注册(NS 为普通字符串)。
   ctx.inject(['settings'], (settingsCtx) => {
@@ -144,7 +153,7 @@ export function registerCodebuddySettings(ctx: Context, config: Config): () => E
       setSource: (source) => {
         current = (() => source() ?? {}) as () => Record<string, unknown>
       },
-      onChange: () => {},
+      onChange: () => onSettingsChange?.(),
     })
   })
   const sectionOf = (): EffectiveCodebuddySettings => {
@@ -153,6 +162,7 @@ export function registerCodebuddySettings(ctx: Context, config: Config): () => E
       command: s.command ?? config.command ?? 'codebuddy',
       model: s.model ?? config.model ?? 'deepseek-v4-flash',
       permissionMode: s.permissionMode ?? config.permissionMode ?? 'bypassPermissions',
+      registerSubagentTools: s.registerSubagentTools ?? config.registerSubagentTools ?? false,
     }
   }
 

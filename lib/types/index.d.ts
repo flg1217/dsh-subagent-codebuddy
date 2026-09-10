@@ -1,19 +1,19 @@
 /**
- * CodeBuddy CLI 作为 dsh 子代理提供方(LLM 适配器架构)。
+ * CodeBuddy CLI(Tencent)作为 dsh 的 LLM 提供方(模型供应商模式)。
  *
  * 结构对齐 dsh-llm-agy:
- *  1. 注册 `codebuddy` LLM provider 路由(CodebuddyLlmAdapter)——每次
- *     子代理 LLM 调用 spawn `codebuddy -p --output-format stream-json`,
- *     翻译文本与工具步骤回 dsh;
- *  2. 挂载 `@deepseek-ai/dsh-tool-subagent` 实例(provider: spawn,
- *     backgroundMode: continuable)——子代理是 dsh 进程内 agent,
- *     会话可常驻、`send_message` 可续聊;推理由 CodeBuddy 完成。
+ *  1. 注册 `codebuddy` LLM provider 路由(CodebuddyLlmAdapter,ACP 协议)——
+ *     主代理可直接在模型选择器里选用 CodeBuddy 模型(该轮由 CodeBuddy
+ *     CLI 全权驱动,用它自己的工具链;dsh 的沙箱/审批不参与);同时
+ *     通用 `subagent` 工具可通过 subagent-model-selection 委派
+ *     `{provider: codebuddy, model: <id>}` 的进程内子代理。
+ *  2. 可选注册自定义委派工具 `subagent_codebuddy` 与 `list_codebuddy_models`
+ *     ——工具描述里内置"完整上下文"指引,作为通用工具之外的 opt-in 路径。
+ *     开关在**设置面板**(设置 → 插件 → CodeBuddy,`registerSubagentTools`,
+ *     默认关闭)实时生效,也可用插件行配置兜底。
  *
- * 与"ACP 直接子代理"方案的区别:
- * - 每个子代理是独立 dsh 会话,并行子代理互不干扰、可分别续聊;
- * - 每次调用把该子代理自己的完整历史序列化进 prompt(不依赖
- *   CodeBuddy 按 cwd 自动续上下文的存储,无跨任务串味);
- * - 子代理仍由 CodeBuddy 驱动其自带工具,步骤回传 dsh 会话事件。
+ * 模型目录:adapter `listModels()` 解析 `codebuddy --help` 的支持列表,
+ * 供主模型选择器与 list_subagent_models 使用(带缓存,永不抛错)。
  * @module subagent-codebuddy
  */
 import type { Context } from '@deepseek-ai/cordis';
@@ -23,21 +23,29 @@ export declare const inject: string[];
 export interface Config {
     /** 可执行文件,默认 `codebuddy`。 */
     command?: string;
-    /** 子代理使用的 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
+    /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
     model?: string;
     /**
      * 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`
-     * (子代理工具调用自动放行,不询问)。
+     * (CodeBuddy 工具调用自动放行,不询问)。
      */
     permissionMode?: string;
     /** 追加的额外 CodeBuddy 参数。 */
     extraArgs?: string[];
     /** LLM provider 路由名,默认 `codebuddy`。 */
     providerName?: string;
-    /** 工具名,默认 `subagent_codebuddy`。 */
+    /** opt-in 工具名,默认 `subagent_codebuddy`。 */
     toolName?: string;
-    /** 是否注册委派工具(默认开启)。 */
+    /** 是否注册 opt-in 委派工具(默认关闭;设置面板同名开关优先)。 */
     registerSubagentTools?: boolean;
+    /**
+     * 静默长工具硬顶(分钟,默认 30;0 = 关闭硬顶)。
+     * 只影响「发起后零事件」的工具段——任何中间进展(文本/思考/工具 update)
+     * 都会重置计时,会冒泡的长工具不受影响。超顶时中止本次 CodeBuddy 调用
+     * 并**自动续跑**(stall 重试);被误杀的工具通常工作已落盘,重跑代价可控。
+     * 设为 0 则永不因静默中止(接受 CLI 卡死时进程泄漏、子会话回合悬空的风险)。
+     */
+    longToolCapMinutes?: number;
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config: Config): void;

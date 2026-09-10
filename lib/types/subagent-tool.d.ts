@@ -27,4 +27,8 @@ export interface SubagentToolOptions {
     promptDescription: string;
 }
 /** 注册自定义子代理委派工具(continuable,后台优先)。 */
-export declare function registerSubagentTool(ctx: Context, options: SubagentToolOptions): void;
+/**
+ * 注册自定义子代理委派工具(continuable,后台优先)+ 提示段。
+ * @returns 注销函数(设置开关关闭时调用)。
+ */
+export declare function registerSubagentTool(ctx: Context, options: SubagentToolOptions): () => void;

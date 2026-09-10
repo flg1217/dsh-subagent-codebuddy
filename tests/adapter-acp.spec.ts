@@ -9,6 +9,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
+ import { ConversationStore } from '../src/conversations.ts'
 import { DEFAULT_ACP_RUN_TIMEOUTS } from '../src/acp.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -110,13 +111,16 @@ function makeAdapter(timeouts?: Record<string, number>): { adapter: CodebuddyLlm
   const appended: string[] = []
 
   const session = {
-    header: { cwd: process.cwd() },
+    // 真实子代理会话:带 lineage header + 调用方(agent-loop)已打开的 step。
+    header: { cwd: process.cwd(), parentSession: 'parent-1', origin: 'subagent' as const, delegationDepth: 1 },
     append: (type: string, data: unknown, opts?: unknown) => {
-      appended.push(`${type}@${JSON.stringify(data).slice(0, 700)}`)
-      void opts
+      appended.push(`${type}@${JSON.stringify(data).slice(0, 700)}@opts=${JSON.stringify(opts ?? null)}`)
       return { seq: appended.length }
     },
-    ownEvents: (): Array<{ type: string; data: { turn?: number; step?: number } }> => [],
+    ownEvents: (): Array<{ type: string; data: { turn?: number; step?: number } }> => [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'step/start', data: { turn: 1, step: 1 } },
+    ],
   }
   const ctx = {
     get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined),
@@ -127,6 +131,7 @@ function makeAdapter(timeouts?: Record<string, number>): { adapter: CodebuddyLlm
     modelOf: () => 'glm-5.3',
     permissionMode: 'bypassPermissions',
     extraArgs: [],
+    store: new ConversationStore(null),
     ...(timeouts !== undefined ? { timeouts } : {}),
   })
   return { adapter, appended }
@@ -165,11 +170,17 @@ describe('adapter(ACP):基本对话', () => {
       chunks.push(JSON.stringify(chunk))
     }
     expect(appended.some(a => a.startsWith('assistant/chunk'))).toBe(false)
+    // 延写一块:'分析中' 在 '你好' 收尾时持久化(surfaceOp append,侧边栏/历史
+    // 视图运行中可见);流末的 '你好' 交给循环(其收尾消息=最后一块,非空,
+    // 不会再被空消息吞掉;模型派生=两块恰好一次,零重复)。
     const messages = appended.filter(a => a.startsWith('assistant/message'))
-    expect(messages.length).toBe(2)
-    expect(messages.some(a => a.includes('分析中'))).toBe(true)
-    expect(messages.some(a => a.includes('你好'))).toBe(true)
-    expect(messages.every(a => a.includes('"stream"'))).toBe(true)
+    expect(messages.length).toBe(1)
+    expect(messages[0]).toContain('分析中')
+    expect(messages[0]).toContain('"surfaceOp":"append"')
+    expect(chunks.some(c => c.includes('你好'))).toBe(true)
+    expect(chunks.some(c => c.includes('分析中'))).toBe(false)
+    // adapter 不再自管 step:调用方(agent-loop)打开/关闭 step。
+    expect(appended.some(a => a.startsWith('step/'))).toBe(false)
     expect(chunks.some(c => c.includes('"stop"'))).toBe(true)
   }, 15_000)
 })
@@ -226,9 +237,14 @@ describe('adapter(ACP):工具落地', () => {
     expect(appended.some(a => a.startsWith('tool/call@') && a.includes('bash') && !a.includes('Bash'))).toBe(true)
     expect(appended.some(a => a.startsWith('tool/call@') && a.includes('echo hi'))).toBe(true)
     expect(appended.some(a => a.startsWith('tool/call@') && a.includes('{}'))).toBe(false)
+    // 严格校验:tool/call 前必须有广告(assistant/message 内嵌 tool-call 块,id 一致)。
+    const adIndex = appended.findIndex(a => a.startsWith('assistant/message') && a.includes('"type":"tool-call"') && a.includes('call_1'))
+    const callIndex = appended.findIndex(a => a.startsWith('tool/call@'))
+    expect(adIndex).toBeGreaterThanOrEqual(0)
+    expect(adIndex).toBeLessThan(callIndex)
     expect(appended.some(a => a.startsWith('tool/result@') && a.includes('Stdout: hi'))).toBe(true)
-    // 工具 result 后闭合 step,工具后的文本开新 step
-    expect(appended.some(a => a.startsWith('step/end@'))).toBe(true)
+    // adapter 只写进调用方打开的 step,绝不写 step 事件。
+    expect(appended.some(a => a.startsWith('step/'))).toBe(false)
   }, 15_000)
 })
 

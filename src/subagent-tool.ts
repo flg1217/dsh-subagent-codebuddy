@@ -83,9 +83,13 @@ export interface SubagentToolOptions {
 }
 
 /** 注册自定义子代理委派工具(continuable,后台优先)。 */
-export function registerSubagentTool(ctx: Context, options: SubagentToolOptions): void {
+/**
+ * 注册自定义子代理委派工具(continuable,后台优先)+ 提示段。
+ * @returns 注销函数(设置开关关闭时调用)。
+ */
+export function registerSubagentTool(ctx: Context, options: SubagentToolOptions): () => void {
   const { provider, toolName } = options
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: toolName,
     description: options.description,
     parameters: {
@@ -105,7 +109,7 @@ export function registerSubagentTool(ctx: Context, options: SubagentToolOptions)
       },
       model: {
         type: 'string',
-        description: 'Optional model ID for the subagent. Query the model list tool (e.g. list_codebuddy_models) for the currently supported ids and pass an exact one; omit to use the plugin-configured default model.',
+        description: 'Optional model ID for the subagent. Query list_codebuddy_models (or the main model selector) for the currently supported ids and pass an exact one; omit to use the plugin-configured default model.',
       },
     },
     output: {
@@ -167,11 +171,15 @@ export function registerSubagentTool(ctx: Context, options: SubagentToolOptions)
       return await settleForeground(run)
     },
   }))
-  ctx.systemPrompt.section({
+  const disposeSection = ctx.systemPrompt.section({
     name: `tool:${toolName}`,
     order: SECTION_ORDER,
     text: context => ctx.tools.get(toolName, context.scope) === undefined
       ? ''
       : `Use ${toolName} in the background by default. Start independent delegations together in one assistant message and continue useful work while they run. Set \`run_in_background: false\` only when your next action depends on that subagent's result. When a background run settles, the runtime sends you a notice containing its outcome and any final assistant message. To use a non-default model, first query the model list tool for a supported id and pass that exact id in the \`model\` argument.`,
   })
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

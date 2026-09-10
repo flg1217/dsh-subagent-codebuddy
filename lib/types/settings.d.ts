@@ -16,16 +16,19 @@ export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<{
     command: z<string, string>;
     model: z<string, string>;
     permissionMode: z<string, string>;
+    registerSubagentTools: z<boolean, boolean>;
 }>, Schemastery.ObjectT<{
     command: z<string, string>;
     model: z<string, string>;
     permissionMode: z<string, string>;
+    registerSubagentTools: z<boolean, boolean>;
 }>>;
 /** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
 export interface EffectiveCodebuddySettings {
     command: string;
     model: string;
     permissionMode: string;
+    registerSubagentTools: boolean;
 }
 /**
  * Windows 下把 `codebuddy` 命令解析为 node 可直接 spawn 的形式。
@@ -55,6 +58,9 @@ export declare function codebuddyTest(command: string, prefixArgs: string[]): Pr
  * 注册设置区与模型探测通道(客户端卡片按钮走 api.llm.discoverModels,不落会话)。
  * 设置区是卡片在"设置 → 插件"页出现的前提:该页按 settings namespace
  * 派发卡片(key = namespace);表单值优先于插件行配置,改动后重启生效。
+ * @param ctx - 插件上下文。
+ * @param config - 插件行配置(兜底值)。
+ * @param onSettingsChange - 设置保存后的回调(用于实时同步 opt-in 工具注册)。
  * @returns 读取当前生效配置的函数。
  */
-export declare function registerCodebuddySettings(ctx: Context, config: Config): () => EffectiveCodebuddySettings;
+export declare function registerCodebuddySettings(ctx: Context, config: Config, onSettingsChange?: () => void): () => EffectiveCodebuddySettings;
