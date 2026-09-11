@@ -405,6 +405,51 @@ describe('adapter:任务工具 → todo/write 桥接', () => {
   }, 15_000)
 })
 
+describe('adapter:任务面板跨回合重播', () => {
+  it('会话日志里已有常驻任务表(上一轮写的)→ 新一轮开头重写一遍(抵消 turn/start 清空)', async () => {
+    const store = new ConversationStore(null)
+    store.set('s1', { acpId: 'cb-1', sentCount: 1 })
+    const standing = [
+      { content: 'chassis-downlight-direct-edit: 补预热', status: 'in_progress' },
+      { content: 'component-select: 选中态修复', status: 'pending' },
+    ]
+    const appended: Array<{ type: string; data: unknown }> = []
+    const session = {
+      header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
+      append: (type: string, data: unknown) => { appended.push({ type, data }); return { seq: appended.length } },
+      ownEvents: () => [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'step/start', data: { turn: 1, step: 1 } },
+        { type: 'todo/write', data: { todos: standing } },
+      ],
+    }
+    const ctx = { get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined) } as unknown as Context
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store,
+    })
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method === 'session/prompt') setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 5)
+      })
+      setTimeout(() => { p.update(message('这轮不碰任务工具')) }, 5)
+      return asSpawnResult(p)
+    })
+    for await (const _ of adapter.stream(makeOptions('s1', {
+      messages: [{ id: 'm-old', role: 'user', content: [{ type: 'text', text: '旧输入' }], source: { kind: 'user' } }],
+    }))) { /* drain */ }
+    const todos = appended.filter(entry => entry.type === 'todo/write')
+    expect(todos.length).toBe(1)
+    expect((todos[0]!.data as { todos: unknown }).todos).toEqual(standing)
+  }, 15_000)
+})
+
 describe('adapter:中途插入(steering)', () => {
   /** 建一个已打开 step 的直写会话(插入投递的前置条件)。 */
   function directSession(): { events: Array<{ type: string; data?: unknown }>; ctx: Context } {

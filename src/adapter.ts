@@ -771,6 +771,20 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         } catch { /* 展示性桥接不阻断对话 */ }
       }
 
+      // 常驻任务表重播:CodeBuddy 的任务列表是**跨回合常驻**的(它自己的 TaskList
+      // 里还在),而 dsh 的 `todos` 投影在**每个 turn/start 清空**(设计如此:
+      // "standing-plan fold … cleared by the next turn/start")。插件只 CodeBuddy
+      // 动任务工具时才写快照,于是新一轮开始后面板必然空着,直到模型再碰任务——
+      // 用户视角就是"任务可视化又丢了"(实测:最后 todo/write 14:33:44,之后
+      // turn/start 15:07:52 清空,折叠投影 = null)。
+      // 回合开头把插件播种(从会话日志重放)的当前快照重写一遍,面板跨回合/跨重启
+      // 继续显示同一份计划。
+      if (todoState !== undefined) {
+        try {
+          if (todoState.snapshot().length > 0) emitTodo()
+        } catch { /* 展示性桥接不阻断对话 */ }
+      }
+
       /** 处理一条 ACP update:续命 + 会话事件落地 + 流累积。 */
       const handleUpdate = async (update: AcpUpdate): Promise<void> => {
         // CLI 心跳:agent 阶段 + 会话空闲广播(尾巴窗口的收尾判据)。
