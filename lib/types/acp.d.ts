@@ -69,6 +69,14 @@ export interface AcpTimeouts {
     tailBgQuietMs?: number;
     /** 尾巴窗口硬顶(毫秒,默认 30 分钟):后台任务最长可拖着回合不闭合的时长。 */
     tailCapMs?: number;
+    /**
+     * 模型调用边界的静默兜底(毫秒,默认 1000;回合泵用)。
+     * 有工具调用来到、但既没有 `tool_executing` 心跳也没有工具结果时,内容静默
+     * 超过本值即认定这次模型调用已结束(老 CLI 无 agentPhase 能力时的主要判据)。
+     */
+    boundaryQuietMs?: number;
+    /** 收段前的用量宽限期(毫秒,默认 700;回合泵用):等本次调用的 usage 归段。 */
+    usageGraceMs?: number;
 }
 /** ACP session/update 里我们消费的 update 类型(其余类型仅作活动判定时忽略)。 */
 export interface AcpUpdate {

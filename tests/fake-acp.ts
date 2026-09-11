@@ -119,6 +119,18 @@ export const toolCall = (
 export const toolUpdate = (id: string, status: 'completed' | 'failed', output: string): Record<string, unknown> => ({
   sessionUpdate: 'tool_call_update', toolCallId: id, status, rawOutput: { type: 'text', text: output },
 })
+/** agentPhase 心跳(模型调用边界信号)。 */
+export const phase = (name: string): Record<string, unknown> => ({
+  sessionUpdate: 'session_info_update',
+  _meta: { 'codebuddy.ai/agentPhase': { phase: name } },
+})
+/** usage_update(每次模型调用一条)。 */
+export const usage = (payload: Record<string, unknown>): Record<string, unknown> => ({
+  sessionUpdate: 'usage_update',
+  _meta: { usage: payload },
+})
+/** CLI 空闲广播。 */
+export const sessionEnd = (): Record<string, unknown> => ({ sessionUpdate: 'session_end' })
 
 /** 把假进程转成 mock spawn 的返回类型(假对象本身就是 proc)。 */
 export function asSpawnResult(f: FakeAcp): ReturnType<typeof spawn> {

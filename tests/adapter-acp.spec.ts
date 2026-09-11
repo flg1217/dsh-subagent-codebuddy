@@ -11,6 +11,7 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
  import { ConversationStore } from '../src/conversations.ts'
 import { DEFAULT_ACP_RUN_TIMEOUTS, usageOfUpdate } from '../src/acp.ts'
+import { resetPumpStateForTests } from '../src/pump.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -107,7 +108,7 @@ function autoHandshake(f: FakeAcp): void {
   })
 }
 
-function makeAdapter(timeouts?: Record<string, number>): { adapter: CodebuddyLlmAdapter; appended: string[] } {
+function makeAdapter(timeouts?: Record<string, number>, extra?: { maxAttempts?: number; retryDelayMs?: number }): { adapter: CodebuddyLlmAdapter; appended: string[] } {
   const appended: string[] = []
 
   const session = {
@@ -133,6 +134,8 @@ function makeAdapter(timeouts?: Record<string, number>): { adapter: CodebuddyLlm
     extraArgs: [],
     store: new ConversationStore(null),
     ...(timeouts !== undefined ? { timeouts } : {}),
+    ...(extra?.maxAttempts !== undefined ? { maxAttempts: extra.maxAttempts } : {}),
+    ...(extra?.retryDelayMs !== undefined ? { retryDelayMs: extra.retryDelayMs } : {}),
   })
   return { adapter, appended }
 }
@@ -147,13 +150,28 @@ function makeOptions(sessionId: string | undefined, signal?: AbortSignal): Gener
   } as unknown as GenerateOptions
 }
 
+/** 测试用时序预算:把泵的阈值压到毫秒级。 */
+const FAST = {
+  firstMs: 2_000,
+  idleMinMs: 5_000,
+  idleMaxMs: 5_000,
+  idleFactor: 2,
+  idleWarmupLines: 6,
+  tailQuietMs: 60,
+  tailBgQuietMs: 240,
+  tailCapMs: 800,
+  boundaryQuietMs: 20,
+  usageGraceMs: 20,
+}
+
 beforeEach(() => {
   mockedSpawn.mockReset()
   lastFake = undefined
+  resetPumpStateForTests()
 })
 
 describe('adapter(ACP):基本对话', () => {
-  it('thinking 与文本落地为内嵌 stream 的 message(0.1.3 无 chunk 事件),finish stop 收尾', async () => {
+  it('thinking 与文本以 chunk 流交付(泵零会话写入),finish stop 收尾', async () => {
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
@@ -169,19 +187,12 @@ describe('adapter(ACP):基本对话', () => {
     for await (const chunk of adapter.stream(makeOptions('s1'))) {
       chunks.push(JSON.stringify(chunk))
     }
-    expect(appended.some(a => a.startsWith('assistant/chunk'))).toBe(false)
-    // 延写一块:'分析中' 在 '你好' 收尾时持久化(surfaceOp append,侧边栏/历史
-    // 视图运行中可见);同时**每一块**都交给循环组装收尾消息——dsh 客户端对同一
-    // step 的 assistant/message 末条胜出,只 yield 最后一块的话长回合里正文会被
-    // 顶掉(实测只剩最后一句),所以收尾消息必须含全文。
-    const messages = appended.filter(a => a.startsWith('assistant/message'))
-    expect(messages.length).toBe(1)
-    expect(messages[0]).toContain('分析中')
-    expect(messages[0]).toContain('"surfaceOp":"append"')
-    expect(chunks.some(c => c.includes('你好'))).toBe(true)
-    expect(chunks.some(c => c.includes('分析中'))).toBe(true)
-    // adapter 不再自管 step:调用方(agent-loop)打开/关闭 step。
-    expect(appended.some(a => a.startsWith('step/'))).toBe(false)
+    // 回合泵不写任何会话事件:assistant/message 由 agent-loop 用这些 chunk 组装。
+    expect(appended.length).toBe(0)
+    expect(chunks.some(c => c.includes('"block-start"') && c.includes('"reasoning"'))).toBe(true)
+    expect(chunks.some(c => c.includes('"reasoning-delta"') && c.includes('分析中'))).toBe(true)
+    expect(chunks.some(c => c.includes('"text-delta"') && c.includes('你好'))).toBe(true)
+    expect(chunks.some(c => c.includes('"block-end"') && c.includes('你好'))).toBe(true)
     expect(chunks.some(c => c.includes('"stop"'))).toBe(true)
   }, 15_000)
 })
@@ -217,9 +228,9 @@ describe('adapter(ACP):会话复用', () => {
   }, 15_000)
 })
 
-describe('adapter(ACP):工具落地', () => {
-  it('tool_call/tool_call_update → 会话 tool/call + tool/result,名称来自 _meta,参数来自 rawInput', async () => {
-    const { adapter, appended } = makeAdapter()
+describe('adapter(ACP):工具调用边界', () => {
+  it('tool_call(完整参数)→ 段内 tool-call 块(名称来自 _meta、参数来自 rawInput);结果留在泵里', async () => {
+    const { adapter, appended } = makeAdapter(FAST)
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
@@ -227,25 +238,32 @@ describe('adapter(ACP):工具落地', () => {
         p.update(thought('跑个命令'))
         p.update(toolCall('call_1', 'Bash', {}, 'in_progress'))
         p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }, 'pending'))
+        p.update({
+          sessionUpdate: 'session_info_update',
+          _meta: { 'codebuddy.ai/agentPhase': { phase: 'tool_executing' } },
+        })
         p.update(toolUpdate('call_1', 'completed', 'Command: echo hi\nStdout: hi'))
-        p.update(message('完成了'))
-        setTimeout(() => p.respond(p.requestLog().length, { stopReason: 'end_turn' }), 10)
+        setTimeout(() => {
+          p.update(message('完成了'))
+          p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+        }, 60)
       }, 5)
       return p as unknown as ReturnType<typeof spawn>
     })
-    for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    expect(appended.filter(a => a.startsWith('tool/call@')).length).toBe(1)
-    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('bash') && !a.includes('Bash'))).toBe(true)
-    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('echo hi'))).toBe(true)
-    expect(appended.some(a => a.startsWith('tool/call@') && a.includes('{}'))).toBe(false)
-    // 严格校验:tool/call 前必须有广告(assistant/message 内嵌 tool-call 块,id 一致)。
-    const adIndex = appended.findIndex(a => a.startsWith('assistant/message') && a.includes('"type":"tool-call"') && a.includes('call_1'))
-    const callIndex = appended.findIndex(a => a.startsWith('tool/call@'))
-    expect(adIndex).toBeGreaterThanOrEqual(0)
-    expect(adIndex).toBeLessThan(callIndex)
-    expect(appended.some(a => a.startsWith('tool/result@') && a.includes('Stdout: hi'))).toBe(true)
-    // adapter 只写进调用方打开的 step,绝不写 step 事件。
-    expect(appended.some(a => a.startsWith('step/'))).toBe(false)
+    const first: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) first.push(JSON.stringify(chunk))
+    // 泵零会话写入:tool/call + tool/result 由 loop 原生写。
+    expect(appended.length).toBe(0)
+    // 名称来自 _meta 并归一化(bash),参数来自完整形态的 rawInput(不是空壳)。
+    const toolChunk = first.find(c => c.includes('"type":"tool-call"'))
+    expect(toolChunk).toBeDefined()
+    expect(toolChunk!).toContain('"name":"bash"')
+    expect(toolChunk!).toContain('echo hi')
+    // 段在工具边界收尾(finish stop),但泵继续跑:下一段是收尾文本。
+    expect(first.some(c => c.includes('"stop"'))).toBe(true)
+    const second: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) second.push(JSON.stringify(chunk))
+    expect(second.some(c => c.includes('完成了'))).toBe(true)
   }, 15_000)
 })
 
@@ -283,30 +301,33 @@ describe('adapter(ACP):取消与错误', () => {
     expect(chunks.some(c => c.includes('error'))).toBe(false)
   }, 15_000)
 
-  it('进程中途异常退出 → 抛错并附退出码', async () => {
+  it('进程中途异常退出 → 抛错给调用方(附退出码)', async () => {
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
       setTimeout(() => { p.update(thought('开始')); p.close(1) }, 10)
       return p as unknown as ReturnType<typeof spawn>
     })
-    const { adapter } = makeAdapter()
-    const chunks: string[] = []
-    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
-    expect(chunks.some(c => c.includes('CODEBUDDY_EXEC_ERROR') && (c.includes('退出') || c.includes('exit')))).toBe(true)
+    const { adapter } = makeAdapter(FAST, { maxAttempts: 1 })
+    await expect((async () => {
+      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    })()).rejects.toThrow(/退出/)
   }, 15_000)
 
   it('静默无进展 → 先 cancel 后 kill,抛出明确超时错误', async () => {
-    const { adapter } = makeAdapter({ firstMs: 100, idleMaxMs: 200, idleMinMs: 100, idleFactor: 2, idleWarmupLines: 0, maxAttempts: 1, retryDelayMs: 10 })
+    const { adapter } = makeAdapter(
+      { firstMs: 100, idleMaxMs: 200, idleMinMs: 100, idleFactor: 2, idleWarmupLines: 0, boundaryQuietMs: 20, usageGraceMs: 20, tailQuietMs: 60, tailCapMs: 200 },
+      { maxAttempts: 1, retryDelayMs: 10 },
+    )
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
       // prompt 永不响应、永不推 update(纯死挂)
       return p as unknown as ReturnType<typeof spawn>
     })
-    const chunks: string[] = []
-    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
-    expect(chunks.some(c => c.includes('CODEBUDDY_EXEC_ERROR') && c.includes('超时'))).toBe(true)
+    await expect((async () => {
+      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    })()).rejects.toThrow(/超时/)
     expect(lastFake!.notifications().filter(n => n.method === 'session/cancel').length).toBeGreaterThanOrEqual(1)
   }, 25_000)
 

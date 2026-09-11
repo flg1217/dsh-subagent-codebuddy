@@ -1,20 +1,25 @@
 /**
  * CodeBuddy 模型适配器:provider 路由 `codebuddy`,走 ACP(Agent Client Protocol)。
  *
- * 此前是 spawn `codebuddy -p` + 单向解析 stream-json:CLI 内部工具卡死时
- * 进程树杀不干净(工具子进程持有 stdout 写端),for-await 永久挂起,子代理
- * 假死且无任何错误反馈(实测,多机复现)。迁移到 ACP 后:
+ * 两条路径(路线 C1 起):
  *
+ * 1. **回合泵**(`src/pump.ts`):会话绑定且调用方(agent-loop)已打开 step
+ *    的对话轮。一个 CodeBuddy 回合 = 一个 ACP 进程,按**模型调用**切段,
+ *    每个 dsh step 消费一段;工具调用注册 per-agent 的回放工具、由 loop
+ *    原生写 `assistant/message` / `tool/call` / `tool/result`——适配器自己
+ *    零会话写入。这样「一次模型调用 = 一个 step」与 dsh 语义一致:文本/工具
+ *    顺序、每步用量、分页、客户端末条胜出渲染全部自然成立。
+ * 2. **一次性旁路会话**(压缩/会话标题等 purpose 调用、无会话调用):
+ *    纯 chunk 流,零写入。
+ *
+ * ACP 层的关键机制(两条路径共用):
  * - **会话生命周期官方化**:`session/new` / `session/load`(历史回放)复用
- *   长线会话;`session/prompt` 流式 `session/update`(含 thinking 流——
- *   单向 -p 模式没有的 agent_thought_chunk);
+ *   长线会话;`session/prompt` 流式 `session/update`(含 thinking 流);
  * - **协议级取消**:`session/cancel` 对生成流与正在执行的工具都是即时抢占
- *   (实测),`stopReason: "cancelled"` 与正常结束明确区分;abort 信号驱动
- *   周期性重发(思考早期单次通知可能被吞);
+ *   (实测),abort 信号驱动周期性重发(思考早期单次通知可能被吞);
  * - **静默失败自动重试**:CodeBuddy 服务端偶发静默失败(实测高频)——
- *   end_turn 但零思考零文本零工具、或只有思考没有产出。空跑会让主代理
- *   以为子代理完成了(用户看到"莫名中断、发继续没反应")。可重试失败
- *   自动恢复同一会话续跑(ACP session/load 回放),用尽才显式报错;
+ *   end_turn 但零思考零文本零工具。泵在首段无产出时重启一次(恢复同一
+ *   会话续跑);已有产出的回合以显式错误收尾;
  * - **假死防御分层**:进展性 update(消息/思考/工具)重置动态空闲阈值;
  *   CLI 心跳(session_info/usage/config)与 stderr 不参与续命;静默超
  *   阈值先发 cancel、5s 仍无响应才 kill——进程退出码与 stderr 全程留证。
@@ -34,8 +39,9 @@ export declare function steerDebug(line: string): void;
 /**
  * 会话中最后一个已打开(尚无配对 step/end)的 turn/step。
  *
- * adapter 只在检测到调用方(agent-loop)已打开的 step 时直写事件——
- * 自己绝不创建 step,否则会与循环的 step 记账交错,破坏严格 v2 关系校验。
+ * 它是「调用方是 agent-loop 的对话轮」的判据:只有这种调用才走回合泵
+ * (路线 C1,一个 CodeBuddy 回合 = 多个原生 step);压缩/标题这类旁路调用
+ * 没有打开 step,走一次性会话。
  * @param events - 会话自身的已提交事件(ownEvents)。
  * @returns 打开的 turn/step,没有则为 undefined。
  */
@@ -113,12 +119,24 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private todoStateFor;
     stream(options: GenerateOptions): AsyncIterable<StreamChunk>;
     /**
-     * 带重试的委托执行。可重试失败(静默空跑/半途终止/进程退出/超时)时
-     * 恢复同一会话续跑;用尽后以显式错误收尾,让主代理知道子代理实际状态。
+     * 建立/复用本回合的泵(路线 C1)。同一回合内的每个 step 都到这里:
+     * 已有泵 → 直接续段(绝不重发 prompt);没有 → 编译本轮输入并启动泵。
      */
-    private streamWithRetry;
-    /** 单次委托尝试:进程 + 握手 + prompt + update 消费。 */
-    private streamOnce;
+    private startTurn;
+    /**
+     * 原生种子:新会话且带历史时,把折叠后的历史转成 CodeBuddy 原生记录
+     * (由调用方写成会话文件 + session/load 载入)。转换失败返回 undefined,
+     * 调用方退回纯提示词路径。
+     */
+    private buildNativeSeed;
+    /**
+     * 一次性旁路会话(带 purpose 的辅助调用 / 无会话调用)。可重试失败
+     * (静默空跑/半途终止/进程退出/超时)时恢复同一会话续跑;用尽后以显式
+     * 错误收尾。不写任何会话事件——调用方不是 agent-loop 的对话轮。
+     */
+    private streamOneShot;
+    /** 单次旁路委托:进程 + 握手 + prompt + update 消费(纯 chunk,零会话写入)。 */
+    private oneShotOnce;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     /** 主模型选择器里的 provider 分组名。 */
     providerInfo(provider: string): {

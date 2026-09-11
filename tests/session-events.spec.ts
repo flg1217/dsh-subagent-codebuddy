@@ -1,16 +1,21 @@
 /**
- * 最强护栏:把 adapter 一轮真实写入的事件序列交给官方关系校验器
- * (`assertReleasedArtifactRelationships`,v1→v2 迁移路径用的同一份校验),
- * 确保产物满足严格 v2 会话格式——包括 tool/call 必须被前置 assistant/message
- * 广告、step/end 无未决工具、adapter 不写 step 事件。
+ * chunk 流契约(泵 → agent-loop 组装)。
+ *
+ * 路线 C1 下,插件不再写会话事件:每个 dsh step 的 `assistant/message`、
+ * `tool/call`、`tool/result` 都由 agent-loop 用**本文件校验的 chunk 流**组装
+ * 后原生写入(生产环境由会话关系校验器在 append 时把关)。因此插件的护栏是:
+ * 每个 step 的 chunk 能被 `BlockAssembler` 无损组装成合法的内容块——
+ * 块配对完整、工具调用的 id/name/arguments 一次且完整、顺序与 ACP 一致;
+ * 并且每个工具调用都有对应的回放工具可执行。
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
-import { assertReleasedArtifactRelationships } from '@deepseek-ai/dsh-session-format-v0-to-v1'
+import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
- import { ConversationStore } from '../src/conversations.ts'
-import { asSpawnResult, autoHandshake, fakeAcpProc, message, thought, toolCall, toolUpdate } from './fake-acp.ts'
+import { ConversationStore } from '../src/conversations.ts'
+import { TurnPump, resetPumpStateForTests } from '../src/pump.ts'
+import { asSpawnResult, autoHandshake, fakeAcpProc, message, phase, thought, toolCall, toolUpdate } from './fake-acp.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -19,52 +24,45 @@ vi.mock('node:child_process', async (importOriginal) => {
 const { spawn } = await import('node:child_process')
 const mockedSpawn = vi.mocked(spawn)
 
-interface RecordedEvent {
-  type: string
-  seq: number
-  time: number
-  data: unknown
-  surfaceOp?: unknown
-  sourceEventSeqs?: readonly number[]
+const FAST = {
+  firstMs: 2_000,
+  idleMinMs: 5_000,
+  idleMaxMs: 5_000,
+  idleWarmupLines: 6,
+  tailQuietMs: 60,
+  tailBgQuietMs: 240,
+  tailCapMs: 800,
+  boundaryQuietMs: 20,
+  usageGraceMs: 20,
 }
 
-/**
- * 记录型会话 fixture:预置调用方(agent-loop)打开的 turn/step,
- * adapter 写入追加其后;结束后由测试补 step/end + turn/end。
- */
-function makeRecordingAdapter(): {
+interface Harness {
   adapter: CodebuddyLlmAdapter
-  events: RecordedEvent[]
-  seedTurnEnd: () => void
-} {
-  const events: RecordedEvent[] = []
-  const record = (type: string, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: readonly number[] }): void => {
-    events.push({
-      type,
-      seq: events.length,
-      time: events.length + 1,
-      data,
-      ...(opts?.surfaceOp !== undefined ? { surfaceOp: opts.surfaceOp } : {}),
-      ...(opts?.sourceEventSeqs !== undefined ? { sourceEventSeqs: opts.sourceEventSeqs } : {}),
-    })
-  }
-  // 调用方的已提交事件(turn/step 由其打开)。
-  record('turn/start', { turn: 1 })
-  record('step/start', { turn: 1, step: 1 })
+  registeredTools: Map<string, Record<string, unknown>>
+}
 
+function makeAdapter(): Harness {
+  const registeredTools = new Map<string, Record<string, unknown>>()
   const session = {
-    header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
-    append: (type: string, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: readonly number[] }) => {
-      record(type, data, opts)
-      return { seq: events.length - 1 }
-    },
+    header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
+    append: () => ({ seq: 0 }),
     ownEvents: () => [
       { type: 'turn/start', data: { turn: 1 } },
       { type: 'step/start', data: { turn: 1, step: 1 } },
     ],
   }
+  const toolsFace = {
+    register: (definition: Record<string, unknown>): (() => void) => {
+      registeredTools.set(String(definition['name']), definition)
+      return () => {}
+    },
+  }
   const ctx = {
-    get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined),
+    get: (key: string) => {
+      if (key === 'sessions') return { get: () => session }
+      if (key === 'agents') return { get: (id: string) => (id === 's1' ? { ctx: { get: (k: string) => (k === 'tools' ? toolsFace : undefined) } } : undefined) }
+      return undefined
+    },
   } as unknown as Context
   const adapter = new CodebuddyLlmAdapter(ctx, {
     command: 'codebuddy.js',
@@ -72,13 +70,11 @@ function makeRecordingAdapter(): {
     modelOf: () => 'glm-5.3',
     permissionMode: 'bypassPermissions',
     extraArgs: [],
-  store: new ConversationStore(null),
+    store: new ConversationStore(null),
+    steerPollMs: 20,
+    timeouts: FAST,
   })
-  const seedTurnEnd = (): void => {
-    record('step/end', { turn: 1, step: 1 })
-    record('turn/end', { turn: 1, reason: { kind: 'completed' } })
-  }
-  return { adapter, events, seedTurnEnd }
+  return { adapter, registeredTools }
 }
 
 function options(): GenerateOptions {
@@ -90,12 +86,27 @@ function options(): GenerateOptions {
   } as unknown as GenerateOptions
 }
 
+/** 一个 step 的原始 chunk(供 assembler 组装)。 */
+async function stepChunks(adapter: CodebuddyLlmAdapter): Promise<StreamChunk[]> {
+  const chunks: StreamChunk[] = []
+  for await (const chunk of adapter.stream(options())) chunks.push(chunk)
+  return chunks
+}
+
+/** 组装一个 step 的内容块。 */
+function assemble(chunks: readonly StreamChunk[]): ReturnType<BlockAssembler['blocks']> {
+  const assembler = new BlockAssembler()
+  for (const chunk of chunks) assembler.push(chunk)
+  return assembler.blocks()
+}
+
 beforeEach(() => {
   mockedSpawn.mockReset()
+  resetPumpStateForTests()
 })
 
-describe('adapter 产物 vs 官方关系校验', () => {
-  it('一轮含两个工具调用(成功+失败)+ 交错文本:通过 assertReleasedArtifactRelationships', async () => {
+describe('chunk 流契约:一个回合的多个 step 都能被无损组装', () => {
+  it('两个工具调用(成功+失败)+ 交错文本:块配对完整、工具调用一次且完整', async () => {
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
@@ -103,36 +114,58 @@ describe('adapter 产物 vs 官方关系校验', () => {
         p.update(thought('先想'))
         p.update(message('开始处理'))
         p.update(toolCall('call_a', 'Bash', { command: 'echo a' }))
+        p.update(phase('tool_executing'))
         p.update(toolUpdate('call_a', 'completed', 'a'))
-        p.update(message('继续'))
-        p.update(toolCall('call_b', 'Read', { path: 'x.txt' }))
-        p.update(toolUpdate('call_b', 'failed', 'boom'))
-        p.update(message('收尾文本'))
-        p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+        setTimeout(() => {
+          p.update(message('继续'))
+          p.update(toolCall('call_b', 'Read', { path: 'x.txt' }))
+          p.update(phase('tool_executing'))
+          p.update(toolUpdate('call_b', 'failed', 'boom'))
+          setTimeout(() => {
+            p.update(message('收尾文本'))
+            p.update(phase('idle'))
+            p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+          }, 60)
+        }, 60)
       }, 5)
       return asSpawnResult(p)
     })
-    const { adapter, events, seedTurnEnd } = makeRecordingAdapter()
-    for await (const _ of adapter.stream(options())) { /* drain */ }
-    seedTurnEnd()
+    const { adapter, registeredTools } = makeAdapter()
 
-    // 结构前置断言(与校验器互补,失败时定位更快)。
-    expect(events.some(e => e.type === 'step/start' && e.seq > 2)).toBe(false)
-    expect(events.filter(e => e.type === 'tool/call').length).toBe(2)
-    expect(events.filter(e => e.type === 'tool/result').length).toBe(2)
+    const first = await stepChunks(adapter)
+    // 组装不抛错(未知块类型未闭合会 throw),且第一段有思考/文本/工具块。
+    const blocks1 = assemble(first)
+    const kinds1 = blocks1.map(block => block.type)
+    expect(kinds1).toEqual(expect.arrayContaining(['reasoning', 'text', 'tool-call']))
+    // 文本块在前、工具块在后(与 ACP 到达顺序一致)。
+    expect(kinds1.indexOf('text')).toBeLessThan(kinds1.indexOf('tool-call'))
+    // 工具名归一化、参数完整、id 与回放工具一一对应(趁泵还在,结果可取)。
+    const callA = blocks1.find(block => block.type === 'tool-call')
+    expect(callA).toBeDefined()
+    expect(callA && callA.type === 'tool-call' ? callA.name : '').toBe('bash')
+    expect(registeredTools.has('bash')).toBe(true)
+    const resultA = await (registeredTools.get('bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+      {}, { callId: callA && callA.type === 'tool-call' ? callA.id : '' },
+    )
+    expect(JSON.stringify(resultA)).toContain('a')
 
-    const artifact = {
-      header: { version: 2 },
-      inheritedEventCount: 0,
-      events,
-    }
-    expect(() => assertReleasedArtifactRelationships(
-      artifact as unknown as Parameters<typeof assertReleasedArtifactRelationships>[0],
-      { stepEvents: new Set(['assistant/attempt']) },
-    )).not.toThrow()
+    const second = await stepChunks(adapter)
+    const callB = assemble(second).find(block => block.type === 'tool-call')
+    expect(callB).toBeDefined()
+    expect(callB && callB.type === 'tool-call' ? callB.name : '').toBe('read')
+    const toolB = registeredTools.get('read')!
+    await expect((toolB['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+      {}, { callId: callB && callB.type === 'tool-call' ? callB.id : '' },
+    )).rejects.toThrow('boom')
+
+    const third = await stepChunks(adapter)
+    expect(assemble(third).map(block => block.type)).toContain('text')
+    // 收尾段以 finish 结束;回合收尾后泵已释放。
+    expect(third.some(chunk => chunk.type === 'finish')).toBe(true)
+    expect(TurnPump.forSession('s1')).toBeUndefined()
   }, 15_000)
 
-  it('abort 中途挂起工具:收尾后的序列同样通过校验', async () => {
+  it('abort 中途挂起工具:已交付的块仍可组装,悬空工具由回放工具拒绝', async () => {
     const controller = new AbortController()
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
@@ -150,32 +183,28 @@ describe('adapter 产物 vs 官方关系校验', () => {
       setTimeout(() => {
         p.update(message('开始'))
         p.update(toolCall('call_x', 'Bash', { command: 'sleep 1' }))
+        p.update(phase('tool_executing'))
       }, 20)
       return asSpawnResult(p)
     })
-    const { adapter, events, seedTurnEnd } = makeRecordingAdapter()
-    const run = (async (): Promise<void> => {
-      for await (const _ of adapter.stream({
-        ...options(),
-        signal: controller.signal,
-      } as unknown as GenerateOptions)) { /* drain */ }
+    const { adapter, registeredTools } = makeAdapter()
+    const run = (async (): Promise<StreamChunk[]> => {
+      const chunks: StreamChunk[] = []
+      for await (const chunk of adapter.stream({ ...options(), signal: controller.signal } as GenerateOptions)) {
+        chunks.push(chunk)
+      }
+      return chunks
     })()
     setTimeout(() => controller.abort(), 300)
-    await run
-    seedTurnEnd()
+    const chunks = await run
 
-    const result = events.find(e => e.type === 'tool/result')
-    expect(result).toBeDefined()
-    expect(JSON.stringify(result!.data)).toContain('"isError":true')
-
-    const artifact = {
-      header: { version: 2 },
-      inheritedEventCount: 0,
-      events,
-    }
-    expect(() => assertReleasedArtifactRelationships(
-      artifact as unknown as Parameters<typeof assertReleasedArtifactRelationships>[0],
-      { stepEvents: new Set(['assistant/attempt']) },
-    )).not.toThrow()
+    const blocks = assemble(chunks)
+    expect(blocks.map(block => block.type)).toEqual(expect.arrayContaining(['text', 'tool-call']))
+    const call = blocks.find(block => block.type === 'tool-call')
+    expect(call).toBeDefined()
+    // 结果永不到:回放工具被拒(不悬挂)。
+    const tool = registeredTools.get('bash')!
+    await expect((tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_x' }))
+      .rejects.toThrow()
   }, 15_000)
 })
