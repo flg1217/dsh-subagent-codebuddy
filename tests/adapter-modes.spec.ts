@@ -830,8 +830,8 @@ describe('adapter:工具结果图片', () => {
   }, 15_000)
 })
 
-describe('adapter:用量统计(底部统计栏)', () => {
-  it('usage_update 逐条累计为本 step 合计:收尾 usage chunk = 总和;消息带 usage;工具广告带首 token 流', async () => {
+describe('adapter:用量统计(底部统计栏/上下文占用)', () => {
+  it('usage_update 末位采样:收尾 usage chunk = 最新样本;消息带当时样本;工具广告带首 token 流', async () => {
     const { adapter, appended } = makeAdapter()
     const sampleOne = {
       prompt_tokens: 25414,
@@ -856,12 +856,18 @@ describe('adapter:用量统计(底部统计栏)', () => {
       p.update(message('完成'))
       p.respond(p.requestLog().length, { stopReason: 'end_turn' })
     })
-    // 收尾 usage chunk:两次请求求和的终值(循环收尾消息由此带上 usage)。
+    // 收尾 usage chunk:最新一条样本(不是求和——求和会把上下文占用顶满窗口,
+    // 让 compaction-basic 每条消息都判定超阈值 → 反复自动压缩,实测踩坑)。
     const usageChunks = chunks.map(text => JSON.parse(text) as { type: string; usage?: Record<string, number> })
       .filter(chunk => chunk.type === 'usage')
     expect(usageChunks.length).toBe(1)
-    expect(usageChunks[0]!.usage).toMatchObject({ inputTokens: 208, outputTokens: 29, cacheReadTokens: 25216 })
-    // 工具广告(step 内第一条消息):带当时累计用量 + 首个增量(首 token 计时)。
+    expect(usageChunks[0]!.usage).toMatchObject({ inputTokens: 10, outputTokens: 5 })
+    expect(usageChunks[0]!.usage?.['cacheReadTokens']).toBeUndefined()
+    // prompt 侧总量必须等于**最后一条样本**(10),而不是两次求和(25424)。
+    const final = usageChunks[0]!.usage ?? {}
+    const promptSide = (final['inputTokens'] ?? 0) + (final['cacheReadTokens'] ?? 0) + (final['cacheWriteTokens'] ?? 0)
+    expect(promptSide).toBe(10)
+    // 工具广告:带"当时"的最新样本(sampleOne)+ 首个增量(首 token 计时)。
     const messages = appended
       .filter(entry => entry.type === 'assistant/message')
       .map(entry => entry.data as {
@@ -874,9 +880,9 @@ describe('adapter:用量统计(底部统计栏)', () => {
     expect(ad!.usage).toMatchObject({ inputTokens: 198, outputTokens: 24, cacheReadTokens: 25216 })
     expect(ad!.stream[0]?.chunk).toMatchObject({ type: 'text-delta', text: '正在处理' })
     expect(typeof ad!.stream[0]?.time).toBe('number')
-    // 后写的文本块带累计终值。
+    // 后写的文本块带最新样本。
     const piece = messages.find(item => item.message.content[0]?.type === 'text')
-    expect(piece?.usage).toMatchObject({ inputTokens: 208, outputTokens: 29 })
+    expect(piece?.usage).toMatchObject({ inputTokens: 10, outputTokens: 5 })
   }, 15_000)
 })
 

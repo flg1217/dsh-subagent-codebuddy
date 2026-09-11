@@ -379,9 +379,15 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let textLanded = 0
       let toolsLanded = 0
       /**
-       * 本 step 的累计用量(逐条 `usage_update` 求和)。CodeBuddy 一个 dsh step
-       * 内含多次请求,投影按 (turn, step) 取**最后一条**样本,所以每次写消息都带
-       * 迄今累计值、流末再以 usage chunk 交给循环收尾消息——终值语义正确。
+       * 本 step 的最新一条用量样本(`usage_update`)。
+       *
+       * **必须末位采样,不能累加**:CodeBuddy 一个 dsh step 内含几十次模型请求,
+       * 每条样本的 `prompt_tokens` 都是"整个会话"的 prompt 大小(命中+未命中),
+       * 累加会得到几千万 token。而 `contextPressure` 取 `input+cacheRead+cacheWrite`
+       * 作上下文占用、`compaction-basic` 又拿 `tokenMeter.measure()` 的
+       * `totalTokens >= contextWindow × 0.8` 判定自动压缩——累加值直接顶满
+       * 1M 窗口,导致**每条消息都触发一次压缩**(实测踩坑)。
+       * 末位采样与原生 provider 语义一致:usage 描述"刚才那次请求"。
        */
       let stepUsage: TokenUsage | undefined
       /** 本 step 首个 token 增量(到达时刻 + 原 chunk),供首 token 计时投影。 */
@@ -780,18 +786,10 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             return
           }
           case 'usage_update': {
-            // CLI 心跳里的用量:逐条求和得本 step 累计(见 stepUsage)。
+            // CLI 心跳里的用量:**末位采样**(不是累加,见 stepUsage)。
             const sample = usageOfUpdate(update)
             if (sample === undefined) return
-            stepUsage = stepUsage === undefined ? sample : {
-              inputTokens: stepUsage.inputTokens + sample.inputTokens,
-              outputTokens: stepUsage.outputTokens + sample.outputTokens,
-              ...(stepUsage.totalTokens === undefined && sample.totalTokens === undefined
-                ? {} : { totalTokens: (stepUsage.totalTokens ?? 0) + (sample.totalTokens ?? 0) }),
-              cacheReadTokens: (stepUsage.cacheReadTokens ?? 0) + (sample.cacheReadTokens ?? 0),
-              cacheWriteTokens: (stepUsage.cacheWriteTokens ?? 0) + (sample.cacheWriteTokens ?? 0),
-              reasoningTokens: (stepUsage.reasoningTokens ?? 0) + (sample.reasoningTokens ?? 0),
-            }
+            stepUsage = sample
             return
           }
           case 'tool_call': {
