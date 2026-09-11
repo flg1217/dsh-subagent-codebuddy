@@ -26,7 +26,7 @@ import { mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AssistantStreamAccumulator, ReasoningEffortId, ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import type { AssistantStreamRecord, ContentBlock, GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { AssistantStreamRecord, ContentBlock, GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import { ConversationStore } from './conversations.js'
 import { agentIdFromOutput, SubagentMirror } from './mirror.js'
@@ -35,7 +35,8 @@ import type { NativeRecord } from './native-session.js'
 import { buildPrompt, lastUserPrompt, resumeReplayPrompt } from './serialize.js'
 import { foldPendingInsertions } from './inbox.js'
 import { todoToolKind, TodoListState } from './todo-bridge.js'
-import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf } from './acp.js'
+import { AttachmentsSaveFace, imageReadAlias, toolResultBlocksFromText } from './tool-image.js'
+import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf, usageOfUpdate } from './acp.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { listCodebuddyModelIdsAsync } from './models.js'
 
@@ -144,6 +145,11 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
 
   /** dsh 会话 → 已转发的插入消息 id(续聊补发时跳过,防重复)。 */
   private readonly forwardedInsertions = new Map<string, Set<string>>()
+
+  /** dsh attachments 服务面(单图入库;原生 read_image 同法)。 */
+  private attachmentsFace(): AttachmentsSaveFace | undefined {
+    return (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('attachments') as AttachmentsSaveFace | undefined
+  }
 
   /** 标记一条插入为已转发;已标记过返回 false。 */
   private markForwarded(sessionId: string, id: string): boolean {
@@ -370,6 +376,17 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let lastBudgetMs = to.idleMaxMs
       let acpSessionId = ''
       let textLanded = 0
+      let toolsLanded = 0
+      /**
+       * 本 step 的累计用量(逐条 `usage_update` 求和)。CodeBuddy 一个 dsh step
+       * 内含多次请求,投影按 (turn, step) 取**最后一条**样本,所以每次写消息都带
+       * 迄今累计值、流末再以 usage chunk 交给循环收尾消息——终值语义正确。
+       */
+      let stepUsage: TokenUsage | undefined
+      /** 本 step 首个 token 增量(到达时刻 + 原 chunk),供首 token 计时投影。 */
+      let firstDelta: { time: number; chunk: StreamChunk } | undefined
+      /** read_image 别名调用的 meta 路径(callId → path,结果落地时写 meta)。 */
+      const imageReadPaths = new Map<string, string>()
       const kill = (): void => { try { conn.kill() } catch { /* 已退出 */ } }
       const failStall = (): void => {
         stallTimedOut = true
@@ -442,6 +459,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       // stream:辅助调用(compaction/session-title 带 purpose)或无会话/无打开
       //   step——不写任何会话事件,把 ACP 文本转成真实 chunk 吐回调用方。
       const session = childSession
+      const attachments = this.attachmentsFace()
       const openStep = session === undefined ? undefined : findOpenStep(session.ownEvents?.() ?? [])
       const direct = options.purpose === undefined && session !== undefined && openStep !== undefined
       const turn = openStep?.turn ?? 1
@@ -507,6 +525,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               content: [piece.block],
               source: { provider: options.provider ?? 'codebuddy', model },
             }),
+            ...(stepUsage === undefined ? {} : { usage: stepUsage }),
             stream: [...accumulator.snapshot()] as AssistantStreamRecord[],
           }, { surfaceOp: 'append' })
         } catch { /* 日志面失败不影响流 */ }
@@ -523,6 +542,15 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       }
 
       /**
+       * 把本 step 累计用量交给循环:循环收尾消息(step 最后一条 assistant/message)
+       * 由此带上 usage,底部统计栏的 token / 缓存命中、tok/s 才有数。
+       */
+      const releaseUsage = (): void => {
+        if (stepUsage === undefined) return
+        pendingChunks.push({ type: 'usage', usage: stepUsage })
+      }
+
+      /**
        * 落地一次工具调用:先广告(严格校验要求 tool/call 的 name/arguments 与
        * 前置 assistant/message 的 tool-call 块逐字一致),再写 tool/call。
        * @returns tool/call 的事件 seq,未落地时为 undefined。
@@ -533,37 +561,62 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         args: string,
       ): SessionSeq | undefined => {
         flushPending()
+        // 图片文件的 Read → dsh 原生 `read_image`(UI 图片卡片按此名 + result
+        // 的 meta.path 渲染缩略图;广告与 call 同名,逐字一致校验不受影响)。
+        const alias = imageReadAlias(name, args)
+        const dshName = alias?.name ?? name
+        if (alias !== undefined) imageReadPaths.set(callId, alias.path)
         session!.append('assistant/message', {
           turn,
           step,
           message: createAssistantMessage({
-            content: [{ type: 'tool-call', id: ToolCallId(callId), name, arguments: args }],
+            content: [{ type: 'tool-call', id: ToolCallId(callId), name: dshName, arguments: args }],
             source: { provider: options.provider ?? 'codebuddy', model },
           }),
-          stream: [],
+          ...(stepUsage === undefined ? {} : { usage: stepUsage }),
+          // 首 token 时刻:统计投影只看一个 step 的**第一条** assistant/message
+          // (其后置空 openStep),而工具广告往往就是第一条——带上首个增量的
+          // 真实到达时刻,首 token 延迟才不为空。
+          stream: firstDelta === undefined
+            ? []
+            : [{ type: 'chunk', time: firstDelta.time, chunk: firstDelta.chunk }] as AssistantStreamRecord[],
         }, { surfaceOp: 'append' })
         const ev = session!.append('tool/call', {
           turn,
           step,
           callId: ToolCallId(callId),
-          name,
+          name: dshName,
           arguments: args,
         })
-        if (ev !== undefined) stepState.toolCallSeqs.set(callId, ev.seq)
+        if (ev !== undefined) {
+          stepState.toolCallSeqs.set(callId, ev.seq)
+          toolsLanded += 1
+        }
         return ev?.seq
       }
 
       /** 写一条工具结果(截断 2000 字符;failed/未完成 → isError)。 */
-      const landToolResult = (callId: string, outputText: string, isError: boolean): void => {
+      const landToolResult = async (callId: string, outputText: string, isError: boolean): Promise<void> => {
         const seq = stepState.toolCallSeqs.get(callId)
+        // read_image 别名调用的 presentationMeta(与原生投影同形:{path})。
+        const imagePath = imageReadPaths.get(callId)
+        imageReadPaths.delete(callId)
+        // 图片结果(CodeBuddy 以文本 JSON 交付):落 attachment 转 image 块,
+        // 避免整屏 base64 进会话/UI;非图片/失败则保持原文(限长)。
+        let content: Array<Record<string, unknown>> = [{ type: 'text', text: outputText.slice(0, 2000) }]
+        if (!isError) {
+          const converted = await toolResultBlocksFromText(attachments, outputText, imagePath)
+          if (converted !== undefined) content = converted
+        }
         session!.append('tool/result', {
           turn,
           step,
           message: createToolResultMessage({
             callId: ToolCallId(callId),
-            content: [{ type: 'text', text: outputText.slice(0, 2000) }],
+            content: content as never,
             isError,
           }),
+          ...(imagePath === undefined ? {} : { meta: { path: imagePath } }),
         }, {
           surfaceOp: 'append',
           ...(seq !== undefined ? { sourceEventSeqs: [seq] } : {}),
@@ -587,7 +640,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             entry.landed = true
             landToolCall(callId, entry.name, JSON.stringify(entry.rawInput))
           }
-          landToolResult(callId, 'CodeBuddy turn ended before this tool reported completion.', true)
+          void landToolResult(callId, 'CodeBuddy turn ended before this tool reported completion.', true)
           consumedToolCalls.add(callId)
         }
         pendingToolCalls.clear()
@@ -605,9 +658,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         if (sessions?.create === undefined) return
         const description = entry.rawInput['description']
         const prompt = entry.rawInput['prompt']
-        const attachments = this.ctx.get('attachments') as unknown as
-          | { saveImage: (input: { data: Uint8Array; mediaType: string }) => Promise<unknown> }
-          | undefined
+        const attachments = this.attachmentsFace()
         const mirror = new SubagentMirror({
           sessions: sessions as never,
           parentSessionId: dshSessionId,
@@ -673,7 +724,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       }
 
       /** 处理一条 ACP update:续命 + 会话事件落地 + 流累积。 */
-      const handleUpdate = (update: AcpUpdate): void => {
+      const handleUpdate = async (update: AcpUpdate): Promise<void> => {
         if (isProgressUpdate(update)) armIdle()
         switch (update.sessionUpdate) {
           case 'agent_thought_chunk':
@@ -693,7 +744,24 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               }
             }
             currentStream.text += text
-            currentStream.chunks.push({ type: 'text-delta', index: currentStream.index, text })
+            const delta: StreamChunk = { type: 'text-delta', index: currentStream.index, text }
+            if (firstDelta === undefined) firstDelta = { time: Date.now(), chunk: delta }
+            currentStream.chunks.push(delta)
+            return
+          }
+          case 'usage_update': {
+            // CLI 心跳里的用量:逐条求和得本 step 累计(见 stepUsage)。
+            const sample = usageOfUpdate(update)
+            if (sample === undefined) return
+            stepUsage = stepUsage === undefined ? sample : {
+              inputTokens: stepUsage.inputTokens + sample.inputTokens,
+              outputTokens: stepUsage.outputTokens + sample.outputTokens,
+              ...(stepUsage.totalTokens === undefined && sample.totalTokens === undefined
+                ? {} : { totalTokens: (stepUsage.totalTokens ?? 0) + (sample.totalTokens ?? 0) }),
+              cacheReadTokens: (stepUsage.cacheReadTokens ?? 0) + (sample.cacheReadTokens ?? 0),
+              cacheWriteTokens: (stepUsage.cacheWriteTokens ?? 0) + (sample.cacheWriteTokens ?? 0),
+              reasoningTokens: (stepUsage.reasoningTokens ?? 0) + (sample.reasoningTokens ?? 0),
+            }
             return
           }
           case 'tool_call': {
@@ -748,7 +816,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             armIdle()
             if (!direct) return
             flushPending()
-            landToolResult(update.toolCallId, update.rawOutput?.text ?? '', update.status === 'failed')
+            await landToolResult(update.toolCallId, update.rawOutput?.text ?? '', update.status === 'failed')
             confirmTodo(update.toolCallId, known.name, update.rawOutput?.text ?? '')
             finishMirror(update.toolCallId, update.rawOutput?.text ?? '')
             return
@@ -839,7 +907,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         // 超时(cancel → kill → 进程退出 reject)与 abort 保护——固定超时会
         // 误杀长任务(实测 180s 掐死 3 分钟以上的任务)。
         // 中途插入:飞行中再发 session/prompt 会被 CodeBuddy 排队(实测),
-        // 当前工作完成后立即处理——用于转发 dsh inbox 里尚未 claim 的用户消息。
+        // 当前工作完成后立即处理;插话(`session/steer`)则注入当前运行。
         let promptResult: AcpPromptResult | undefined
         let promptError: Error | undefined
         let inFlight = 0
@@ -859,6 +927,35 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           ...promptImages.map(image => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
         ])
 
+        /**
+         * 转交一条尚未被 claim 的插入:
+         * - 插话(`next-step`):走 CLI 的 ACP 扩展 `session/steer`——文本缓冲
+         *   进**当前运行**的插话队列,下一个内部边界注入模型(不打断、不丢
+         *   消息,实测 1ms 应答、原 prompt 正常 end_turn);
+         * - 排队(`next-turn`):普通 prompt,CLI 在当前工作完成后处理。
+         *
+         * `session/steer` 不可用(CLI 旧版/运行刚结束返回 `steered:false`)时
+         * 退回排队 prompt——最差等于旧行为,消息不丢。
+         */
+        const forwardInsertion = (insertion: { text: string; steer: boolean }): void => {
+          const queuePrompt = (): void => {
+            sendPrompt([{ type: 'text', text: insertion.text }])
+            armIdle()
+          }
+          if (!insertion.steer) {
+            queuePrompt()
+            return
+          }
+          void conn.request<{ steered?: boolean }>(
+            'session/steer',
+            { sessionId: acpSessionId, contentBlocks: [{ type: 'text', text: insertion.text }] },
+            20_000,
+          ).then(
+            res => { if (res?.steered !== true) queuePrompt() },
+            () => { queuePrompt() },
+          )
+        }
+
         /** 轮询间隔(中途插入检测)。 */
         const steerPollMs = this.options.steerPollMs ?? 1_200
         let lastSteerPoll = Date.now()
@@ -866,18 +963,17 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         while (inFlight > 0 && promptError === undefined && exitError === undefined && !stallTimedOut) {
           while (queue.length > 0) {
             const update = queue.shift()
-            if (update !== undefined) handleUpdate(update)
+            if (update !== undefined) await handleUpdate(update)
           }
           while (pendingChunks.length > 0) yield pendingChunks.shift()!
-          // 中途插入检测:dsh inbox 里尚未 claim 的用户消息 → 排队转发。
+          // 中途插入检测:dsh inbox 里尚未 claim 的用户消息 → 插话立即注入 / 排队转发。
           if (direct && dshSessionId !== undefined && session !== undefined
             && options.signal?.aborted !== true && Date.now() - lastSteerPoll >= steerPollMs) {
             lastSteerPoll = Date.now()
             try {
               for (const insertion of foldPendingInsertions(session.ownEvents?.() ?? [])) {
                 if (!this.markForwarded(dshSessionId, insertion.id)) continue
-                sendPrompt([{ type: 'text', text: insertion.text }])
-                armIdle()
+                forwardInsertion(insertion)
               }
             } catch { /* 插入检测不阻断主流程 */ }
           }
@@ -887,7 +983,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         // 抽干尾巴(cancel/exit 后可能还有少量 update)。
         while (queue.length > 0) {
           const update = queue.shift()
-          if (update !== undefined) handleUpdate(update)
+          if (update !== undefined) await handleUpdate(update)
         }
         while (pendingChunks.length > 0) yield pendingChunks.shift()!
 
@@ -912,6 +1008,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           // 在途工具补错误 result,调用方闭合 step 时无未决生命周期。
           flushPending()
           releasePending()
+          releaseUsage()
           while (pendingChunks.length > 0) yield pendingChunks.shift()!
           finalizePendingTools()
           return
@@ -921,6 +1018,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         const errorMessage = promptResult?.errorMessage
         flushPending()
         releasePending()
+        releaseUsage()
         // stream 模式的收尾块在最后一次泵之后才产生,这里补泵(compaction/标题)。
         while (pendingChunks.length > 0) yield pendingChunks.shift()!
         if (errorMessage !== undefined && errorMessage.length > 0) {
@@ -930,10 +1028,12 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         // 静默失败防御(实测高频):end_turn 但零思考、零文本、零工具——多为
         // 配额受限/服务端异常导致的静默失败;或只有思考没有产出(半途失败)。
         // 空跑会让主代理以为子代理完成了,用户看到"莫名中断"。
-        if (stopReason !== 'cancelled' && (progressSamples === 0 || textLanded === 0)) {
+        // 工具落地也算产出:纯工具轮次(无解说文本)是正常形态,误判会触发
+        // 自动重试并重复落地事件。
+        if (stopReason !== 'cancelled' && (progressSamples === 0 || (textLanded === 0 && toolsLanded === 0))) {
           finalizePendingTools()
           throw new RetryableError(`CodeBuddy 静默失败(stopReason: ${stopReason ?? 'none'};`
-            + `${progressSamples} 次进展、0 次文本产出)——可能是配额受限或服务端异常`)
+            + `${progressSamples} 次进展、0 次文本/工具产出)——可能是配额受限或服务端异常`)
         }
         finalizePendingTools()
         // end_turn + 有文本产出,或 cancelled:正常收尾。

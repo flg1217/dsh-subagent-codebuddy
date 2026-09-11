@@ -10,7 +10,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
  import { ConversationStore } from '../src/conversations.ts'
-import { DEFAULT_ACP_RUN_TIMEOUTS } from '../src/acp.ts'
+import { DEFAULT_ACP_RUN_TIMEOUTS, usageOfUpdate } from '../src/acp.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -317,5 +317,43 @@ describe('adapter(ACP):取消与错误', () => {
       idleFactor: 3,
       idleWarmupLines: 6,
     })
+  })
+})
+
+describe('usageOfUpdate:usage_update → dsh TokenUsage', () => {
+  it('OpenAI 风格字段映射为三个不重叠桶;命中优先 hit 字段(cache_read_input_tokens 恒 0)', () => {
+    const usage = usageOfUpdate({
+      sessionUpdate: 'usage_update',
+      _meta: {
+        usage: {
+          prompt_tokens: 25414,
+          completion_tokens: 24,
+          total_tokens: 25438,
+          prompt_cache_hit_tokens: 25216,
+          prompt_cache_miss_tokens: 198,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          completion_tokens_details: { reasoning_tokens: 22 },
+        },
+      },
+    })
+    expect(usage).toEqual({
+      inputTokens: 198,
+      outputTokens: 24,
+      totalTokens: 25438,
+      cacheReadTokens: 25216,
+      cacheWriteTokens: 0,
+      reasoningTokens: 22,
+    })
+  })
+
+  it('缺 miss 字段时由 prompt − hit 推导;空载心跳(全零)不产生用量', () => {
+    const derived = usageOfUpdate({
+      sessionUpdate: 'usage_update',
+      _meta: { usage: { prompt_tokens: 1000, completion_tokens: 5, prompt_cache_hit_tokens: 800 } },
+    })
+    expect(derived).toMatchObject({ inputTokens: 200, outputTokens: 5, cacheReadTokens: 800 })
+    expect(usageOfUpdate({ sessionUpdate: 'usage_update', _meta: { usage: { prompt_tokens: 0, completion_tokens: 0 } } })).toBeUndefined()
+    expect(usageOfUpdate({ sessionUpdate: 'usage_update' })).toBeUndefined()
   })
 })

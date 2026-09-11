@@ -90,6 +90,8 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly todoStates;
     /** dsh 会话 → 已转发的插入消息 id(续聊补发时跳过,防重复)。 */
     private readonly forwardedInsertions;
+    /** dsh attachments 服务面(单图入库;原生 read_image 同法)。 */
+    private attachmentsFace;
     /** 标记一条插入为已转发;已标记过返回 false。 */
     private markForwarded;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);

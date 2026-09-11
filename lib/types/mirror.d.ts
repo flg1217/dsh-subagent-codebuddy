@@ -91,6 +91,8 @@ export declare class RecordTranslator {
     private readonly advertised;
     /** 子代理的任务/todo(整表快照,镜像侧同桥接)。 */
     private readonly todos;
+    /** read_image 别名调用的 meta 路径(callId → path,结果落地时写 meta)。 */
+    private readonly imageReadPaths;
     constructor(append: (type: string, data: unknown, opts?: unknown) => unknown, model: string, images?: MirrorImages | undefined);
     /** 开头:turn + step + 描述符。 */
     begin(descriptor: {

@@ -35,6 +35,7 @@ function makeAdapter(
   appended: Array<{ type: string; data: unknown; opts?: unknown }>
   createdMetas: Array<Record<string, unknown> | undefined>
   shadowEvents: Array<{ type: string; data: unknown }>
+  savedImages: Array<{ mediaType: string; bytes: number }>
 } {
   const appended: Array<{ type: string; data: unknown; opts?: unknown }> = []
   const events: Array<{ type: string; data: Record<string, unknown> }> = []
@@ -64,6 +65,12 @@ function makeAdapter(
   const ctx = {
     get: (key: string) => (key === 'sessions' && shape.hasSession !== false ? { get: () => session, create: session.create } : undefined),
   } as unknown as Context
+  const savedImages: Array<{ mediaType: string; bytes: number }> = []
+  const ctxWithImages = ctx as unknown as { get: (key: string) => unknown }
+  const originalGet = ctxWithImages.get.bind(ctxWithImages)
+  ctxWithImages.get = (key: string) => key === 'attachments'
+    ? { saveImage: async (input: { data: Uint8Array; mediaType: string }) => { savedImages.push({ mediaType: input.mediaType, bytes: input.data.byteLength }); return { attachmentId: 'sha256:test', mediaType: input.mediaType, bytes: input.data.byteLength, width: 1, height: 1 } } }
+    : originalGet(key)
   const adapter = new CodebuddyLlmAdapter(ctx, {
     command: 'codebuddy.js',
     prefixArgs: [],
@@ -73,7 +80,7 @@ function makeAdapter(
     store: new ConversationStore(null),
     ...(timeouts !== undefined ? { timeouts } : {}),
   })
-  return { adapter, appended, createdMetas, shadowEvents }
+  return { adapter, appended, createdMetas, shadowEvents, savedImages }
 }
 
 function makeOptions(
@@ -399,7 +406,8 @@ describe('adapter:任务工具 → todo/write 桥接', () => {
 })
 
 describe('adapter:中途插入(steering)', () => {
-  it('生成中出现的 inbox 插入 → 作为排队 prompt 转发(同 id 只转一次)', async () => {
+  /** 建一个已打开 step 的直写会话(插入投递的前置条件)。 */
+  function directSession(): { events: Array<{ type: string; data?: unknown }>; ctx: Context } {
     const events: Array<{ type: string; data?: unknown }> = [
       { type: 'turn/start', data: { turn: 1 } },
       { type: 'step/start', data: { turn: 1, step: 1 } },
@@ -409,7 +417,99 @@ describe('adapter:中途插入(steering)', () => {
       append: () => ({ seq: events.length }),
       ownEvents: () => events,
     }
-    const ctx = { get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined) } as unknown as Context
+    return { events, ctx: { get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined) } as unknown as Context }
+  }
+
+  /** 生成中在指定队列插入一条用户消息(80ms 后,留出短轮询窗口)。 */
+  function spliceAfter(events: Array<{ type: string; data?: unknown }>, target: 'next-step' | 'next-turn'): void {
+    setTimeout(() => {
+      events.push({
+        type: 'agent/inbox/spliced',
+        data: {
+          target,
+          start: 0,
+          inserted: [{
+            id: 'ins-1',
+            role: 'user',
+            content: [{ type: 'text', text: '插一句话:先别做别的' }],
+            source: { kind: 'user' },
+          }],
+        },
+      })
+    }, 80)
+  }
+
+  it('插话(next-step)走 ACP session/steer 注入当前运行,不再排队 prompt;同 id 只发一次', async () => {
+    const { events, ctx } = directSession()
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store: new ConversationStore(null),
+      steerPollMs: 40,
+    })
+    const prompts: Array<Array<Record<string, unknown>>> = []
+    const steers: Array<Record<string, unknown>> = []
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method === 'session/steer') {
+          steers.push(request.params)
+          p.respond(request.id, { steered: true, ownerRequestId: 'req-1' })
+          return
+        }
+        if (request.method !== 'session/prompt') return
+        prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 500)
+      })
+      setTimeout(() => { p.update(message('处理中')) }, 10)
+      return asSpawnResult(p)
+    })
+    spliceAfter(events, 'next-step')
+    for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    expect(steers.length).toBe(1)
+    expect(steers[0]).toMatchObject({ sessionId: 'cb-1', contentBlocks: [{ type: 'text', text: '插一句话:先别做别的' }] })
+    // 插话不当排队 prompt 再发一遍。
+    expect(prompts.length).toBe(1)
+  }, 15_000)
+
+  it('排队(next-turn)仍作为排队 prompt 转发;不发 session/steer', async () => {
+    const { events, ctx } = directSession()
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store: new ConversationStore(null),
+      steerPollMs: 40,
+    })
+    const prompts: Array<Array<Record<string, unknown>>> = []
+    let steerRequests = 0
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method === 'session/steer') { steerRequests += 1; p.respond(request.id, { steered: true }); return }
+        if (request.method !== 'session/prompt') return
+        prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), prompts.length === 1 ? 500 : 30)
+      })
+      setTimeout(() => { p.update(message('处理中')) }, 10)
+      return asSpawnResult(p)
+    })
+    spliceAfter(events, 'next-turn')
+    for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    expect(steerRequests).toBe(0)
+    expect(prompts.length).toBe(2)
+    expect(JSON.stringify(prompts[1])).toContain('插一句话')
+  }, 15_000)
+
+  it('session/steer 被拒(steered:false)→ 退回排队 prompt,消息不丢', async () => {
+    const { events, ctx } = directSession()
     const adapter = new CodebuddyLlmAdapter(ctx, {
       command: 'codebuddy.js',
       prefixArgs: [],
@@ -424,36 +524,18 @@ describe('adapter:中途插入(steering)', () => {
       const p = fakeAcpProc()
       autoHandshake(p)
       p.onRequest(request => {
+        if (request.method === 'session/steer') { p.respond(request.id, { steered: false, reason: 'idle' }); return }
         if (request.method !== 'session/prompt') return
         prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
-        // 第一条延迟响应,留出中途插入窗口;第二条快速响应收尾。
         setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), prompts.length === 1 ? 500 : 30)
-        if (prompts.length === 1) {
-          setTimeout(() => {
-            events.push({
-              type: 'agent/inbox/spliced',
-              data: {
-                target: 'next-step',
-                start: 0,
-                inserted: [{
-                  id: 'ins-1',
-                  role: 'user',
-                  content: [{ type: 'text', text: '插一句话:先别做别的' }],
-                  source: { kind: 'user' },
-                }],
-              },
-            })
-          }, 80)
-        }
       })
       setTimeout(() => { p.update(message('处理中')) }, 10)
       return asSpawnResult(p)
     })
+    spliceAfter(events, 'next-step')
     for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    // 只转发一条(重复轮询同 id 不重发)。
     expect(prompts.length).toBe(2)
     expect(JSON.stringify(prompts[1])).toContain('插一句话')
-    expect(prompts[1]![0]).toMatchObject({ type: 'text' })
   }, 15_000)
 })
 
@@ -567,5 +649,139 @@ describe('adapter:看门狗(硬顶可关闭)', () => {
     expect(cancelled).toBe(false)
     // return 限时:生成器若卡在某个 await,测试也不能被拖死。
     await Promise.race([gen.return?.(undefined), new Promise(resolve => setTimeout(resolve, 2_000))])
+  }, 15_000)
+})
+
+describe('adapter:工具结果图片', () => {
+  it('图片文本 JSON → tool/result 转 image 块(与原生 read_image 同形状,base64 不进文本)', async () => {
+    const { adapter, appended, savedImages } = makeAdapter()
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+    const imageJson = JSON.stringify([{ type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } }])
+    await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(toolCall('call_img', 'Read', { file_path: 'a.png' }))
+      p.update(toolUpdate('call_img', 'completed', imageJson))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    const result = appended.find(a => a.type === 'tool/result')
+    expect(result).toBeDefined()
+    const blocks = (result!.data as {
+      message: { content: Array<{ content?: Array<Record<string, unknown>> }> }
+    }).message.content[0]!.content ?? []
+    expect(blocks.some(b => b['type'] === 'image')).toBe(true)
+    expect(String(JSON.stringify(blocks).includes('data:image'))).toBe('false')
+    expect(savedImages).toEqual([{ mediaType: 'image/png', bytes: Buffer.from(png, 'base64').byteLength }])
+    // 图片路径的 Read 已改名为 read_image,且 result 带 meta.path(UI 图片卡渲染依据)。
+    const call = appended.find(x => x.type === 'tool/call')!
+    expect((call.data as { name: string }).name).toBe('read_image')
+    expect((result!.data as { meta?: { path?: string } }).meta).toEqual({ path: 'a.png' })
+    const ad = appended.find(x => x.type === 'assistant/message' && JSON.stringify(x.data).includes('read_image'))
+    expect(ad).toBeDefined()
+  }, 15_000)
+})
+
+describe('adapter:用量统计(底部统计栏)', () => {
+  it('usage_update 逐条累计为本 step 合计:收尾 usage chunk = 总和;消息带 usage;工具广告带首 token 流', async () => {
+    const { adapter, appended } = makeAdapter()
+    const sampleOne = {
+      prompt_tokens: 25414,
+      completion_tokens: 24,
+      total_tokens: 25438,
+      prompt_cache_hit_tokens: 25216,
+      prompt_cache_miss_tokens: 198,
+    }
+    const sampleTwo = {
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+      prompt_cache_hit_tokens: 0,
+      prompt_cache_miss_tokens: 10,
+    }
+    const chunks = await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(message('正在处理'))
+      p.update({ sessionUpdate: 'usage_update', used: 25414, size: 1_000_000, _meta: { usage: sampleOne } })
+      p.update(toolCall('call_u1', 'Bash', { command: 'ls' }))
+      p.update(toolUpdate('call_u1', 'completed', 'ok'))
+      p.update({ sessionUpdate: 'usage_update', used: 10, size: 1_000_000, _meta: { usage: sampleTwo } })
+      p.update(message('完成'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    // 收尾 usage chunk:两次请求求和的终值(循环收尾消息由此带上 usage)。
+    const usageChunks = chunks.map(text => JSON.parse(text) as { type: string; usage?: Record<string, number> })
+      .filter(chunk => chunk.type === 'usage')
+    expect(usageChunks.length).toBe(1)
+    expect(usageChunks[0]!.usage).toMatchObject({ inputTokens: 208, outputTokens: 29, cacheReadTokens: 25216 })
+    // 工具广告(step 内第一条消息):带当时累计用量 + 首个增量(首 token 计时)。
+    const messages = appended
+      .filter(entry => entry.type === 'assistant/message')
+      .map(entry => entry.data as {
+        message: { content: Array<{ type: string }> }
+        usage?: Record<string, number>
+        stream: Array<{ chunk?: { type: string; text?: string }; time?: number }>
+      })
+    const ad = messages.find(item => item.message.content[0]?.type === 'tool-call')
+    expect(ad).toBeDefined()
+    expect(ad!.usage).toMatchObject({ inputTokens: 198, outputTokens: 24, cacheReadTokens: 25216 })
+    expect(ad!.stream[0]?.chunk).toMatchObject({ type: 'text-delta', text: '正在处理' })
+    expect(typeof ad!.stream[0]?.time).toBe('number')
+    // 后写的文本块带累计终值。
+    const piece = messages.find(item => item.message.content[0]?.type === 'text')
+    expect(piece?.usage).toMatchObject({ inputTokens: 208, outputTokens: 29 })
+  }, 15_000)
+})
+
+describe('adapter:压缩后续聊兜底(历史收缩)', () => {
+  it('sentCount 超出当前消息数时,补发最后一条用户消息,而不是排在它后面的插件提醒', async () => {
+    const store = new ConversationStore(null)
+    store.set('s1', { acpId: 'cb-1', sentCount: 9999 })
+    const session = {
+      header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
+      append: () => ({ seq: 1 }),
+      ownEvents: () => [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'step/start', data: { turn: 1, step: 1 } },
+      ],
+    }
+    const ctx = { get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined) } as unknown as Context
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store,
+    })
+    const prompts: Array<Array<Record<string, unknown>>> = []
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method !== 'session/prompt') return
+        prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 5)
+      })
+      setTimeout(() => { p.update(message('好')) }, 5)
+      return asSpawnResult(p)
+    })
+    const options = makeOptions('s1', {
+      messages: [
+        {
+          id: 'm-summary',
+          role: 'user',
+          content: [{ type: 'text', text: 'This is an automatically generated checkpoint condensing…' }],
+          source: { kind: 'plugin', plugin: 'compaction', form: 'snapshot' },
+        },
+        { id: 'u-new', role: 'user', content: [{ type: 'text', text: '账本设计还是过度设计' }], source: { kind: 'user' } },
+        {
+          id: 'ctx-1',
+          role: 'user',
+          content: [{ type: 'text', text: '<system-reminder>技能目录已更新</system-reminder>' }],
+          source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-skill', form: 'snapshot' },
+        },
+      ] as never,
+    })
+    for await (const _ of adapter.stream(options)) { /* drain */ }
+    const sent = JSON.stringify(prompts[0])
+    expect(sent).toContain('账本设计还是过度设计')
+    expect(sent).not.toContain('技能目录已更新')
   }, 15_000)
 })

@@ -5,7 +5,8 @@
  * (splice 事件落会话日志,`inserted` 插入到 `start`),在下一个 step/turn
  * 边界被 claim 后才成为 `user/message`。codebuddy 轮是单个长 step,插入
  * 会一直悬挂——本模块折叠出**尚未被 claim 的用户消息**,供适配器转发给
- * 运行中的 CodeBuddy(排队 prompt)。
+ * 运行中的 CodeBuddy:`next-step`(插话)走 ACP `session/steer` 立即注入,
+ * `next-turn` 排队为 prompt。
  *
  * 队列按 target 分开维护;非 user 来源(插件注入的 context 等)保留在队列里
  * 参与位置对齐,但不出现在结果中。
@@ -17,6 +18,11 @@ export interface PendingInsertion {
     id: string;
     /** 文本内容。 */
     text: string;
+    /**
+     * 是否插话(`next-step` 队列):插话应立即投递给运行中的 CodeBuddy
+     * (ACP `session/steer`);`next-turn` 只排队,等当前工作结束。
+     */
+    steer: boolean;
 }
 /**
  * 折叠会话事件里的 inbox splice,得到尚未 claim 的用户消息。

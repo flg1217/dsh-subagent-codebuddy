@@ -139,3 +139,37 @@ describe('resumeReplayPrompt:已转发插入的去重', () => {
     expect(prompt).not.toContain('插话')
   })
 })
+
+describe('lastUserPrompt:插件注入上下文不顶掉用户输入', () => {
+  it('系统提醒(plugin)排在用户消息之后时,仍取用户消息(压缩后排队消息丢失回归)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: '账本设计还是过度设计' }], source: { kind: 'user' } },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: '<system-reminder>技能目录已更新</system-reminder>' }],
+        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-skill' },
+      },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'Current runtime context…' }],
+        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' },
+      },
+    ] as unknown as Message[]
+    const { prompt } = await lastUserPrompt(ctx as never, messages)
+    expect(prompt).toBe('账本设计还是过度设计')
+  })
+
+  it('只有插件上下文时退回 CONTINUE_PROMPT(不把提醒当用户输入)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: '<system-reminder>技能目录</system-reminder>' }],
+        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-skill' },
+      },
+    ] as unknown as Message[]
+    const { prompt } = await lastUserPrompt(ctx as never, messages)
+    expect(prompt).toContain('继续完成之前未完成的任务')
+  })
+})

@@ -15,6 +15,7 @@
  * @module subagent-codebuddy/acp
  */
 import type { ChildProcess } from 'node:child_process';
+import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 /** 默认动态空闲超时预算:与 agy 执行器同一套算法(无总时长上限)。 */
 export declare const DEFAULT_ACP_RUN_TIMEOUTS: {
     firstMs: number;
@@ -74,6 +75,18 @@ export interface AcpExitInfo {
  * (Read→read、TodoWrite→todo_write、WebSearch→web_search),
  * 让子代理窗口复用 dsh 原生工具的可视化渲染器。 */
 export declare function toolNameOf(update: AcpUpdate): string;
+/**
+ * 从 `usage_update` 提取本次请求的用量(`_meta.usage`,OpenAI 风格字段)。
+ *
+ * 实测载荷:`prompt_tokens` / `completion_tokens` / `total_tokens` /
+ * `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`,缓存命中还会镜像在
+ * `prompt_tokens_details.cached_tokens`。映射到 dsh TokenUsage 的三个**不重叠**
+ * 桶:未命中输入、缓存读、缓存写——命中桶优先取 OpenAI 风格的 hit 字段
+ * (`cache_read_input_tokens` 在该载荷里恒为 0,不能优先)。
+ * @param update - 一条 session/update。
+ * @returns dsh 用量;载荷缺失或全零时为 undefined(心跳空载不计)。
+ */
+export declare function usageOfUpdate(update: AcpUpdate): TokenUsage | undefined;
 /** 进展性事件:代表任务真实推进,重置动态空闲计时。 */
 export declare function isProgressUpdate(update: AcpUpdate): boolean;
 /** 一个 ACP 进程连接:JSON-RPC 请求/通知 + update 事件回调。 */

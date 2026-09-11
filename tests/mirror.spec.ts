@@ -269,3 +269,50 @@ describe('SubagentMirror:任务工具桥接', () => {
     }
   })
 })
+
+describe('SubagentMirror:工具结果图片', () => {
+  it('转录里的图片文本 JSON → 影子 tool/result 转 image 块', async () => {
+    const tree = makeTree()
+    try {
+      const { sessions, events } = makeFakeSessions()
+      const saved: Array<{ mediaType: string; bytes: number }> = []
+      const mirror = new SubagentMirror({
+        sessions: sessions as never,
+        parentSessionId: 'parent-1',
+        cwd: tree.cwd,
+        acpSessionId: tree.acpSessionId,
+        projectsRoot: tree.root,
+        pollMs: 10_000,
+        attachments: {
+          saveImage: async (data, mediaType) => {
+            saved.push({ mediaType, bytes: data.byteLength })
+            return { attachmentId: 'sha256:test', mediaType, bytes: data.byteLength, width: 1, height: 1 }
+          },
+        },
+      })
+      mirror.start({ label: '图片子代理', prompt: '读图', delegationDepth: 1 })
+      const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+      const imageJson = JSON.stringify([{ type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } }])
+      writeRecords(tree.file, [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '读图' }] },
+        { type: 'function_call', callId: 'c1', name: 'Read', arguments: '{"file_path":"a.png"}' },
+        { type: 'function_call_result', callId: 'c1', name: 'Read', status: 'completed', output: { type: 'text', text: imageJson } },
+      ])
+      await mirror.syncOnce()
+      await mirror.finish()
+      const result = events.find(e => e.type === 'tool/result')
+      const blocks = (result!.data as {
+        message: { content: Array<{ content?: Array<Record<string, unknown>> }> }
+      }).message.content[0]!.content ?? []
+      expect(blocks.some(b => b['type'] === 'image')).toBe(true)
+      expect(JSON.stringify(blocks).includes('data:image')).toBe(false)
+      expect(saved).toEqual([{ mediaType: 'image/png', bytes: Buffer.from(png, 'base64').byteLength }])
+      const call = events.find(e => e.type === 'tool/call')!
+      expect((call.data as { name: string }).name).toBe('read_image')
+      expect((result!.data as { meta?: { path?: string } }).meta).toEqual({ path: 'a.png' })
+      validate(events)
+    } finally {
+      tree.cleanup()
+    }
+  })
+})

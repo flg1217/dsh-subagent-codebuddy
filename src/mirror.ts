@@ -25,6 +25,7 @@ import { createAssistantMessage, createToolResultMessage, createUserMessage, Too
 import { projectSlug } from './native-session.js'
 import { readImageBlob } from './image-blob.js'
 import { todoToolKind, TodoListState } from './todo-bridge.js'
+import { imageReadAlias, toolResultBlocksFromText } from './tool-image.js'
 
 /** 影子会话的最小操作面(sessions 服务)。 */
 export interface ShadowSessionFace {
@@ -89,6 +90,8 @@ export class RecordTranslator {
   private readonly advertised = new Set<string>()
   /** 子代理的任务/todo(整表快照,镜像侧同桥接)。 */
   private readonly todos = new TodoListState()
+  /** read_image 别名调用的 meta 路径(callId → path,结果落地时写 meta)。 */
+  private readonly imageReadPaths = new Map<string, string>()
 
   constructor(
     private readonly append: (type: string, data: unknown, opts?: unknown) => unknown,
@@ -189,12 +192,17 @@ export class RecordTranslator {
         if (record.callId === undefined) return
         const args = typeof record.arguments === 'string' ? record.arguments : JSON.stringify(record.arguments ?? {})
         const name = record.name ?? 'tool'
+        // 图片文件的 Read → dsh 原生 `read_image`(UI 图片卡片按此名 + 结果的
+        // meta.path 渲染缩略图;广告与 call 同名同参,逐字一致校验不受影响)。
+        const alias = imageReadAlias(name, args)
+        const dshName = alias?.name ?? name
+        if (alias !== undefined) this.imageReadPaths.set(record.callId, alias.path)
         // 广告 + call(name/arguments 逐字一致,严格校验要求)。
         this.append('assistant/message', {
           turn: 1,
           step: 1,
           message: createAssistantMessage({
-            content: [{ type: 'tool-call', id: ToolCallId(record.callId), name, arguments: args }],
+            content: [{ type: 'tool-call', id: ToolCallId(record.callId), name: dshName, arguments: args }],
             source: { provider: 'codebuddy', model: this.model },
           }),
           stream: [],
@@ -203,7 +211,7 @@ export class RecordTranslator {
           turn: 1,
           step: 1,
           callId: ToolCallId(record.callId),
-          name,
+          name: dshName,
           arguments: args,
         }) as { seq?: number } | undefined
         if (typeof event?.seq === 'number') this.callSeqs.set(record.callId, event.seq)
@@ -231,15 +239,29 @@ export class RecordTranslator {
         if (this.todos.resolveTaskUpdate(record.callId, text)) {
           this.append('todo/write', { todos: this.todos.snapshot() })
         }
+        const isError = record.status !== undefined && record.status !== 'completed' && record.status !== 'success'
+        const imagePath = this.imageReadPaths.get(record.callId)
+        this.imageReadPaths.delete(record.callId)
+        // 图片结果(CLI 以文本 JSON 交付):落 attachment 转 image 块,
+        // 与原生 read_image 同形状;非图片/失败保持原文(限长)。
+        let content: Array<Record<string, unknown>> = [{ type: 'text', text: text.slice(0, 4000) }]
+        if (!isError) {
+          const face = this.images === undefined
+            ? undefined
+            : { saveImage: (input: { data: Uint8Array; mediaType: string }): Promise<unknown> => this.images!.saveImage(input.data, input.mediaType) }
+          const converted = await toolResultBlocksFromText(face, text, imagePath)
+          if (converted !== undefined) content = converted
+        }
         const seq = this.callSeqs.get(record.callId)
         this.append('tool/result', {
           turn: 1,
           step: 1,
           message: createToolResultMessage({
             callId: ToolCallId(record.callId),
-            content: [{ type: 'text', text: text.slice(0, 4000) }],
-            isError: record.status !== undefined && record.status !== 'completed' && record.status !== 'success',
+            content: content as never,
+            isError,
           }),
+          ...(imagePath === undefined ? {} : { meta: { path: imagePath } }),
         }, {
           surfaceOp: 'append',
           ...(seq === undefined ? {} : { sourceEventSeqs: [seq] }),
