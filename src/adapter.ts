@@ -22,8 +22,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AssistantStreamAccumulator, ReasoningEffortId, ToolCallId, LlmAdapter, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import type { AssistantStreamRecord, ContentBlock, GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
@@ -49,6 +49,18 @@ function purposeWorkDir(): string {
 
 /** 可重试的委托失败:恢复同一会话续跑(ACP session/load)即可,不重复已完成部分。 */
 class RetryableError extends Error {}
+
+/**
+ * 插话链路诊断日志(临时):`~/.dsh/codebuddy/steer-debug.log`。
+ * 静默失败会让"点了插话没反应"无从定位,这里把每次轮询的判定写盘。
+ */
+export function steerDebug(line: string): void {
+  try {
+    mkdirSync(join(homedir(), '.dsh', 'codebuddy'), { recursive: true })
+    appendFileSync(join(homedir(), '.dsh', 'codebuddy', 'steer-debug.log'),
+      `${new Date().toISOString()} ${line}\n`)
+  } catch { /* 诊断不影响主流程 */ }
+}
 
 /** listModels 成功缓存时长。 */
 const SUCCESS_TTL_MS = 10 * 60_000
@@ -333,6 +345,17 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       )
       prompt = replay.prompt
       promptImages = replay.images
+      // 这一步的输入只有"我们已在运行中插话投递过"的消息(dsh 在回合边界把
+      // 那条插话 claim 成了新 step)。模型已经处理过它,再发
+      // `CONTINUE_PROMPT`("继续完成之前未完成的任务")会把模型从插话上拽回
+      // 旧任务——实测:插话送达成功(steered:true、注入成 user 消息、模型开始
+      // 响应),随后被这句催跑覆盖,用户看到的现象是"插队没生效"。
+      // 空跑收尾:不启动 CLI、不写任何内容,循环以空 assistant 消息闭合该 step。
+      if (replay.skippedForwarded === true && record.sentCount !== undefined) {
+        steerDebug(`空跑收尾:本 step 输入均为已插话投递的消息(sentCount=${record.sentCount})`)
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
     } else if (nativeSeed !== undefined) {
       // 历史走原生文件;prompt 只带当前输入(含其图片,原生内容块)。
       const last = await lastUserPrompt(this.ctx, options.messages)
@@ -966,22 +989,31 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
          */
         const forwardInsertion = (text: string): void => {
           const queuePrompt = (): void => {
+            steerDebug(`steer 被拒/失败 → 退回排队 prompt: ${JSON.stringify(text.slice(0, 30))}`)
             sendPrompt([{ type: 'text', text }])
             armIdle()
           }
-          void conn.request<{ steered?: boolean }>(
+          conn.request<{ steered?: boolean }>(
             'session/steer',
             { sessionId: acpSessionId, contentBlocks: [{ type: 'text', text }] },
             20_000,
           ).then(
-            res => { if (res?.steered !== true) queuePrompt() },
-            () => { queuePrompt() },
+            res => {
+              steerDebug(`steer 应答: ${JSON.stringify(res)}`)
+              if (res?.steered !== true) queuePrompt()
+            },
+            error => {
+              steerDebug(`steer 报错: ${String(error).slice(0, 160)}`)
+              queuePrompt()
+            },
           )
         }
 
         /** 轮询间隔(中途插入检测)。 */
         const steerPollMs = this.options.steerPollMs ?? 1_200
         let lastSteerPoll = Date.now()
+        /** 已记录过"跳过"的 id(诊断日志去重,避免每 1.2s 刷屏)。 */
+        const skippedLogged = new Set<string>()
 
         /**
          * 插话检测:dsh inbox 里尚未 claim 的 **next-step** 消息 → ACP steer。
@@ -1001,10 +1033,17 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           try {
             for (const insertion of foldPendingInsertions(session.ownEvents?.() ?? [])) {
               if (!insertion.steer) continue
-              if (!this.markForwarded(dshSessionId, insertion.id)) continue
+              if (!this.markForwarded(dshSessionId, insertion.id)) {
+                if (!skippedLogged.has(insertion.id)) {
+                  skippedLogged.add(insertion.id)
+                  steerDebug(`poll: 已标记跳过 id=${insertion.id}(已投递过,不重复)`)
+                }
+                continue
+              }
+              steerDebug(`poll: steer id=${insertion.id} text=${JSON.stringify(insertion.text.slice(0, 30))}`)
               forwardInsertion(insertion.text)
             }
-          } catch { /* 插入检测不阻断主流程 */ }
+          } catch (error) { steerDebug(`poll 异常: ${String(error)}`) }
         }
 
         // 尾巴窗口参数(见 AcpTimeouts.tailQuietMs / tailBgQuietMs)。

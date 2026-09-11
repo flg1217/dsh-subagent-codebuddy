@@ -886,6 +886,79 @@ describe('adapter:用量统计(底部统计栏/上下文占用)', () => {
   }, 15_000)
 })
 
+describe('adapter:step 输入只有已插话投递的消息', () => {
+  /** 构造:store 带锚点 + 会话已打开 step;forwardedInsertions 预置"已插话投递"。 */
+  function harness(sentCount: number, forwarded: string[]): { adapter: CodebuddyLlmAdapter } {
+    const store = new ConversationStore(null)
+    store.set('s1', { acpId: 'cb-1', sentCount })
+    const session = {
+      header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
+      append: () => ({ seq: 1 }),
+      ownEvents: () => [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'step/start', data: { turn: 1, step: 1 } },
+      ],
+    }
+    const ctx = { get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined) } as unknown as Context
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store,
+    })
+    const face = adapter as unknown as { forwardedInsertions: Map<string, Set<string>> }
+    face.forwardedInsertions.set('s1', new Set(forwarded))
+    return { adapter }
+  }
+
+  it('已插话投递的消息在回合边界被 claim 成新 step → 空跑收尾(不启动 CLI、不发 CONTINUE_PROMPT)', async () => {
+    const { adapter } = harness(1, ['m-steer'])
+    let spawned = 0
+    mockedSpawn.mockImplementation(() => {
+      spawned += 1
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      return asSpawnResult(p)
+    })
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1', {
+      messages: [
+        { id: 'm-old', role: 'user', content: [{ type: 'text', text: '旧输入' }], source: { kind: 'user' } },
+        { id: 'm-steer', role: 'user', content: [{ type: 'text', text: '插句话:先别做别的' }], source: { kind: 'user' } },
+      ],
+    }))) chunks.push(JSON.stringify(chunk))
+    expect(spawned).toBe(0)                                   // 不 spawn CLI
+    expect(chunks.join('')).toContain('"finish"')             // 空跑:只有收尾
+    expect(chunks.join('')).not.toContain('继续完成之前未完成的任务')
+  }, 15_000)
+
+  it('对照:锚点之后是 CodeBuddy 自己的消息 → 仍发 CONTINUE_PROMPT 续跑', async () => {
+    const { adapter } = harness(1, [])
+    const prompts: Array<Array<Record<string, unknown>>> = []
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method !== 'session/prompt') return
+        prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 5)
+      })
+      setTimeout(() => { p.update(message('继续干活')) }, 5)
+      return asSpawnResult(p)
+    })
+    for await (const _ of adapter.stream(makeOptions('s1', {
+      messages: [
+        { id: 'm-old', role: 'user', content: [{ type: 'text', text: '旧输入' }], source: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: '我自己产出的' }] },
+      ],
+    }))) { /* drain */ }
+    expect(prompts.length).toBe(1)
+    expect(JSON.stringify(prompts[0])).toContain('继续完成之前未完成的任务')
+  }, 15_000)
+})
+
 describe('adapter:压缩后续聊兜底(历史收缩)', () => {
   it('sentCount 超出当前消息数时,补发最后一条用户消息,而不是排在它后面的插件提醒', async () => {
     const store = new ConversationStore(null)

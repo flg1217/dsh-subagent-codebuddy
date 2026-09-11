@@ -5,7 +5,7 @@
  * - 超长 prompt 内联返回(经 ACP stdin 发送,无命令行长度限制)。
  */
 import { describe, expect, it, vi } from 'vitest'
-import { buildPrompt, lastUserPrompt } from '../src/serialize.ts'
+import { buildPrompt, lastUserPrompt, resumeReplayPrompt } from '../src/serialize.ts'
 import type { Message } from '@deepseek-ai/dsh-llm'
 
 /** 伪附件服务:readImage 返回图片字节与媒体类型。 */
@@ -171,5 +171,46 @@ describe('lastUserPrompt:插件注入上下文不顶掉用户输入', () => {
     ] as unknown as Message[]
     const { prompt } = await lastUserPrompt(ctx as never, messages)
     expect(prompt).toContain('继续完成之前未完成的任务')
+  })
+})
+
+describe('resumeReplayPrompt:只有已插话投递的消息可跳过', () => {
+  /** 用户消息(带 id,便于 skipIds 命中)。 */
+  function userMessage(id: string, text: string): Message {
+    return { id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } } as unknown as Message
+  }
+
+  it('锚点之后全是"已插话投递"的消息 → skippedForwarded=true(调用方空跑,不发 CONTINUE_PROMPT)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('m-old', '旧输入'),
+      userMessage('m-steer', '插句话:先别做别的'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set(['m-steer']))
+    expect(replay.skippedForwarded).toBe(true)
+    expect(replay.prompt).toContain('继续完成之前未完成的任务')   // 兜底文本仍在,由调用方决定不用
+  })
+
+  it('跳过的是 CodeBuddy 自己的消息 → skippedForwarded 不置位(仍走续跑)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('m-old', '旧输入'),
+      { role: 'assistant', content: [{ type: 'text', text: '我自己产出的' }] } as unknown as Message,
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set())
+    expect(replay.skippedForwarded).toBe(false)
+  })
+
+  it('锚点之后还有新输入 → 正常序列化新输入(S 不置位)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('m-old', '旧输入'),
+      userMessage('m-steer', '插句话'),
+      userMessage('m-new', '新的输入'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set(['m-steer']))
+    expect(replay.skippedForwarded).toBeUndefined()
+    expect(replay.prompt).toContain('新的输入')
+    expect(replay.prompt).not.toContain('插句话')
   })
 })

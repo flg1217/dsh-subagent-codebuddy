@@ -19,6 +19,11 @@ export interface SerializedPrompt {
         data: string;
         mimeType: string;
     }>;
+    /**
+     * 本次补发**只有**已插话投递过的消息被跳过(无任何新内容)。
+     * 调用方据此空跑收尾,而不是发 CONTINUE_PROMPT 把模型拽回旧任务。
+     */
+    skippedForwarded?: boolean;
 }
 /**
  * 续聊兜底:只发**用户自己发的**最后一条消息(锚点缺失/历史被压缩收缩时)。
