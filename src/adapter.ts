@@ -37,6 +37,8 @@ import { foldPendingInsertions } from './inbox.js'
 import { todoToolKind, TodoListState } from './todo-bridge.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf } from './acp.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
+import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
+import type { CodebuddyFailure } from './failure.js'
 import { listCodebuddyModelIdsAsync } from './models.js'
 
 /** purpose 调用的隔离工作目录(懒建;一次性旁路会话不落进用户项目)。 */
@@ -48,6 +50,26 @@ function purposeWorkDir(): string {
 
 /** 可重试的委托失败:恢复同一会话续跑(ACP session/load)即可,不重复已完成部分。 */
 class RetryableError extends Error {}
+
+/** 取第一个非空字符串。 */
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (value !== undefined && value.length > 0) return value
+  }
+  return undefined
+}
+
+/**
+ * 按失败分类收尾:可重试分类(网络/模型服务等瞬时故障)抛 RetryableError,
+ * 外层恢复会话续跑;配额/认证等重试无意义的分类直接显式中止——让对话里
+ * 显示真实中断原因,而不是笼统的"静默失败"。
+ */
+function throwFailure(prefix: string, failure: CodebuddyFailure | undefined, suffix?: string): never {
+  if (failure === undefined) throw new Error(`${prefix}未知错误`)
+  const message = `${prefix}${formatFailureLine(failure, suffix)}`
+  if (failure.retryable) throw new RetryableError(message)
+  throw new Error(message)
+}
 
 /** listModels 成功缓存时长。 */
 const SUCCESS_TTL_MS = 10 * 60_000
@@ -87,6 +109,52 @@ export function findOpenStep(events: readonly SessionEvent[]): { turn: number; s
     }
   }
   return open
+}
+
+/** CodeBuddy 读图输出解析结果:文本片段 + 待存附件服务的图片。 */
+export interface ParsedImageOutput {
+  /** 输出中的文本块(拼接),可能为空。 */
+  text: string
+  /** data URI 解码后的图片字节与媒体类型。 */
+  images: Array<{ data: Uint8Array; mediaType: string }>
+}
+
+/**
+ * 识别 CodeBuddy Read 工具读图的原始输出。
+ * 形态:`[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}, ...]`
+ * (部分版本为 JSON 字符串,数组内可混有 text 块)。非该形态返回 undefined,
+ * 调用方保持原有纯文本路径。
+ * @param outputText - tool/result 的原始输出文本。
+ * @returns 解析出的文本与图片;不是图片输出时为 undefined。
+ */
+export function parseCodebuddyImageOutput(outputText: string): ParsedImageOutput | undefined {
+  const trimmed = outputText.trim()
+  if (!trimmed.startsWith('[') || !trimmed.includes('image_url')) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(parsed)) return undefined
+  const texts: string[] = []
+  const images: Array<{ data: Uint8Array; mediaType: string }> = []
+  for (const item of parsed) {
+    if (item === null || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    if (record['type'] === 'text' && typeof record['text'] === 'string') {
+      texts.push(record['text'])
+      continue
+    }
+    if (record['type'] !== 'image_url') continue
+    const url = (record['image_url'] as Record<string, unknown> | undefined)?.['url']
+    if (typeof url !== 'string') continue
+    const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,(.*)$/is.exec(url)
+    if (match === null) continue
+    images.push({ data: new Uint8Array(Buffer.from(match[2]!, 'base64')), mediaType: match[1]! })
+  }
+  if (images.length === 0) return undefined
+  return { text: texts.join('\n'), images }
 }
 
 /** CodeBuddy CLI 入口配置(由 index.ts 解析)。 */
@@ -553,21 +621,63 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         return ev?.seq
       }
 
-      /** 写一条工具结果(截断 2000 字符;failed/未完成 → isError)。 */
-      const landToolResult = (callId: string, outputText: string, isError: boolean): void => {
+      /** 写一条工具结果(截断 2000 字符;failed/未完成 → isError)。
+       * CodeBuddy Read 工具读取图片时 rawOutput.text 是
+       * `[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]`
+       * 形态的 JSON:识别后把图片存进附件服务,落成 dsh 原生 image 块
+       * (UI 渲染缩略图、可点击看大图),而不是把 base64 原样铺进文本。 */
+      const landToolResult = (callId: string, outputText: string, isError: boolean): void | Promise<void> => {
         const seq = stepState.toolCallSeqs.get(callId)
-        session!.append('tool/result', {
-          turn,
-          step,
-          message: createToolResultMessage({
-            callId: ToolCallId(callId),
-            content: [{ type: 'text', text: outputText.slice(0, 2000) }],
-            isError,
-          }),
-        }, {
-          surfaceOp: 'append',
+        const sourceOptions = {
+          surfaceOp: 'append' as const,
           ...(seq !== undefined ? { sourceEventSeqs: [seq] } : {}),
-        })
+        }
+        const parsedImage = parseCodebuddyImageOutput(outputText)
+        if (parsedImage === undefined) {
+          session!.append('tool/result', {
+            turn,
+            step,
+            message: createToolResultMessage({
+              callId: ToolCallId(callId),
+              content: [{ type: 'text', text: outputText.slice(0, 2000) }],
+              isError,
+            }),
+          }, sourceOptions)
+          return
+        }
+        return (async () => {
+          const attachments = this.ctx.get('attachments') as unknown as
+            | { saveImage: (input: { data: Uint8Array; mediaType: string }) => Promise<unknown> }
+            | undefined
+          const blocks: ContentBlock[] = [{
+            type: 'text',
+            text: parsedImage.text.length > 0
+              ? parsedImage.text.slice(0, 2000)
+              : `[图片输出:${parsedImage.images.length} 张]`,
+          }]
+          for (const image of parsedImage.images) {
+            if (attachments === undefined) {
+              blocks.push({ type: 'text', text: '[图片无法显示:附件服务不可用]' })
+              continue
+            }
+            try {
+              const ref = await attachments.saveImage(image)
+              blocks.push({ type: 'image', attachment: ref } as ContentBlock)
+            } catch (error: unknown) {
+              const message = error instanceof Error ? error.message : String(error)
+              blocks.push({ type: 'text', text: `[图片保存失败:${message.slice(0, 300)}]` })
+            }
+          }
+          session!.append('tool/result', {
+            turn,
+            step,
+            message: createToolResultMessage({
+              callId: ToolCallId(callId),
+              content: blocks,
+              isError,
+            }),
+          }, sourceOptions)
+        })()
       }
 
       /**
@@ -587,7 +697,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             entry.landed = true
             landToolCall(callId, entry.name, JSON.stringify(entry.rawInput))
           }
-          landToolResult(callId, 'CodeBuddy turn ended before this tool reported completion.', true)
+          void landToolResult(callId, 'CodeBuddy turn ended before this tool reported completion.', true)
           consumedToolCalls.add(callId)
         }
         pendingToolCalls.clear()
@@ -673,7 +783,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       }
 
       /** 处理一条 ACP update:续命 + 会话事件落地 + 流累积。 */
-      const handleUpdate = (update: AcpUpdate): void => {
+      const handleUpdate = async (update: AcpUpdate): Promise<void> => {
         if (isProgressUpdate(update)) armIdle()
         switch (update.sessionUpdate) {
           case 'agent_thought_chunk':
@@ -748,7 +858,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             armIdle()
             if (!direct) return
             flushPending()
-            landToolResult(update.toolCallId, update.rawOutput?.text ?? '', update.status === 'failed')
+            await landToolResult(update.toolCallId, update.rawOutput?.text ?? '', update.status === 'failed')
             confirmTodo(update.toolCallId, known.name, update.rawOutput?.text ?? '')
             finishMirror(update.toolCallId, update.rawOutput?.text ?? '')
             return
@@ -866,7 +976,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         while (inFlight > 0 && promptError === undefined && exitError === undefined && !stallTimedOut) {
           while (queue.length > 0) {
             const update = queue.shift()
-            if (update !== undefined) handleUpdate(update)
+            if (update !== undefined) await handleUpdate(update)
           }
           while (pendingChunks.length > 0) yield pendingChunks.shift()!
           // 中途插入检测:dsh inbox 里尚未 claim 的用户消息 → 排队转发。
@@ -887,7 +997,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         // 抽干尾巴(cancel/exit 后可能还有少量 update)。
         while (queue.length > 0) {
           const update = queue.shift()
-          if (update !== undefined) handleUpdate(update)
+          if (update !== undefined) await handleUpdate(update)
         }
         while (pendingChunks.length > 0) yield pendingChunks.shift()!
 
@@ -901,7 +1011,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }
         if (promptError !== undefined) {
           finalizePendingTools()
-          throw new RetryableError(`CodeBuddy ACP 请求失败:${promptError.message}${conn.stderrNote()}`)
+          throwFailure('CodeBuddy ACP 请求失败:', failureOfError(promptError), conn.stderrNote())
         }
         if (exitError !== undefined) {
           finalizePendingTools()
@@ -918,22 +1028,35 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }
 
         const stopReason = promptResult?.stopReason
-        const errorMessage = promptResult?.errorMessage
+        // 失败详情优先取顶层 errorMessage;refusal 场景只有
+        // _meta["codebuddy.ai/errorMessage"](JSON:code/category/statusCode/
+        // displayMsg 多语言文案)与 "codebuddy.ai/outcome"(FAILED_MODEL_REQUEST 等)。
+        const metaError = promptResult?._meta?.['codebuddy.ai/errorMessage']
+        const metaOutcome = promptResult?._meta?.['codebuddy.ai/outcome']
+        const rawError = firstNonEmpty(
+          promptResult?.errorMessage,
+          typeof metaError === 'string' ? metaError : undefined,
+        )
+        const failureOutcome = isFailureOutcome(metaOutcome) ? metaOutcome : undefined
         flushPending()
         releasePending()
         // stream 模式的收尾块在最后一次泵之后才产生,这里补泵(compaction/标题)。
         while (pendingChunks.length > 0) yield pendingChunks.shift()!
-        if (errorMessage !== undefined && errorMessage.length > 0) {
+        if (rawError !== undefined || failureOutcome !== undefined) {
           finalizePendingTools()
-          throw new RetryableError(`CodeBuddy 报错:${errorMessage.slice(0, 300)}${conn.stderrNote()}`)
+          throwFailure(
+            'CodeBuddy 中断:',
+            parseCodebuddyFailure(rawError, undefined, failureOutcome),
+            conn.stderrNote(),
+          )
         }
-        // 静默失败防御(实测高频):end_turn 但零思考、零文本、零工具——多为
-        // 配额受限/服务端异常导致的静默失败;或只有思考没有产出(半途失败)。
+        // 静默失败防御(实测高频):end_turn 但零思考、零文本、零工具——无错误
+        // 详情上报的空跑,多为服务端异常;或只有思考没有产出(半途失败)。
         // 空跑会让主代理以为子代理完成了,用户看到"莫名中断"。
         if (stopReason !== 'cancelled' && (progressSamples === 0 || textLanded === 0)) {
           finalizePendingTools()
           throw new RetryableError(`CodeBuddy 静默失败(stopReason: ${stopReason ?? 'none'};`
-            + `${progressSamples} 次进展、0 次文本产出)——可能是配额受限或服务端异常`)
+            + `${progressSamples} 次进展、0 次文本产出;无错误详情上报)`)
         }
         finalizePendingTools()
         // end_turn + 有文本产出,或 cancelled:正常收尾。

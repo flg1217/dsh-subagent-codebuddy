@@ -38,6 +38,25 @@ export declare function findOpenStep(events: readonly SessionEvent[]): {
     turn: number;
     step: number;
 } | undefined;
+/** CodeBuddy 读图输出解析结果:文本片段 + 待存附件服务的图片。 */
+export interface ParsedImageOutput {
+    /** 输出中的文本块(拼接),可能为空。 */
+    text: string;
+    /** data URI 解码后的图片字节与媒体类型。 */
+    images: Array<{
+        data: Uint8Array;
+        mediaType: string;
+    }>;
+}
+/**
+ * 识别 CodeBuddy Read 工具读图的原始输出。
+ * 形态:`[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}, ...]`
+ * (部分版本为 JSON 字符串,数组内可混有 text 块)。非该形态返回 undefined,
+ * 调用方保持原有纯文本路径。
+ * @param outputText - tool/result 的原始输出文本。
+ * @returns 解析出的文本与图片;不是图片输出时为 undefined。
+ */
+export declare function parseCodebuddyImageOutput(outputText: string): ParsedImageOutput | undefined;
 /** CodeBuddy CLI 入口配置(由 index.ts 解析)。 */
 export interface CodebuddyAdapterOptions {
     /** 可执行入口(node 脚本绝对路径或命令)。 */

@@ -5,11 +5,8 @@
  * 广告、step/end 无未决工具、adapter 不写 step 事件。
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { assertReleasedArtifactRelationships } from '@deepseek-ai/dsh-session-format-v0-to-v1'
-import { CodebuddyLlmAdapter } from '../src/adapter.ts'
- import { ConversationStore } from '../src/conversations.ts'
 import { asSpawnResult, autoHandshake, fakeAcpProc, message, thought, toolCall, toolUpdate } from './fake-acp.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -19,67 +16,9 @@ vi.mock('node:child_process', async (importOriginal) => {
 const { spawn } = await import('node:child_process')
 const mockedSpawn = vi.mocked(spawn)
 
-interface RecordedEvent {
-  type: string
-  seq: number
-  time: number
-  data: unknown
-  surfaceOp?: unknown
-  sourceEventSeqs?: readonly number[]
-}
+import { makeRecordingAdapter } from './recording-fixture.ts'
+import type { RecordedEvent } from './recording-fixture.ts'
 
-/**
- * 记录型会话 fixture:预置调用方(agent-loop)打开的 turn/step,
- * adapter 写入追加其后;结束后由测试补 step/end + turn/end。
- */
-function makeRecordingAdapter(): {
-  adapter: CodebuddyLlmAdapter
-  events: RecordedEvent[]
-  seedTurnEnd: () => void
-} {
-  const events: RecordedEvent[] = []
-  const record = (type: string, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: readonly number[] }): void => {
-    events.push({
-      type,
-      seq: events.length,
-      time: events.length + 1,
-      data,
-      ...(opts?.surfaceOp !== undefined ? { surfaceOp: opts.surfaceOp } : {}),
-      ...(opts?.sourceEventSeqs !== undefined ? { sourceEventSeqs: opts.sourceEventSeqs } : {}),
-    })
-  }
-  // 调用方的已提交事件(turn/step 由其打开)。
-  record('turn/start', { turn: 1 })
-  record('step/start', { turn: 1, step: 1 })
-
-  const session = {
-    header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
-    append: (type: string, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: readonly number[] }) => {
-      record(type, data, opts)
-      return { seq: events.length - 1 }
-    },
-    ownEvents: () => [
-      { type: 'turn/start', data: { turn: 1 } },
-      { type: 'step/start', data: { turn: 1, step: 1 } },
-    ],
-  }
-  const ctx = {
-    get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined),
-  } as unknown as Context
-  const adapter = new CodebuddyLlmAdapter(ctx, {
-    command: 'codebuddy.js',
-    prefixArgs: [],
-    modelOf: () => 'glm-5.3',
-    permissionMode: 'bypassPermissions',
-    extraArgs: [],
-  store: new ConversationStore(null),
-  })
-  const seedTurnEnd = (): void => {
-    record('step/end', { turn: 1, step: 1 })
-    record('turn/end', { turn: 1, reason: { kind: 'completed' } })
-  }
-  return { adapter, events, seedTurnEnd }
-}
 
 function options(): GenerateOptions {
   return {

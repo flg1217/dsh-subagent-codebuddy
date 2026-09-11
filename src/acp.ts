@@ -65,6 +65,27 @@ export interface AcpUpdate {
 export interface AcpPromptResult {
   stopReason?: string
   errorMessage?: string
+  /**
+   * CodeBuddy 私有扩展。失败详情在 `codebuddy.ai/errorMessage`(JSON 串,
+   * 含 category/statusCode/业务码)与 `codebuddy.ai/traceId` 里;
+   * 顶层 errorMessage 为空时这里才是唯一原因来源(实测 refusal 场景)。
+   */
+  _meta?: Record<string, unknown>
+}
+
+/**
+ * JSON-RPC 级失败:保留错误码与 data(限流/认证/模型服务等分类在 data 里,
+ * 压成纯文本就丢失了可分类性)。
+ */
+export class AcpRpcError extends Error {
+  constructor(
+    readonly code: number | undefined,
+    message: string,
+    readonly data: Record<string, unknown> | undefined,
+  ) {
+    super(message)
+    this.name = 'AcpRpcError'
+  }
 }
 
 /** 进程退出信息。 */
@@ -94,6 +115,16 @@ export function isProgressUpdate(update: AcpUpdate): boolean {
     || update.sessionUpdate === 'agent_thought_chunk'
     || update.sessionUpdate === 'tool_call'
     || update.sessionUpdate === 'tool_call_update'
+}
+
+/** JSON-RPC error 对象 → AcpRpcError(保留 code 与 data)。 */
+function toRpcError(raw: unknown): AcpRpcError {
+  const error = (raw !== null && typeof raw === 'object' ? raw : {}) as { code?: unknown; message?: unknown; data?: unknown }
+  const data = error.data !== null && typeof error.data === 'object' && !Array.isArray(error.data)
+    ? error.data as Record<string, unknown>
+    : undefined
+  const message = typeof error.message === 'string' && error.message.length > 0 ? error.message : 'error'
+  return new AcpRpcError(typeof error.code === 'number' ? error.code : undefined, `ACP ${message}`, data)
 }
 
 /** 一个 ACP 进程连接:JSON-RPC 请求/通知 + update 事件回调。 */
@@ -135,7 +166,7 @@ export class AcpConnection {
         const p = this.pending.get(msg.id)
         if (p !== undefined) {
           this.pending.delete(msg.id)
-          if (msg.error !== undefined) p.reject(new Error(`ACP ${String((msg.error as { message?: string }).message ?? 'error')}`))
+          if (msg.error !== undefined) p.reject(toRpcError(msg.error))
           else p.resolve(msg.result)
         }
         return
