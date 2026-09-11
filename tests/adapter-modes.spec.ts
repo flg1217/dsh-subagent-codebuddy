@@ -450,32 +450,44 @@ describe('adapter:任务面板跨回合重播', () => {
   }, 15_000)
 })
 
-describe('adapter:碎片消息携带累积正文(客户端末条胜出)', () => {
-  it('工具广告与后续碎片都包含此前累积的文本块;末条即全文', async () => {
+describe('adapter:碎片消息保持自然顺序(各含自己那块)', () => {
+  it('每条碎片只含自己的块;同一批块也全部交给循环(收尾消息 = 按序全文)', async () => {
     const { adapter, appended } = makeAdapter()
-    await runTurn(adapter, makeOptions('s1'), (p) => {
-      p.update(message('第一段:说明 A'))
-      p.update(thought('思考片段'))
-      p.update(message('第二段:说明 B'))
-      p.update(toolCall('call_acc', 'Bash', { command: 'ls' }))
-      p.update(toolUpdate('call_acc', 'completed', 'ok'))
-      p.update(message('第三段:结论 C'))
-      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    const chunks: string[] = []
+    const run = (async () => {
+      for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
+    })()
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      setTimeout(() => {
+        p.update(message('第一段:说明 A'))
+        p.update(thought('思考片段'))
+        p.update(message('第二段:说明 B'))
+        p.update(toolCall('call_acc', 'Bash', { command: 'ls' }))
+        p.update(toolUpdate('call_acc', 'completed', 'ok'))
+        p.update(message('第三段:结论 C'))
+        setTimeout(() => p.respond(p.requestLog().length, { stopReason: 'end_turn' }), 10)
+      }, 5)
+      return asSpawnResult(p)
     })
+    await run
     const contents = appended
       .filter(entry => entry.type === 'assistant/message')
       .map(entry => (entry.data as { message: { content: Array<{ type: string; text?: string }> } }).message.content)
+    // 文本碎片只含自己那段(不把此前文本堆进来,保持与工具的自然顺序)。
+    const textPiece = contents.find(blocks => blocks.length === 1 && blocks[0]?.type === 'text' && blocks[0].text?.includes('第一段'))
+    expect(textPiece).toBeDefined()
+    // 工具广告只含工具块。
     const ad = contents.find(blocks => blocks.some(block => block.type === 'tool-call'))
     expect(ad).toBeDefined()
-    const adText = (ad ?? []).filter(block => block.type === 'text').map(block => block.text).join('')
-    // 工具广告也带上前两段文本(dsh 客户端同一 step 末条胜出,末条必须含全文)。
-    expect(adText).toContain('第一段')
-    expect(adText).toContain('第二段')
-    // 末条(本条 step 内我们写的最后一条)同样带全文,客户端末条胜出即完整视图。
-    const last = contents.at(-1) ?? []
-    const lastText = last.filter(block => block.type === 'text').map(block => block.text).join('')
-    expect(lastText).toContain('第一段')
-    expect(lastText).toContain('第二段')
+    expect(ad!.filter(block => block.type === 'text')).toEqual([])
+    // 每一块都交给循环:收尾消息由全部 chunk 按序组装,不再只剩最后一句。
+    const yielded = chunks.join('')
+    expect(yielded).toContain('第一段')
+    expect(yielded).toContain('思考片段')
+    expect(yielded).toContain('第二段')
+    expect(yielded).toContain('第三段')
   }, 15_000)
 })
 
