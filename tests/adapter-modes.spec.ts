@@ -450,6 +450,35 @@ describe('adapter:任务面板跨回合重播', () => {
   }, 15_000)
 })
 
+describe('adapter:碎片消息携带累积正文(客户端末条胜出)', () => {
+  it('工具广告与后续碎片都包含此前累积的文本块;末条即全文', async () => {
+    const { adapter, appended } = makeAdapter()
+    await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(message('第一段:说明 A'))
+      p.update(thought('思考片段'))
+      p.update(message('第二段:说明 B'))
+      p.update(toolCall('call_acc', 'Bash', { command: 'ls' }))
+      p.update(toolUpdate('call_acc', 'completed', 'ok'))
+      p.update(message('第三段:结论 C'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    const contents = appended
+      .filter(entry => entry.type === 'assistant/message')
+      .map(entry => (entry.data as { message: { content: Array<{ type: string; text?: string }> } }).message.content)
+    const ad = contents.find(blocks => blocks.some(block => block.type === 'tool-call'))
+    expect(ad).toBeDefined()
+    const adText = (ad ?? []).filter(block => block.type === 'text').map(block => block.text).join('')
+    // 工具广告也带上前两段文本(dsh 客户端同一 step 末条胜出,末条必须含全文)。
+    expect(adText).toContain('第一段')
+    expect(adText).toContain('第二段')
+    // 末条(本条 step 内我们写的最后一条)同样带全文,客户端末条胜出即完整视图。
+    const last = contents.at(-1) ?? []
+    const lastText = last.filter(block => block.type === 'text').map(block => block.text).join('')
+    expect(lastText).toContain('第一段')
+    expect(lastText).toContain('第二段')
+  }, 15_000)
+})
+
 describe('adapter:中途插入(steering)', () => {
   /** 建一个已打开 step 的直写会话(插入投递的前置条件)。 */
   function directSession(): { events: Array<{ type: string; data?: unknown }>; ctx: Context } {
@@ -982,13 +1011,14 @@ describe('adapter:用量统计(底部统计栏/上下文占用)', () => {
         usage?: Record<string, number>
         stream: Array<{ chunk?: { type: string; text?: string }; time?: number }>
       })
-    const ad = messages.find(item => item.message.content[0]?.type === 'tool-call')
+    // 广告消息里除工具块外还带上累积正文(客户端末条胜出),按"含工具块"定位。
+    const ad = messages.find(item => item.message.content.some(block => block.type === 'tool-call'))
     expect(ad).toBeDefined()
     expect(ad!.usage).toMatchObject({ inputTokens: 198, outputTokens: 24, cacheReadTokens: 25216 })
     expect(ad!.stream[0]?.chunk).toMatchObject({ type: 'text-delta', text: '正在处理' })
     expect(typeof ad!.stream[0]?.time).toBe('number')
-    // 后写的文本块带最新样本。
-    const piece = messages.find(item => item.message.content[0]?.type === 'text')
+    // 后写的文本块带最新样本(取最后一条含文本块的消息)。
+    const piece = [...messages].reverse().find(item => item.message.content.some(block => block.type === 'text'))
     expect(piece?.usage).toMatchObject({ inputTokens: 10, outputTokens: 5 })
   }, 15_000)
 })

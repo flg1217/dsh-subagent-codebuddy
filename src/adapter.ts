@@ -415,6 +415,22 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let stepUsage: TokenUsage | undefined
       /** 本 step 首个 token 增量(到达时刻 + 原 chunk),供首 token 计时投影。 */
       let firstDelta: { time: number; chunk: StreamChunk } | undefined
+      /**
+       * 本 step 已持久化的**文本块**(按落地顺序)。
+       *
+       * 每个碎片消息都随带这些文本,原因:dsh 客户端对同一个 step 的
+       * assistant/message 是**末条胜出**——一条 step 里最后落地的消息决定视图。
+       * CodeBuddy 一轮 = 一个横跨几十分钟的巨型 step,中途最后落地的往往是思考
+       * 或工具广告,于是此前所有正文都被"顶掉"(用户视角:一句消息都看不到)。
+       * 让每条消息都带上截至目前累积的正文,末条即全文;中途刷新也能看到。
+       * 重复文本由会话日志的 zstd 压缩吸收,模型侧不受影响(其消息在补发时按
+       * source.kind === 'model' 跳过)。
+       */
+      const landedTexts: ContentBlock[] = []
+      /** 累积正文 = 已写出的文本块 + 尚未写出的延写块(若为文本)。 */
+      const accumulatedTexts = (): ContentBlock[] => pendingPiece !== undefined && pendingPiece.block.type === 'text'
+        ? [...landedTexts, pendingPiece.block]
+        : [...landedTexts]
       /** read_image 别名调用的 meta 路径(callId → path,结果落地时写 meta)。 */
       const imageReadPaths = new Map<string, string>()
       /** 本回合是否见过 agentPhase 心跳(CLI 能力探针;老 CLI 无此信号)。 */
@@ -567,12 +583,13 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             turn,
             step,
             message: createAssistantMessage({
-              content: [piece.block],
+              content: [...landedTexts, piece.block],
               source: { provider: options.provider ?? 'codebuddy', model },
             }),
             ...(stepUsage === undefined ? {} : { usage: stepUsage }),
             stream: [...accumulator.snapshot()] as AssistantStreamRecord[],
           }, { surfaceOp: 'append' })
+          if (piece.block.type === 'text') landedTexts.push(piece.block)
         } catch { /* 日志面失败不影响流 */ }
       }
 
@@ -618,7 +635,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           turn,
           step,
           message: createAssistantMessage({
-            content: [{ type: 'tool-call', id: ToolCallId(callId), name: dshName, arguments: args }],
+            content: [...accumulatedTexts(), { type: 'tool-call', id: ToolCallId(callId), name: dshName, arguments: args }],
             source: { provider: options.provider ?? 'codebuddy', model },
           }),
           ...(stepUsage === undefined ? {} : { usage: stepUsage }),
