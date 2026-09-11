@@ -171,14 +171,15 @@ describe('adapter(ACP):基本对话', () => {
     }
     expect(appended.some(a => a.startsWith('assistant/chunk'))).toBe(false)
     // 延写一块:'分析中' 在 '你好' 收尾时持久化(surfaceOp append,侧边栏/历史
-    // 视图运行中可见);流末的 '你好' 交给循环(其收尾消息=最后一块,非空,
-    // 不会再被空消息吞掉;模型派生=两块恰好一次,零重复)。
+    // 视图运行中可见);同时**每一块**都交给循环组装收尾消息——dsh 客户端对同一
+    // step 的 assistant/message 末条胜出,只 yield 最后一块的话长回合里正文会被
+    // 顶掉(实测只剩最后一句),所以收尾消息必须含全文。
     const messages = appended.filter(a => a.startsWith('assistant/message'))
     expect(messages.length).toBe(1)
     expect(messages[0]).toContain('分析中')
     expect(messages[0]).toContain('"surfaceOp":"append"')
     expect(chunks.some(c => c.includes('你好'))).toBe(true)
-    expect(chunks.some(c => c.includes('分析中'))).toBe(false)
+    expect(chunks.some(c => c.includes('分析中'))).toBe(true)
     // adapter 不再自管 step:调用方(agent-loop)打开/关闭 step。
     expect(appended.some(a => a.startsWith('step/'))).toBe(false)
     expect(chunks.some(c => c.includes('"stop"'))).toBe(true)
