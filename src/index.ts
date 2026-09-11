@@ -56,6 +56,27 @@ export interface Config {
    * 设为 0 则永不因静默中止(接受 CLI 卡死时进程泄漏、子会话回合悬空的风险)。
    */
   longToolCapMinutes?: number
+  /**
+   * 尾巴窗口静默阈值(秒,默认 5;0 = 关闭)。
+   *
+   * CodeBuddy 的 `end_turn` 不等于空闲:后台任务(后台 bash / agent 任务)完成时
+   * CLI 会**自发续跑**,续跑内容以普通流式事件推过来。若回合在 `end_turn` 处
+   * 直接收尾,插件就不再抽流,这些内容全丢——用户永远等不到模型承诺的
+   * "跑完我继续/给你最终结果"。尾巴窗口:干净收尾后继续抽流,直到 CLI 报
+   * `idle` 且静默达到本阈值(普通回合的额外延迟就是这个值)、或 CLI 广播
+   * `session_end`(真正空闲,立即收尾)、或撞上 {@link tailCapMinutes}。
+   */
+  tailQuietSeconds?: number
+  /**
+   * 起了后台任务的回合的静默阈值(分钟,默认 10)。
+   *
+   * 后台任务在跑时 CLI 可以长时间零事件;识别到本轮起过后台任务
+   * (工具参数 `run_in_background`/`background`)后,尾巴窗口放宽到本阈值,
+   * 等它跑完的自发续跑;续跑内容一出现即回到 tailQuietSeconds。
+   */
+  tailBgQuietMinutes?: number
+  /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
+  tailCapMinutes?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -67,6 +88,9 @@ export const Config: z<Config> = z.object({
   toolName: z.string().default('subagent_codebuddy'),
   registerSubagentTools: z.boolean().default(false),
   longToolCapMinutes: z.number().default(30),
+  tailQuietSeconds: z.number().default(5),
+  tailBgQuietMinutes: z.number().default(10),
+  tailCapMinutes: z.number().default(30),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -92,7 +116,13 @@ export function apply(ctx: Context, config: Config): void {
     extraArgs: config.extraArgs ?? [],
     // 静默长工具硬顶(分钟 → 毫秒;0 = 关闭)。看门狗超顶时 cancel+强杀,走
     // stall 重试自动续跑——防止 CLI 卡死时进程泄漏、子会话回合悬空。
-    timeouts: { guardCapMs: (config.longToolCapMinutes ?? 30) * 60_000 },
+    // 尾巴窗口(秒/分钟 → 毫秒;0 = 关闭)见 Config.tailQuietSeconds。
+    timeouts: {
+      guardCapMs: (config.longToolCapMinutes ?? 30) * 60_000,
+      tailQuietMs: (config.tailQuietSeconds ?? 5) * 1_000,
+      tailBgQuietMs: (config.tailBgQuietMinutes ?? 10) * 60_000,
+      tailCapMs: (config.tailCapMinutes ?? 30) * 60_000,
+    },
   }))
 
   /**

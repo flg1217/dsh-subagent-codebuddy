@@ -316,6 +316,10 @@ describe('adapter(ACP):取消与错误', () => {
       idleMaxMs: 600_000,
       idleFactor: 3,
       idleWarmupLines: 6,
+      // 尾巴窗口:普通回合静默 5s 收尾;起了后台任务放宽到 10 分钟;硬顶 30 分钟。
+      tailQuietMs: 5_000,
+      tailBgQuietMs: 10 * 60_000,
+      tailCapMs: 30 * 60_000,
     })
   })
 })

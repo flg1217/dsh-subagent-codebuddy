@@ -597,6 +597,99 @@ describe('adapter:中途插入(steering)', () => {
   }, 15_000)
 })
 
+describe('adapter:尾巴窗口(后台任务续跑)', () => {
+  /** CLI 心跳:agent 阶段(尾巴窗口判据;真 CLI 在会话建立后就持续推)。 */
+  const phase = (value: string): Record<string, unknown> => ({
+    sessionUpdate: 'session_info_update',
+    _meta: { 'codebuddy.ai/agentPhase': { phase: value } },
+  })
+  const sessionEnd = (): Record<string, unknown> => ({ sessionUpdate: 'session_end', stopReason: 'end_turn' })
+
+  it('起了后台任务(run_in_background)→ 放宽静默阈值等续跑;续跑内容落进同一 step', async () => {
+    const { adapter } = makeAdapter({}, { tailQuietMs: 80, tailBgQuietMs: 2_000, tailCapMs: 5_000 })
+    const chunks = await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(phase('model_streaming'))   // CLI 心跳(尾巴窗口的能力探针)
+      p.update(toolCall('call_bg', 'Bash', { command: 'npm test', run_in_background: true }))
+      p.update(toolUpdate('call_bg', 'completed', 'Running in background with task_id: t1'))
+      p.update(message('已后台启动,本轮先结束'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+      // 后台任务期间的长时间静默(远超 tailQuietMs):bg 阈值兜住,不许收尾。
+      setTimeout(() => { p.update(message('后台回归完成:TAIL-CONTINUED')) }, 400)
+      setTimeout(() => { p.update(sessionEnd()) }, 600)
+    })
+    const text = chunks.join('')
+    expect(text).toContain('已后台启动')
+    expect(text).toContain('后台回归完成:TAIL-CONTINUED')
+  }, 15_000)
+
+  it('后台任务迟迟没有续跑 → 撞 bg 静默阈值收尾,不等满硬顶', async () => {
+    const { adapter } = makeAdapter({}, { tailQuietMs: 40, tailBgQuietMs: 250, tailCapMs: 30_000 })
+    const started = Date.now()
+    await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(phase('model_streaming'))
+      p.update(toolCall('call_bg2', 'Bash', { command: 'npm run dev', run_in_background: true }))
+      p.update(toolUpdate('call_bg2', 'completed', 'Running in background with task_id: t2'))
+      p.update(message('服务已在后台起好'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeGreaterThanOrEqual(200)   // 等过 bg 阈值(没被普通阈值提前收掉)
+    expect(elapsed).toBeLessThan(5_000)           // 也没拖到硬顶
+  }, 15_000)
+
+  it('CLI 空闲且静默超阈值 → 按时收尾,不等硬顶', async () => {
+    const { adapter } = makeAdapter({}, { tailQuietMs: 100, tailCapMs: 60_000 })
+    const started = Date.now()
+    const chunks = await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(message('干完了'))
+      p.update(phase('idle'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    expect(chunks.join('')).toContain('干完了')
+    // 尾部只等一个静默阈值(100ms),远小于硬顶。
+    expect(Date.now() - started).toBeLessThan(5_000)
+  }, 15_000)
+
+  it('老 CLI 无 agentPhase 心跳 → 不进尾巴窗口,收尾不额外延迟', async () => {
+    const { adapter } = makeAdapter({}, { tailQuietMs: 5_000, tailCapMs: 60_000 })
+    const started = Date.now()
+    await runTurn(adapter, makeOptions('s1'), (p) => {
+      p.update(message('普通一轮'))
+      p.respond(p.requestLog().length, { stopReason: 'end_turn' })
+    })
+    expect(Date.now() - started).toBeLessThan(2_000)
+  }, 15_000)
+
+  it('cancel/abort 的回合不进尾巴窗口', async () => {
+    const { adapter } = makeAdapter({}, { tailQuietMs: 5_000, tailCapMs: 60_000 })
+    const controller = new AbortController()
+    const started = Date.now()
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(msg => {
+        if (msg.method !== 'session/prompt') return
+        const check = setInterval(() => {
+          if (p.notifications().some(n => n.method === 'session/cancel')) {
+            clearInterval(check)
+            p.respond(msg.id, { stopReason: 'cancelled' })
+          }
+        }, 50)
+      })
+      setTimeout(() => { p.update(message('半途')) }, 20)
+      // 心跳已见(资格本该成立)——但取消的回合必须直接收尾。
+      setTimeout(() => { p.update(phase('model_streaming')) }, 30)
+      return asSpawnResult(p)
+    })
+    const streamPromise = (async (): Promise<void> => {
+      for await (const _ of adapter.stream(makeOptions('s1', undefined, controller.signal))) { /* drain */ }
+    })()
+    setTimeout(() => controller.abort(), 150)
+    await streamPromise
+    expect(Date.now() - started).toBeLessThan(3_000)
+  }, 15_000)
+})
+
 describe('adapter:辅助调用(purpose)隔离', () => {
   it('purpose 调用不读映射(走 session/new,不 session/load)、不写映射、不建原生种子', async () => {
     const { mkdtempSync, readdirSync, rmSync } = await import('node:fs')
