@@ -11,7 +11,7 @@ export interface FakeAcp {
   proc: EventEmitter & { stdin: unknown; stdout: Readable; stderr: Readable; kill: () => void }
   onRequest(handler: (msg: { id: number; method: string; params: Record<string, unknown> }) => void): void
   respond(id: number, result: unknown): void
-  respondError(id: number, error: { code: number; message: string }): void
+  respondError(id: number, error: { code: number; message: string; data?: unknown }): void
   update(update: Record<string, unknown>): void
   close(code: number | null): void
   requestLog(): string[]

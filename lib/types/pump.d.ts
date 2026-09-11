@@ -141,6 +141,8 @@ export declare class TurnPump {
     private stopReason;
     private inFlight;
     private promptError;
+    /** prompt 结果里的失败分类(refusal + _meta errorMessage/outcome)。 */
+    private promptFailure;
     private agentPhaseSeen;
     private sessionEnded;
     private lastUpdateAt;
@@ -173,6 +175,12 @@ export declare class TurnPump {
      * 每个 dsh step 调一次。abort 直接返回(由 loop 的中断语义收尾)。
      */
     attach(): AsyncGenerator<StreamChunk>;
+    /**
+     * 以 finish error 收尾(而非抛出):让 agent-loop 走它自己的
+     * `agent/request-error` 路径——消息进 LlmError、回合以错误闭合,
+     * 与一次性路径的中断语义一致(可重试与否已在泵内决定)。
+     */
+    private yieldError;
     private isMaxTokens;
     /** 起一次 ACP 进程 + 握手 + prompt(重启路径也走它)。 */
     private runAttempt;
@@ -181,7 +189,7 @@ export declare class TurnPump {
     private finishTurn;
     /** 失败:首段无产出 → 重启;否则整体失败(消费方抛出,loop 收错误回合)。 */
     private failRun;
-    /** 重启资格:仍是首段、本回合无任何产出、还有重试次数。 */
+    /** 重启资格:失败可续跑、仍是首段、本回合无任何产出、还有重试次数。 */
     private canRestart;
     private restart;
     /** 补一次「到期即判定」的定时器(收段宽限/尾巴静默预算)。 */

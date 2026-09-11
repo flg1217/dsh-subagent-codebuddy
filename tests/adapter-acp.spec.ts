@@ -301,7 +301,7 @@ describe('adapter(ACP):取消与错误', () => {
     expect(chunks.some(c => c.includes('error'))).toBe(false)
   }, 15_000)
 
-  it('进程中途异常退出 → 抛错给调用方(附退出码)', async () => {
+  it('进程中途异常退出 → finish error 交付调用方(附退出码)', async () => {
     mockedSpawn.mockImplementation(() => {
       const p = fakeAcpProc()
       autoHandshake(p)
@@ -309,12 +309,13 @@ describe('adapter(ACP):取消与错误', () => {
       return p as unknown as ReturnType<typeof spawn>
     })
     const { adapter } = makeAdapter(FAST, { maxAttempts: 1 })
-    await expect((async () => {
-      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    })()).rejects.toThrow(/退出/)
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
+    expect(chunks.at(-1)).toContain('"kind":"error"')
+    expect(chunks.at(-1)).toContain('退出')
   }, 15_000)
 
-  it('静默无进展 → 先 cancel 后 kill,抛出明确超时错误', async () => {
+  it('静默无进展 → 先 cancel 后 kill,以明确超时的 finish error 收尾', async () => {
     const { adapter } = makeAdapter(
       { firstMs: 100, idleMaxMs: 200, idleMinMs: 100, idleFactor: 2, idleWarmupLines: 0, boundaryQuietMs: 20, usageGraceMs: 20, tailQuietMs: 60, tailCapMs: 200 },
       { maxAttempts: 1, retryDelayMs: 10 },
@@ -325,9 +326,10 @@ describe('adapter(ACP):取消与错误', () => {
       // prompt 永不响应、永不推 update(纯死挂)
       return p as unknown as ReturnType<typeof spawn>
     })
-    await expect((async () => {
-      for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
-    })()).rejects.toThrow(/超时/)
+    const chunks: string[] = []
+    for await (const chunk of adapter.stream(makeOptions('s1'))) chunks.push(JSON.stringify(chunk))
+    expect(chunks.at(-1)).toContain('"kind":"error"')
+    expect(chunks.at(-1)).toContain('超时')
     expect(lastFake!.notifications().filter(n => n.method === 'session/cancel').length).toBeGreaterThanOrEqual(1)
   }, 25_000)
 

@@ -41,6 +41,8 @@ import { TodoListState } from './todo-bridge.js'
 import { AttachmentsSaveFace } from './tool-image.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, usageOfUpdate } from './acp.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
+import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
+import type { CodebuddyFailure } from './failure.js'
 import { TurnPump } from './pump.js'
 import type { PumpHost } from './pump.js'
 import { listCodebuddyModelIdsAsync } from './models.js'
@@ -54,6 +56,26 @@ function purposeWorkDir(): string {
 
 /** 可重试的委托失败:恢复同一会话续跑(ACP session/load)即可,不重复已完成部分。 */
 class RetryableError extends Error {}
+
+/** 取第一个非空字符串。 */
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (value !== undefined && value.length > 0) return value
+  }
+  return undefined
+}
+
+/**
+ * 按失败分类收尾:可重试分类(网络/模型服务等瞬时故障)抛 RetryableError,
+ * 外层恢复会话续跑;配额/认证等重试无意义的分类直接显式中止——让对话里
+ * 显示真实中断原因,而不是笼统的"静默失败"。
+ */
+function throwFailure(prefix: string, failure: CodebuddyFailure | undefined, suffix?: string): never {
+  if (failure === undefined) throw new Error(`${prefix}未知错误`)
+  const message = `${prefix}${formatFailureLine(failure, suffix)}`
+  if (failure.retryable) throw new RetryableError(message)
+  throw new Error(message)
+}
 
 /**
  * 插话链路诊断日志(临时):`~/.dsh/codebuddy/steer-debug.log`。
@@ -768,7 +790,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         let inFlight = 0
         const sendPrompt = (blocks: Array<Record<string, unknown>>): void => {
           inFlight += 1
-          void conn.request<{ stopReason?: string; errorMessage?: string }>(
+          void conn.request<AcpPromptResult>(
             'session/prompt',
             { sessionId: acpSessionId, prompt: blocks },
             0,
@@ -815,7 +837,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             + `已收 ${progressSamples} 次进展,在途工具 ${pendingTools.size} 个${conn.stderrNote()})`)
         }
         if (promptError !== undefined) {
-          throw new RetryableError(`CodeBuddy ACP 请求失败:${promptError.message}${conn.stderrNote()}`)
+          throwFailure('CodeBuddy ACP 请求失败:', failureOfError(promptError), conn.stderrNote())
         }
         if (exitError !== undefined) throw exitError
         if (options.signal?.aborted === true) {
@@ -827,13 +849,26 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }
 
         const stopReason = promptResult?.stopReason
-        const errorMessage = promptResult?.errorMessage
+        // 失败详情优先取顶层 errorMessage;refusal 场景只有
+        // `_meta["codebuddy.ai/errorMessage"]`(JSON:code/category/statusCode/
+        // displayMsg 多语言文案)与 `codebuddy.ai/outcome`(FAILED_MODEL_REQUEST 等)。
+        const metaError = promptResult?._meta?.['codebuddy.ai/errorMessage']
+        const metaOutcome = promptResult?._meta?.['codebuddy.ai/outcome']
+        const errorMessage = firstNonEmpty(
+          promptResult?.errorMessage,
+          typeof metaError === 'string' ? metaError : undefined,
+        )
+        const failureOutcome = isFailureOutcome(metaOutcome) ? metaOutcome : undefined
         flushPending()
         releasePending()
         if (lastUsage !== undefined) pendingChunks.push({ type: 'usage', usage: lastUsage })
         while (pendingChunks.length > 0) yield pendingChunks.shift()!
-        if (errorMessage !== undefined && errorMessage.length > 0) {
-          throw new RetryableError(`CodeBuddy 报错:${errorMessage.slice(0, 300)}${conn.stderrNote()}`)
+        if (errorMessage !== undefined || failureOutcome !== undefined) {
+          throwFailure(
+            'CodeBuddy 中断:',
+            parseCodebuddyFailure(errorMessage, undefined, failureOutcome),
+            conn.stderrNote(),
+          )
         }
         // 静默失败防御(实测高频):end_turn 但零思考、零文本、零工具。
         // 工具落地也算产出:纯工具轮次(无解说文本)是正常形态。

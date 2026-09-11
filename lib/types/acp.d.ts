@@ -102,6 +102,21 @@ export interface AcpUpdate {
 export interface AcpPromptResult {
     stopReason?: string;
     errorMessage?: string;
+    /**
+     * CodeBuddy 私有扩展。失败详情在 `codebuddy.ai/errorMessage`(JSON 串,
+     * 含 category/statusCode/业务码)与 `codebuddy.ai/traceId` 里;
+     * 顶层 errorMessage 为空时这里才是唯一原因来源(实测 refusal 场景)。
+     */
+    _meta?: Record<string, unknown>;
+}
+/**
+ * JSON-RPC 级失败:保留错误码与 data(限流/认证/模型服务等分类在 data 里,
+ * 压成纯文本就丢失了可分类性)。
+ */
+export declare class AcpRpcError extends Error {
+    readonly code: number | undefined;
+    readonly data: Record<string, unknown> | undefined;
+    constructor(code: number | undefined, message: string, data: Record<string, unknown> | undefined);
 }
 /** 进程退出信息。 */
 export interface AcpExitInfo {

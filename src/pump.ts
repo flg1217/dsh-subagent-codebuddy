@@ -32,11 +32,12 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf, usageOfUpdate } from './acp.js'
-import type { AcpTimeouts, AcpUpdate } from './acp.js'
+import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { agentIdFromOutput, SubagentMirror } from './mirror.js'
 import { foldPendingInsertions } from './inbox.js'
 import { todoToolKind } from './todo-bridge.js'
 import type { TodoListState } from './todo-bridge.js'
+import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import { imageReadAlias, toolResultBlocksFromText } from './tool-image.js'
 import type { AttachmentsSaveFace } from './tool-image.js'
 
@@ -194,6 +195,8 @@ export class TurnPump {
   private stopReason: string | undefined
   private inFlight = 0
   private promptError: Error | undefined
+  /** prompt 结果里的失败分类(refusal + _meta errorMessage/outcome)。 */
+  private promptFailure: import('./failure.js').CodebuddyFailure | undefined
   private agentPhaseSeen = false
   private sessionEnded = false
   private lastUpdateAt = Date.now()
@@ -274,16 +277,31 @@ export class TurnPump {
         while (segment.cursor < segment.chunks.length) yield segment.chunks[segment.cursor++]!
         if (!segment.closed) { await this.waitEvent(); continue }
         this.segments.shift()
-        if (this.failed !== undefined) throw this.failed
+        if (this.failed !== undefined) { yield* this.yieldError(this.failed); return }
         yield {
           type: 'finish',
           reason: segment.outcome === 'settle' && this.isMaxTokens() ? { kind: 'max-tokens' } : { kind: 'stop' },
         }
         return
       }
-      if (this.failed !== undefined) throw this.failed
+      if (this.failed !== undefined) { yield* this.yieldError(this.failed); return }
       if (this.finished) { yield { type: 'finish', reason: { kind: 'stop' } }; return }
       await this.waitEvent()
+    }
+  }
+
+  /**
+   * 以 finish error 收尾(而非抛出):让 agent-loop 走它自己的
+   * `agent/request-error` 路径——消息进 LlmError、回合以错误闭合,
+   * 与一次性路径的中断语义一致(可重试与否已在泵内决定)。
+   */
+  private async *yieldError(error: Error): AsyncGenerator<StreamChunk> {
+    yield {
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: { message: error.message.slice(0, 500), code: 'CODEBUDDY_EXEC_ERROR' },
+      },
     }
   }
 
@@ -302,6 +320,7 @@ export class TurnPump {
     this.promptSettled = false
     this.stopReason = undefined
     this.promptError = undefined
+    this.promptFailure = undefined
     this.toolExecutingSeen = false
     this.firstResultSeen = false
     this.boundarySeenAt = 0
@@ -327,9 +346,10 @@ export class TurnPump {
     this.conn = conn
     conn.onExit(info => {
       if (conn.wasKilled || this.stallTimedOut || this.disposed) return
+      // 进程退出沿用旧语义:不可续跑(重试会重复已完成部分),显式中止。
       this.failRun(new Error(
         `CodeBuddy ACP 进程退出(code ${info.code ?? 'null'}${info.signal !== null ? `,signal ${info.signal}` : ''})${conn.stderrNote()}`,
-      ))
+      ), false)
     })
 
     try {
@@ -371,7 +391,7 @@ export class TurnPump {
     if (conn === undefined) return
     this.inFlight += 1
     this.promptSettled = false
-    void conn.request<{ stopReason?: string; errorMessage?: string }>(
+    void conn.request<AcpPromptResult>(
       'session/prompt',
       {
         sessionId: this.acpSessionId,
@@ -384,8 +404,17 @@ export class TurnPump {
     ).then(
       value => {
         this.stopReason = value.stopReason
-        if (value.errorMessage !== undefined && value.errorMessage.length > 0) {
-          this.promptError = new Error(value.errorMessage)
+        // 失败详情优先取顶层 errorMessage;refusal 场景只有
+        // `_meta["codebuddy.ai/errorMessage"]`(JSON:code/category/statusCode/
+        // displayMsg)与 `codebuddy.ai/outcome`(FAILED_MODEL_REQUEST 等)。
+        const metaError = value._meta?.['codebuddy.ai/errorMessage']
+        const metaOutcome = value._meta?.['codebuddy.ai/outcome']
+        const raw = value.errorMessage !== undefined && value.errorMessage.length > 0
+          ? value.errorMessage
+          : (typeof metaError === 'string' ? metaError : undefined)
+        const outcome = isFailureOutcome(metaOutcome) ? metaOutcome : undefined
+        if (raw !== undefined || outcome !== undefined) {
+          this.promptFailure = parseCodebuddyFailure(raw, undefined, outcome)
         }
       },
       error => {
@@ -393,7 +422,7 @@ export class TurnPump {
       },
     ).finally(() => {
       this.inFlight -= 1
-      if (this.promptError === undefined) this.promptSettled = true
+      if (this.promptError === undefined && this.promptFailure === undefined) this.promptSettled = true
       this.wakeAll()
     })
   }
@@ -408,9 +437,9 @@ export class TurnPump {
   }
 
   /** 失败:首段无产出 → 重启;否则整体失败(消费方抛出,loop 收错误回合)。 */
-  private failRun(error: Error): void {
+  private failRun(error: Error, retryable = true): void {
     if (this.finished || this.disposed) return
-    if (this.canRestart()) { this.restart(error); return }
+    if (this.canRestart(retryable)) { this.restart(); return }
     this.failed = error
     for (const segment of this.segments) {
       if (!segment.closed) {
@@ -425,21 +454,23 @@ export class TurnPump {
     this.wakeAll()
   }
 
-  /** 重启资格:仍是首段、本回合无任何产出、还有重试次数。 */
-  private canRestart(): boolean {
-    return this.attempts < this.maxAttempts
+  /** 重启资格:失败可续跑、仍是首段、本回合无任何产出、还有重试次数。 */
+  private canRestart(retryable: boolean): boolean {
+    return retryable
+      && this.attempts < this.maxAttempts
       && !this.hasText
       && this.calls.size === 0
       && !this.aborted
   }
 
-  private restart(error: Error): void {
+  private restart(): void {
     this.disposeProcess()
     this.capturing = true
     // 已登记的 CodeBuddy 会话继续复用之(避免重试丢历史)。
     if (this.acpSessionId !== '') this.deps.resume = { acpId: this.acpSessionId }
     this.acpSessionId = ''
     this.promptError = undefined
+    this.promptFailure = undefined
     this.stallTimedOut = false
     this.lastProgressAt = Date.now()
     this.segments = []
@@ -447,7 +478,6 @@ export class TurnPump {
     const timer = setTimeout(() => { void this.runAttempt() }, this.retryDelayMs)
     timer.unref?.()
     this.wakeAll()
-    void error
   }
 
   /** 补一次「到期即判定」的定时器(收段宽限/尾巴静默预算)。 */
@@ -771,7 +801,23 @@ export class TurnPump {
 
   /** tail 窗口:prompt 干净收尾后继续抽流(后台任务会自发续跑)。 */
   private checkTail(): void {
-    if (this.promptError !== undefined) { this.failRun(this.promptError); return }
+    // 失败分类:prompt 结果里的 refusal/_meta 错误(配额/认证等不重试),
+    // 或 JSON-RPC/传输层错误(带 code/data 分类)。两者都翻成一行可读原因。
+    if (this.promptFailure !== undefined) {
+      this.failRun(
+        new Error(`CodeBuddy 中断:${formatFailureLine(this.promptFailure, this.conn?.stderrNote())}`),
+        this.promptFailure.retryable,
+      )
+      return
+    }
+    if (this.promptError !== undefined) {
+      const failure = failureOfError(this.promptError)
+      this.failRun(
+        new Error(`CodeBuddy ACP 请求失败:${formatFailureLine(failure, this.conn?.stderrNote())}`),
+        failure.retryable,
+      )
+      return
+    }
     if (!this.promptSettled || this.inFlight > 0 || this.aborted) return
     // 静默失败:end_turn 但零文本零工具(配额/服务端异常)——首段重启,否则报错。
     if (this.progressSamples === 0 || (!this.hasText && this.calls.size === 0)) {

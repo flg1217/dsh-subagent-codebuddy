@@ -300,13 +300,16 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
     expect(h.spawns()).toBe(2)
   }, 15_000)
 
-  it('CLI 进程中途退出 → 抛错给调用方(已有产出则不再重启)', async () => {
+  it('CLI 进程中途退出 → finish error 交付调用方(已有产出则不再重启)', async () => {
     const h = makeAdapter({}, { ...FAST, maxAttempts: 2, retryDelayMs: 20 })
     mockTurn((c) => {
       c.p.update(message('半句话'))
       setTimeout(() => c.p.close(1), 40)
     })
-    await expect(step(h.adapter, makeOptions('s1'))).rejects.toThrow(/退出/)
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    const finish = chunks.at(-1)!
+    expect(finish).toContain('"kind":"error"')
+    expect(finish).toContain('退出')
     expect(h.spawns()).toBe(1)
   }, 15_000)
 
@@ -316,7 +319,7 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
       c.p.update(toolCall('call_1', 'Bash', { command: 'hang' }))
       c.p.update(phase('tool_executing'))
       // 工具永不返回:段在工具边界收尾(step 正常结束),但结果永不到——
-      // 硬顶(guardCapMs)到点后泵失败、回放工具拒绝,下一步 attach 抛错。
+      // 硬顶(guardCapMs)到点后泵失败、回放工具拒绝,下一步以 finish error 收尾。
     })
     const first = await step(h.adapter, makeOptions('s1'))
     expect(first.some(c => c.includes('"stop"'))).toBe(true)
@@ -324,7 +327,9 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
       {}, { callId: 'call_1' },
     )
     waiting.catch(() => { /* 断言在下面 */ })
-    await expect(step(h.adapter, makeOptions('s1'))).rejects.toThrow(/超时/)
+    const second = await step(h.adapter, makeOptions('s1'))
+    expect(second.at(-1)).toContain('"kind":"error"')
+    expect(second.at(-1)).toContain('超时')
     await expect(waiting).rejects.toThrow()
     expect(lastFake()!.notifications().some(n => n.method === 'session/cancel')).toBe(true)
   }, 15_000)
