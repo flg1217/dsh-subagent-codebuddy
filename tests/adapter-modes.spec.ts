@@ -476,7 +476,7 @@ describe('adapter:中途插入(steering)', () => {
     expect(prompts.length).toBe(1)
   }, 15_000)
 
-  it('排队(next-turn)仍作为排队 prompt 转发;不发 session/steer', async () => {
+  it('排队(next-turn)不在生成中转发:留给 dsh 回合收尾 claim,不发 prompt 也不发 steer', async () => {
     const { events, ctx } = directSession()
     const adapter = new CodebuddyLlmAdapter(ctx, {
       command: 'codebuddy.js',
@@ -496,7 +496,7 @@ describe('adapter:中途插入(steering)', () => {
         if (request.method === 'session/steer') { steerRequests += 1; p.respond(request.id, { steered: true }); return }
         if (request.method !== 'session/prompt') return
         prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
-        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), prompts.length === 1 ? 500 : 30)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 500)
       })
       setTimeout(() => { p.update(message('处理中')) }, 10)
       return asSpawnResult(p)
@@ -504,8 +504,66 @@ describe('adapter:中途插入(steering)', () => {
     spliceAfter(events, 'next-turn')
     for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
     expect(steerRequests).toBe(0)
-    expect(prompts.length).toBe(2)
-    expect(JSON.stringify(prompts[1])).toContain('插一句话')
+    // 只有开场那一条 prompt;排队消息不在生成中转发(dsh 收尾时 claim 成下一轮)。
+    expect(prompts.length).toBe(1)
+    expect(JSON.stringify(prompts[0])).not.toContain('插一句话')
+  }, 15_000)
+
+  it('先入队(next-turn)、再点「立即发送」(升级为 next-step):steer 必须发出去(回归:同 id 被去重吞掉)', async () => {
+    const { events, ctx } = directSession()
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store: new ConversationStore(null),
+      steerPollMs: 40,
+    })
+    const prompts: Array<Array<Record<string, unknown>>> = []
+    const steers: Array<Record<string, unknown>> = []
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method === 'session/steer') {
+          steers.push(request.params)
+          p.respond(request.id, { steered: true, ownerRequestId: 'req-1' })
+          return
+        }
+        if (request.method !== 'session/prompt') return
+        prompts.push(request.params['prompt'] as Array<Record<string, unknown>>)
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 600)
+      })
+      setTimeout(() => { p.update(message('处理中')) }, 10)
+      return asSpawnResult(p)
+    })
+    // 打字 → next-turn;5s 后(这里 200ms)点「立即发送」→ 同 id 挪到 next-step。
+    spliceAfter(events, 'next-turn')
+    setTimeout(() => {
+      events.push({
+        type: 'agent/inbox/spliced',
+        data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+      })
+      events.push({
+        type: 'agent/inbox/spliced',
+        data: {
+          target: 'next-step',
+          start: 0,
+          inserted: [{
+            id: 'ins-1',
+            role: 'user',
+            content: [{ type: 'text', text: '插一句话:先别做别的' }],
+            source: { kind: 'user' },
+          }],
+        },
+      })
+    }, 200)
+    for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    expect(steers.length).toBe(1)
+    expect(steers[0]).toMatchObject({ sessionId: 'cb-1', contentBlocks: [{ type: 'text', text: '插一句话:先别做别的' }] })
+    // 同一条消息不许再作为排队 prompt 投一次(重复投递)。
+    expect(prompts.length).toBe(1)
   }, 15_000)
 
   it('session/steer 被拒(steered:false)→ 退回排队 prompt,消息不丢', async () => {
