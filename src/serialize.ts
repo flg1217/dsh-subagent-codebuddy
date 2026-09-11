@@ -19,6 +19,11 @@ export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推�
 export interface SerializedPrompt {
   prompt: string
   images: Array<{ data: string; mimeType: string }>
+  /**
+   * 本次补发**只有**已插话投递过的消息被跳过(无任何新内容)。
+   * 调用方据此空跑收尾,而不是发 CONTINUE_PROMPT 把模型拽回旧任务。
+   */
+  skippedForwarded?: boolean
 }
 
 /** 一条消息的可读文本(text 块 + tool-result 内嵌文本;图片走内容块)。 */
@@ -60,9 +65,16 @@ async function readImages(
   return images
 }
 
-/** 续聊兜底:只发最后一条真实用户消息(锚点缺失/历史被压缩收缩时)。 */
+/**
+ * 续聊兜底:只发**用户自己发的**最后一条消息(锚点缺失/历史被压缩收缩时)。
+ *
+ * 必须按 `source.kind === 'user'` 精确取:插件注入的上下文(系统提醒、
+ * 工作区指令、技能目录)同样是 user 角色、且排在用户消息**之后**,
+ * 按"最后一条 user 角色"取会把用户输入整条顶掉——实测:压缩完成后
+ * 被 claim 的排队消息丢失,模型只看到技能目录提醒。
+ */
 export async function lastUserPrompt(ctx: Context, messages: readonly Message[]): Promise<SerializedPrompt> {
-  const last = [...messages].reverse().find(message => message.role === 'user' && message.source.kind !== 'tool')
+  const last = [...messages].reverse().find(message => message.role === 'user' && message.source.kind === 'user')
   if (last === undefined) return { prompt: CONTINUE_PROMPT, images: [] }
   const text = messageText(last)
   const images = await readImages(ctx, [last])
@@ -93,16 +105,23 @@ export async function resumeReplayPrompt(
     return await lastUserPrompt(ctx, messages)
   }
   let index = sentCount
+  let skippedForwarded = false
   while (index < messages.length) {
     const message = messages[index]!
-    if (message.role === 'assistant' || message.source.kind === 'tool'
-      || (skipIds !== undefined && skipIds.has(String(message.id)))) {
+    const forwarded = skipIds !== undefined && skipIds.has(String(message.id))
+    if (message.role === 'assistant' || message.source.kind === 'tool' || forwarded) {
+      if (forwarded) skippedForwarded = true
       index += 1
       continue
     }
     break
   }
-  if (index >= messages.length) return { prompt: CONTINUE_PROMPT, images: [] }
+  // 全部跳过:没有可补发的新内容。若跳过的是**我们已插话投递过的**消息,
+  // 说明这一步只是 dsh 在回合边界把那条插话 claim 成了新 step——模型在运行中
+  // 已经处理过它。此时绝不能再发"继续完成之前未完成的任务":实测这句会把模型
+  // 从插话上拽回旧任务(用户视角:插队没生效)。调用方据 skippedForwarded
+  // 空跑收尾。
+  if (index >= messages.length) return { prompt: CONTINUE_PROMPT, images: [], skippedForwarded }
   return await serializeMessages(ctx, messages.slice(index))
 }
 

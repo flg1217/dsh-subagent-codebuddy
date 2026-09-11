@@ -15,6 +15,7 @@
  * @module subagent-codebuddy/acp
  */
 import type { ChildProcess } from 'node:child_process';
+import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 /** 默认动态空闲超时预算:与 agy 执行器同一套算法(无总时长上限)。 */
 export declare const DEFAULT_ACP_RUN_TIMEOUTS: {
     firstMs: number;
@@ -22,6 +23,9 @@ export declare const DEFAULT_ACP_RUN_TIMEOUTS: {
     idleMaxMs: number;
     idleFactor: number;
     idleWarmupLines: number;
+    tailQuietMs: number;
+    tailBgQuietMs: number;
+    tailCapMs: number;
 };
 /** 动态空闲超时预算(测试注入小值压缩时间)。 */
 export interface AcpTimeouts {
@@ -39,6 +43,32 @@ export interface AcpTimeouts {
      * stall 重试(自动续跑),被误杀的工具通常工作已落盘,重跑代价可控。
      */
     guardCapMs?: number;
+    /**
+     * 尾巴窗口静默阈值(毫秒,默认 5s;<=0 关闭尾巴窗口)。
+     *
+     * CLI 的 `end_turn` **不等于**空闲:后台任务(后台 bash / agent 任务)完成时
+     * CLI 会自发续跑,续跑内容以普通 update 推过来。dsh 回合若已收尾,插件就不在
+     * 抽流,这些内容全丢(实测量产场景:模型说"跑完我重启后端,给你最终结果",
+     * 回合一结束 CLI 进程就被杀,承诺的收尾永远不来)。
+     * 尾巴窗口:干净收尾后继续抽流,直到
+     *   - `session_info_update._meta["codebuddy.ai/agentPhase"]` 报 `idle` 且静默
+     *     达到本阈值(普通回合代价 = 这段静默);
+     *   - 或收到 `session_end`(CLI 广播:会话真正空闲,含后台任务/团队收尾);
+     *   - 或撞上 {@link AcpTimeouts.tailCapMs} 硬顶。
+     */
+    tailQuietMs?: number;
+    /**
+     * 起了后台任务的回合的静默阈值(毫秒,默认 10 分钟)。
+     *
+     * 后台任务在跑时 CLI 可以长时间零 update(后台 `sleep 300` 之类),用普通
+     * 阈值会在任务完成前就收尾。识别方式:落地的 `tool/call` 参数带
+     * `run_in_background` / `background`(CLI Bash 的后台模式)。
+     * 一旦看到**续跑内容**(settle 之后超过普通阈值才出现的内容 update),
+     * 说明任务已回、CLI 在继续干活,阈值立即回到 {@link AcpTimeouts.tailQuietMs}。
+     */
+    tailBgQuietMs?: number;
+    /** 尾巴窗口硬顶(毫秒,默认 30 分钟):后台任务最长可拖着回合不闭合的时长。 */
+    tailCapMs?: number;
 }
 /** ACP session/update 里我们消费的 update 类型(其余类型仅作活动判定时忽略)。 */
 export interface AcpUpdate {
@@ -89,6 +119,18 @@ export interface AcpExitInfo {
  * (Read→read、TodoWrite→todo_write、WebSearch→web_search),
  * 让子代理窗口复用 dsh 原生工具的可视化渲染器。 */
 export declare function toolNameOf(update: AcpUpdate): string;
+/**
+ * 从 `usage_update` 提取本次请求的用量(`_meta.usage`,OpenAI 风格字段)。
+ *
+ * 实测载荷:`prompt_tokens` / `completion_tokens` / `total_tokens` /
+ * `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`,缓存命中还会镜像在
+ * `prompt_tokens_details.cached_tokens`。映射到 dsh TokenUsage 的三个**不重叠**
+ * 桶:未命中输入、缓存读、缓存写——命中桶优先取 OpenAI 风格的 hit 字段
+ * (`cache_read_input_tokens` 在该载荷里恒为 0,不能优先)。
+ * @param update - 一条 session/update。
+ * @returns dsh 用量;载荷缺失或全零时为 undefined(心跳空载不计)。
+ */
+export declare function usageOfUpdate(update: AcpUpdate): TokenUsage | undefined;
 /** 进展性事件:代表任务真实推进,重置动态空闲计时。 */
 export declare function isProgressUpdate(update: AcpUpdate): boolean;
 /** 一个 ACP 进程连接:JSON-RPC 请求/通知 + update 事件回调。 */

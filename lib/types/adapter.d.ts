@@ -27,6 +27,11 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { ConversationStore } from './conversations.js';
 import type { AcpTimeouts } from './acp.js';
 /**
+ * 插话链路诊断日志(临时):`~/.dsh/codebuddy/steer-debug.log`。
+ * 静默失败会让"点了插话没反应"无从定位,这里把每次轮询的判定写盘。
+ */
+export declare function steerDebug(line: string): void;
+/**
  * 会话中最后一个已打开(尚无配对 step/end)的 turn/step。
  *
  * adapter 只在检测到调用方(agent-loop)已打开的 step 时直写事件——
@@ -38,25 +43,6 @@ export declare function findOpenStep(events: readonly SessionEvent[]): {
     turn: number;
     step: number;
 } | undefined;
-/** CodeBuddy 读图输出解析结果:文本片段 + 待存附件服务的图片。 */
-export interface ParsedImageOutput {
-    /** 输出中的文本块(拼接),可能为空。 */
-    text: string;
-    /** data URI 解码后的图片字节与媒体类型。 */
-    images: Array<{
-        data: Uint8Array;
-        mediaType: string;
-    }>;
-}
-/**
- * 识别 CodeBuddy Read 工具读图的原始输出。
- * 形态:`[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}, ...]`
- * (部分版本为 JSON 字符串,数组内可混有 text 块)。非该形态返回 undefined,
- * 调用方保持原有纯文本路径。
- * @param outputText - tool/result 的原始输出文本。
- * @returns 解析出的文本与图片;不是图片输出时为 undefined。
- */
-export declare function parseCodebuddyImageOutput(outputText: string): ParsedImageOutput | undefined;
 /** CodeBuddy CLI 入口配置(由 index.ts 解析)。 */
 export interface CodebuddyAdapterOptions {
     /** 可执行入口(node 脚本绝对路径或命令)。 */
@@ -109,6 +95,8 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private readonly todoStates;
     /** dsh 会话 → 已转发的插入消息 id(续聊补发时跳过,防重复)。 */
     private readonly forwardedInsertions;
+    /** dsh attachments 服务面(单图入库;原生 read_image 同法)。 */
+    private attachmentsFace;
     /** 标记一条插入为已转发;已标记过返回 false。 */
     private markForwarded;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);

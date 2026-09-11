@@ -19,8 +19,20 @@ export interface SerializedPrompt {
         data: string;
         mimeType: string;
     }>;
+    /**
+     * 本次补发**只有**已插话投递过的消息被跳过(无任何新内容)。
+     * 调用方据此空跑收尾,而不是发 CONTINUE_PROMPT 把模型拽回旧任务。
+     */
+    skippedForwarded?: boolean;
 }
-/** 续聊兜底:只发最后一条真实用户消息(锚点缺失/历史被压缩收缩时)。 */
+/**
+ * 续聊兜底:只发**用户自己发的**最后一条消息(锚点缺失/历史被压缩收缩时)。
+ *
+ * 必须按 `source.kind === 'user'` 精确取:插件注入的上下文(系统提醒、
+ * 工作区指令、技能目录)同样是 user 角色、且排在用户消息**之后**,
+ * 按"最后一条 user 角色"取会把用户输入整条顶掉——实测:压缩完成后
+ * 被 claim 的排队消息丢失,模型只看到技能目录提醒。
+ */
 export declare function lastUserPrompt(ctx: Context, messages: readonly Message[]): Promise<SerializedPrompt>;
 /**
  * 续聊补发:把上次发送锚点(`sentCount`)之后的消息完整补发。
