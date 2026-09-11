@@ -211,7 +211,6 @@ export class TurnPump {
 
   /** steer 轮询。 */
   private lastSteerPoll = 0
-  private readonly skippedLogged = new Set<string>()
 
   /** 子代理镜像 / todo 桥。 */
   private readonly mirrors = new Map<string, SubagentMirror>()
@@ -861,10 +860,7 @@ export class TurnPump {
     try {
       for (const insertion of foldPendingInsertions(this.deps.session?.ownEvents?.() ?? [])) {
         if (!insertion.steer) continue
-        if (!this.deps.markForwarded(insertion.id)) {
-          this.skippedLogged.add(insertion.id)
-          continue
-        }
+        if (!this.deps.markForwarded(insertion.id)) continue
         const conn = this.conn
         if (conn === undefined) return
         const queuePrompt = (): void => { this.sendPrompt(insertion.text, []) }

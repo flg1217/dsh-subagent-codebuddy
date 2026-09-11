@@ -156,7 +156,6 @@ export declare class TurnPump {
     private firstResultSeen;
     /** steer 轮询。 */
     private lastSteerPoll;
-    private readonly skippedLogged;
     /** 子代理镜像 / todo 桥。 */
     private readonly mirrors;
     private readonly subagentCallIds;

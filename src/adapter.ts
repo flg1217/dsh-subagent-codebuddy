@@ -516,7 +516,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       let wake: (() => void) | undefined
       const onUpdate = (update: AcpUpdate): void => {
         if (capturing) return
-        lastUpdateAt = Date.now()
         queue.push(update)
         const w = wake
         wake = undefined
@@ -633,10 +632,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
 
       /** 处理一条 ACP update:续命 + 流累积(不写会话事件)。 */
       const handleUpdate = (update: AcpUpdate): void => {
-        if (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_thought_chunk'
-          || update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-          lastContentAt = Date.now()
-        }
         if (isProgressUpdate(update)) armIdle()
         switch (update.sessionUpdate) {
           case 'agent_thought_chunk':
@@ -689,8 +684,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             return
         }
       }
-      let lastUpdateAt = Date.now()
-      let lastContentAt = 0
 
       // ── 建 ACP 进程 + 握手 + 会话 ────────────────────────────────────────
       // 推理强度:调用方选中的 effort 以 `--effort <level>` 传参(未选则保持 CLI 默认)。
@@ -848,7 +841,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           throw new RetryableError(`CodeBuddy 静默失败(stopReason: ${stopReason ?? 'none'};`
             + `${progressSamples} 次进展、0 次文本/工具产出)——可能是配额受限或服务端异常`)
         }
-        void lastContentAt
         // end_turn + 有产出,或 cancelled:正常收尾。
         yield {
           type: 'finish',
