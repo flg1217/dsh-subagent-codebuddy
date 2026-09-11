@@ -611,6 +611,68 @@ describe('adapter:中途插入(steering)', () => {
     expect(prompts.length).toBe(1)
   }, 15_000)
 
+  it('插话投递成功 → 摘出 dsh 队列并补 user/message(界面回执)', async () => {
+    // 带 agents 服务的会话面:dsh 的 next-step 队列 + inbox.remove。
+    const events: Array<{ type: string; data?: unknown }> = [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'step/start', data: { turn: 1, step: 1 } },
+    ]
+    const arrived = {
+      id: 'ins-1',
+      role: 'user',
+      content: [{ type: 'text', text: '插一句话:先别做别的' }],
+      source: { kind: 'user' },
+    }
+    const removed: string[] = []
+    const appended: Array<{ type: string; data: unknown; opts?: unknown }> = []
+    const session = {
+      header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
+      append: (type: string, data: unknown, opts?: unknown) => { appended.push({ type, data, opts }); return { seq: events.length } },
+      ownEvents: () => events,
+    }
+    const agent = { inbox: { nextStep: [arrived], remove: (id: unknown) => { removed.push(String(id)); return true } } }
+    const ctx = {
+      get: (key: string) => key === 'sessions'
+        ? { get: () => session }
+        : key === 'agents'
+          ? { get: () => agent }
+          : undefined,
+    } as unknown as Context
+    const adapter = new CodebuddyLlmAdapter(ctx, {
+      command: 'codebuddy.js',
+      prefixArgs: [],
+      modelOf: () => 'glm-5.3',
+      permissionMode: 'bypassPermissions',
+      extraArgs: [],
+      store: new ConversationStore(null),
+      steerPollMs: 40,
+    })
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(request => {
+        if (request.method === 'session/steer') { p.respond(request.id, { steered: true, ownerRequestId: 'req-1' }); return }
+        if (request.method !== 'session/prompt') return
+        setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 400)
+      })
+      setTimeout(() => { p.update(message('处理中')) }, 10)
+      return asSpawnResult(p)
+    })
+    setTimeout(() => {
+      events.push({
+        type: 'agent/inbox/spliced',
+        data: { target: 'next-step', start: 0, inserted: [arrived] },
+      })
+    }, 80)
+    for await (const _ of adapter.stream(makeOptions('s1'))) { /* drain */ }
+    // 投递成功:inbox.remove(摘出队列 → 队列坞立刻清空)+ user/message(转写回执)。
+    expect(removed).toEqual(['ins-1'])
+    const landed = appended.find(entry => entry.type === 'user/message')
+    expect(landed).toBeDefined()
+    expect(JSON.stringify(landed!.data)).toContain('插一句话')
+    expect((landed!.opts as { surfaceOp?: string } | undefined)?.surfaceOp).toBe('append')
+  }, 15_000)
+
   it('session/steer 被拒(steered:false)→ 退回排队 prompt,消息不丢', async () => {
     const { events, ctx } = directSession()
     const adapter = new CodebuddyLlmAdapter(ctx, {

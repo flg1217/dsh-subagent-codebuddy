@@ -1001,7 +1001,40 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
          * `session/steer` 不可用(CLI 旧版/运行刚结束返回 `steered:false`)时
          * 退回排队 prompt——最差等于排队语义,消息不丢。
          */
-        const forwardInsertion = (text: string): void => {
+        /**
+         * 插话投递成功后的收尾:把这条消息从 dsh 的 `next-step` 队列里摘掉,
+         * 并补一条 `user/message` 落进转写——对齐原生 provider 的插话语义
+         * (点击后立刻离开队列、出现在对话流里)。
+         *
+         * 不这么做的后果(实测):dsh 只在**回合边界**claim 它,而 CodeBuddy
+         * 一轮能跑几十分钟,队列坞会整段显示这条"排队中"的消息——模型其实
+         * 早在运行中读到并处理了(会留下"收到…"之类的回应),但界面没有任何
+         * 已送达的痕迹,用户视角就是"插队没生效"。
+         */
+        const settleSteeredInsertion = (insertionId: string): void => {
+          const agents = this.ctx.get('agents') as { get?: (id: string) => unknown } | undefined
+          const agent = agents?.get?.(dshSessionId ?? '') as {
+            inbox?: { remove?: (id: unknown) => boolean; nextStep?: readonly unknown[] }
+          } | undefined
+          const inbox = agent?.inbox
+          if (inbox?.remove === undefined) return
+          try {
+            const message = (inbox.nextStep ?? []).find(candidate =>
+              String((candidate as { id?: unknown }).id) === insertionId)
+            inbox.remove(insertionId)
+            if (message !== undefined) {
+              // 'user/message' 是核心已知事件;插件依赖的 dsh-session 类型表未含
+              // 该 augmentation,窄化 session 面以落事件(与 todo/write 同法)。
+              const writer = session as unknown as { append: (type: string, data: unknown, opts?: unknown) => unknown }
+              writer.append('user/message', message, { surfaceOp: 'append' })
+              steerDebug(`插话收尾:已摘出队列并落 user/message id=${insertionId}`)
+            }
+          } catch (error) {
+            steerDebug(`插话收尾失败(不影响投递): ${String(error).slice(0, 120)}`)
+          }
+        }
+
+        const forwardInsertion = (text: string, insertionId: string): void => {
           const queuePrompt = (): void => {
             steerDebug(`steer 被拒/失败 → 退回排队 prompt: ${JSON.stringify(text.slice(0, 30))}`)
             sendPrompt([{ type: 'text', text }])
@@ -1014,7 +1047,11 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           ).then(
             res => {
               steerDebug(`steer 应答: ${JSON.stringify(res)}`)
-              if (res?.steered !== true) queuePrompt()
+              if (res?.steered !== true) {
+                queuePrompt()
+                return
+              }
+              settleSteeredInsertion(insertionId)
             },
             error => {
               steerDebug(`steer 报错: ${String(error).slice(0, 160)}`)
@@ -1022,6 +1059,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             },
           )
         }
+
 
         /** 轮询间隔(中途插入检测)。 */
         const steerPollMs = this.options.steerPollMs ?? 1_200
@@ -1055,7 +1093,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
                 continue
               }
               steerDebug(`poll: steer id=${insertion.id} text=${JSON.stringify(insertion.text.slice(0, 30))}`)
-              forwardInsertion(insertion.text)
+              forwardInsertion(insertion.text, insertion.id)
             }
           } catch (error) { steerDebug(`poll 异常: ${String(error)}`) }
         }
