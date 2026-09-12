@@ -289,6 +289,11 @@ export class SubagentMirror {
   private translator: RecordTranslator | undefined
   private file: string | undefined
   private offset = 0
+  /**
+   * sync 串行链:定时轮询与终读共用一条链。translator 是状态机(累积
+   * assistant 消息/工具调用),并发 apply 会让事件乱序甚至破坏状态。
+   */
+  private chain: Promise<void> = Promise.resolve()
   private startedAt = 0
   private prompt = ''
   private timer: ReturnType<typeof setInterval> | undefined
@@ -373,11 +378,20 @@ export class SubagentMirror {
 
   /** 拉取一次增量(也由测试直接调用)。内部全量容错:镜像失败绝不能拖垮主轮。 */
   async syncOnce(): Promise<void> {
-    try {
-      await this.syncOnceUnsafe()
-    } catch (error) {
-      this.log(`mirror: sync failed (shadow ${this.shadow?.id ?? '?'}): ${String(error).slice(0, 200)}`)
-    }
+    return await this.enqueueSync()
+  }
+
+  /** 串行排入一次 sync(定时器/终读共用;上一轮结束后才开始下一轮)。 */
+  private enqueueSync(): Promise<void> {
+    const run = this.chain.then(async () => {
+      try {
+        await this.syncOnceUnsafe()
+      } catch (error) {
+        this.log(`mirror: sync failed (shadow ${this.shadow?.id ?? '?'}): ${String(error).slice(0, 200)}`)
+      }
+    })
+    this.chain = run
+    return run
   }
 
   /** 增量读取主体;异常由 {@link syncOnce} 兜底。 */
@@ -407,8 +421,13 @@ export class SubagentMirror {
     }
   }
 
-  /** 收尾:终读一次,闭合结构与计时器(全量容错,同 {@link syncOnce})。 */
+  /** 收尾:终读一次(排在已入队的 sync 之后),闭合结构与计时器(全量容错,同 {@link syncOnce})。 */
   async finish(agentId?: string): Promise<void> {
+    // 先停轮询:之后不再有新 tick 入队,终读是最后一轮。
+    if (this.timer !== undefined) {
+      clearInterval(this.timer)
+      this.timer = undefined
+    }
     try {
       if (this.finished) return
       if (agentId !== undefined && this.file === undefined) {
@@ -418,7 +437,7 @@ export class SubagentMirror {
           this.file = candidate
         } catch { /* 文件不在则终读原文件 */ }
       }
-      await this.syncOnceUnsafe()
+      await this.enqueueSync()
       try {
         this.translator?.end()
       } catch (error) {

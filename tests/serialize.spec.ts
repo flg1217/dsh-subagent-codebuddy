@@ -195,10 +195,39 @@ describe('resumeReplayPrompt:只有已插话投递的消息可跳过', () => {
     const { ctx } = makeCtx()
     const messages = [
       userMessage('m-old', '旧输入'),
-      { role: 'assistant', content: [{ type: 'text', text: '我自己产出的' }] } as unknown as Message,
+      {
+        id: 'm-own',
+        role: 'assistant',
+        content: [{ type: 'text', text: '我自己产出的' }],
+        source: { kind: 'model', provider: 'codebuddy', model: 'glm-5.3' },
+      } as unknown as Message,
     ]
     const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set())
     expect(replay.skippedForwarded).toBe(false)
+  })
+
+  it('切换其他模型再切回:期间其他模型的回答被补发(只跳过 CodeBuddy 自己的)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('m-old', '旧输入'),
+      {
+        id: 'm-own',
+        role: 'assistant',
+        content: [{ type: 'text', text: '我自己的回答' }],
+        source: { kind: 'model', provider: 'codebuddy', model: 'glm-5.3' },
+      } as unknown as Message,
+      {
+        id: 'm-other',
+        role: 'assistant',
+        content: [{ type: 'text', text: '别的模型的回答' }],
+        source: { kind: 'model', provider: 'sensenova', model: 'kimi-k3' },
+      } as unknown as Message,
+      userMessage('m-new', '切回后的新输入'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set())
+    expect(replay.prompt).toContain('别的模型的回答')
+    expect(replay.prompt).toContain('切回后的新输入')
+    expect(replay.prompt).not.toContain('我自己的回答')
   })
 
   it('锚点之后还有新输入 → 正常序列化新输入(S 不置位)', async () => {

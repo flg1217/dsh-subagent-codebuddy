@@ -24,6 +24,11 @@ export interface SerializedPrompt {
    * 调用方据此空跑收尾,而不是发 CONTINUE_PROMPT 把模型拽回旧任务。
    */
   skippedForwarded?: boolean
+  /**
+   * 本次发送覆盖到的最后一条消息 id(写回续接记录,充当下一次补发的主锚——
+   * 数量锚在压缩/编辑后不可靠)。
+   */
+  lastMessageId?: string
 }
 
 /** 一条消息的可读文本(text 块 + tool-result 内嵌文本;图片走内容块)。 */
@@ -83,34 +88,92 @@ export async function lastUserPrompt(ctx: Context, messages: readonly Message[])
 }
 
 /**
- * 续聊补发:把上次发送锚点(`sentCount`)之后的消息完整补发。
+ * 续聊补发:把"CLI 尚未见过"的消息补发给 CodeBuddy。
  *
- * 锚点之后先跳过 CodeBuddy 自己产生的消息(assistant 与 tool 结果——其会话里
- * 已有)与**已中途转发的插入消息**(`skipIds`——其文本已作为排队 prompt 送达,
- * 补发会重复),其余(切换其他模型期间产生的轮次、新的用户输入、压缩摘要等)
- * 全部按 User/Assistant 序列化发出。锚点缺失或历史被压缩收缩时退回最后一条用户消息。
+ * 主锚是**消息 id**(`lastSentMessageId`):上次发送覆盖到的最后一条消息。
+ * 数量锚(`sentCount`)在历史被压缩/编辑后不可靠——切到其他模型跑一段再切回时,
+ * 数量锚越界会让补发退化成"只发最后一条",切换期间的上下文永久丢失(实测)。
+ * 锚点已被压缩移除时,CLI 缺的就是"当前 surface 全部",整体序列化重建。
+ *
+ * 补发按 User/Assistant 序列化;CodeBuddy 自己产生的消息(assistant/tool)与
+ * 已中途转发的插入消息(`skipIds`)跳过。
  * @param ctx - 插件上下文(读取附件服务)。
  * @param messages - 当前 dsh 折叠视图的完整消息序列。
- * @param sentCount - 上次发送时的消息数锚点(未知则退回兜底)。
+ * @param sentCount - 旧的数量锚(仅兼容历史记录;新锚见下)。
  * @param skipIds - 已在生成中转发过的插入消息 id 集合(可选)。
- * @returns 序列化结果(prompt + 原生图片块)。
+ * @param lastSentMessageId - 上次发送覆盖到的最后一条消息 id(主锚,可选)。
+ * @returns 序列化结果(prompt + 原生图片块 + 本次覆盖到的最后消息 id)。
  */
 export async function resumeReplayPrompt(
   ctx: Context,
   messages: readonly Message[],
   sentCount: number | undefined,
   skipIds?: ReadonlySet<string>,
+  lastSentMessageId?: string,
+  ownProvider: string = 'codebuddy',
 ): Promise<SerializedPrompt> {
-  if (sentCount === undefined || sentCount > messages.length) {
-    return await lastUserPrompt(ctx, messages)
+  const latestId = (): string | undefined => (
+    messages.length === 0 ? undefined : String(messages[messages.length - 1]!.id)
+  )
+  if (lastSentMessageId !== undefined && lastSentMessageId.length > 0) {
+    const at = messages.findIndex(message => String(message.id) === lastSentMessageId)
+    if (at >= 0) return await replayFrom(ctx, messages, at + 1, skipIds, latestId(), ownProvider)
+    // 锚点已被压缩移除:CLI 缺的是当前 surface 全部——整体重建(压缩后的
+    // surface 已是精简视图,尺寸可控)。
+    if (messages.length === 0) return { prompt: CONTINUE_PROMPT, images: [] }
+    const rebuilt = await serializeMessages(ctx, messages)
+    const id = latestId()
+    return { ...rebuilt, ...(id === undefined ? {} : { lastMessageId: id }) }
   }
-  let index = sentCount
+  if (sentCount === undefined) return await lastUserPrompt(ctx, messages)
+  if (sentCount > messages.length) {
+    // 旧数量锚越界(历史被压缩收缩):整体重建,不再退化成"只发最后一条"。
+    if (messages.length === 0) return { prompt: CONTINUE_PROMPT, images: [] }
+    const rebuilt = await serializeMessages(ctx, messages)
+    const id = latestId()
+    return { ...rebuilt, ...(id === undefined ? {} : { lastMessageId: id }) }
+  }
+  return await replayFrom(ctx, messages, sentCount, skipIds, latestId(), ownProvider)
+}
+
+/** 从 start 起补发(跳过 CodeBuddy 自己的 assistant/tool 与已转发),带回覆盖到的最后消息 id。 */
+async function replayFrom(
+  ctx: Context,
+  messages: readonly Message[],
+  start: number,
+  skipIds: ReadonlySet<string> | undefined,
+  lastMessageId: string | undefined,
+  ownProvider: string,
+): Promise<SerializedPrompt> {
+  let index = start
   let skippedForwarded = false
+  // 跟踪"当前这一轮是谁跑的":CodeBuddy 自己的回答(及其跟随的工具结果)CLI
+  // 已有;**切换其他模型期间**产生的回答/工具结果必须补发——否则切回后模型
+  // 看不到那段上下文(实测:补发把 assistant 一律当"自己的"跳过,期间内容全丢)。
+  let ownTurn = true
   while (index < messages.length) {
     const message = messages[index]!
     const forwarded = skipIds !== undefined && skipIds.has(String(message.id))
-    if (message.role === 'assistant' || message.source.kind === 'tool' || forwarded) {
-      if (forwarded) skippedForwarded = true
+    if (message.role === 'assistant') {
+      const source = message.source as { kind?: unknown; provider?: unknown } | undefined
+      ownTurn = source?.kind === 'model' && source.provider === ownProvider
+      if (ownTurn || forwarded) {
+        if (forwarded) skippedForwarded = true
+        index += 1
+        continue
+      }
+      break
+    }
+    if (message.source.kind === 'tool') {
+      if (ownTurn || forwarded) {
+        if (forwarded) skippedForwarded = true
+        index += 1
+        continue
+      }
+      break
+    }
+    if (forwarded) {
+      skippedForwarded = true
       index += 1
       continue
     }
@@ -119,10 +182,17 @@ export async function resumeReplayPrompt(
   // 全部跳过:没有可补发的新内容。若跳过的是**我们已插话投递过的**消息,
   // 说明这一步只是 dsh 在回合边界把那条插话 claim 成了新 step——模型在运行中
   // 已经处理过它。此时绝不能再发"继续完成之前未完成的任务":实测这句会把模型
-  // 从插话上拽回旧任务(用户视角:插队没生效)。调用方据 skippedForwarded
-  // 空跑收尾。
-  if (index >= messages.length) return { prompt: CONTINUE_PROMPT, images: [], skippedForwarded }
-  return await serializeMessages(ctx, messages.slice(index))
+  // 从插话上拽回旧任务(用户视角:插队没生效)。调用方据 skippedForwarded 空跑收尾。
+  if (index >= messages.length) {
+    return {
+      prompt: CONTINUE_PROMPT,
+      images: [],
+      skippedForwarded,
+      ...(lastMessageId === undefined ? {} : { lastMessageId }),
+    }
+  }
+  const serialized = await serializeMessages(ctx, messages.slice(index))
+  return { ...serialized, ...(lastMessageId === undefined ? {} : { lastMessageId }) }
 }
 
 /** 把一组消息序列化为 prompt(无系统提示);图片走原生内容块。 */

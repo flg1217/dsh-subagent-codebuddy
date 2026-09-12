@@ -116,6 +116,11 @@ export declare class SubagentMirror {
     private translator;
     private file;
     private offset;
+    /**
+     * sync 串行链:定时轮询与终读共用一条链。translator 是状态机(累积
+     * assistant 消息/工具调用),并发 apply 会让事件乱序甚至破坏状态。
+     */
+    private chain;
     private startedAt;
     private prompt;
     private timer;
@@ -135,9 +140,11 @@ export declare class SubagentMirror {
     private locateFile;
     /** 拉取一次增量(也由测试直接调用)。内部全量容错:镜像失败绝不能拖垮主轮。 */
     syncOnce(): Promise<void>;
+    /** 串行排入一次 sync(定时器/终读共用;上一轮结束后才开始下一轮)。 */
+    private enqueueSync;
     /** 增量读取主体;异常由 {@link syncOnce} 兜底。 */
     private syncOnceUnsafe;
-    /** 收尾:终读一次,闭合结构与计时器(全量容错,同 {@link syncOnce})。 */
+    /** 收尾:终读一次(排在已入队的 sync 之后),闭合结构与计时器(全量容错,同 {@link syncOnce})。 */
     finish(agentId?: string): Promise<void>;
 }
 export {};

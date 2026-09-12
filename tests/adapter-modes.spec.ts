@@ -230,8 +230,8 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
     // 泵不写任何会话事件:step/assistant/tool 全部由 agent-loop 原生写。
     expect(h.appended.length).toBe(0)
     // 回放工具按归一化名注册(per-agent),结果来自 ACP。
-    expect(h.registeredTools.has('bash')).toBe(true)
-    const tool = h.registeredTools.get('bash')!
+    expect(h.registeredTools.has('cli_bash')).toBe(true)
+    const tool = h.registeredTools.get('cli_bash')!
     const value = await (tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_1' })
     expect(JSON.stringify(value)).toContain('Stdout: hi')
 
@@ -323,7 +323,7 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
     })
     const first = await step(h.adapter, makeOptions('s1'))
     expect(first.some(c => c.includes('"stop"'))).toBe(true)
-    const waiting = (h.registeredTools.get('bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    const waiting = (h.registeredTools.get('cli_bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: 'call_1' },
     )
     waiting.catch(() => { /* 断言在下面 */ })
@@ -345,8 +345,8 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
     const options = makeOptions('s1', {}, controller.signal)
     const first = await step(h.adapter, options)
     expect(first.some(c => c.includes('"stop"'))).toBe(true)
-    expect(h.registeredTools.has('bash')).toBe(true)
-    const pending = (h.registeredTools.get('bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    expect(h.registeredTools.has('cli_bash')).toBe(true)
+    const pending = (h.registeredTools.get('cli_bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: 'call_1', signal: new AbortController().signal },
     )
     pending.catch(() => { /* 断言在下面 */ })
@@ -371,14 +371,29 @@ describe('回放工具:结果与别名', () => {
       setTimeout(() => { c.p.update(message('看到了')); c.settle() }, 60)
     })
     const first = await step(h.adapter, makeOptions('s1'))
-    expect(first.some(c => c.includes('read_image'))).toBe(true)
-    expect(h.registeredTools.has('read_image')).toBe(true)
-    const value = await (h.registeredTools.get('read_image')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    expect(first.some(c => c.includes('cli_read_image'))).toBe(true)
+    expect(h.registeredTools.has('cli_read_image')).toBe(true)
+    const value = await (h.registeredTools.get('cli_read_image')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: 'call_img' },
     ) as { blocks: Array<Record<string, unknown>>; meta?: { path?: string } }
     expect(value.blocks.some(block => block['type'] === 'image')).toBe(true)
     expect(value.meta?.path).toBe('C:\\tmp\\shot.png')
     expect(h.savedImages.length).toBe(1)
+  }, 15_000)
+
+  it('空 DelegateTool 调用(无 toolId)→ 回放工具立即以错误收尾,不等 CLI 更新', async () => {
+    const h = makeAdapter({}, FAST)
+    mockTurn((c) => {
+      // 模型偶发空参数 DelegateTool:CLI 本地会把调用改写成合法 JSON 继续,
+      // 但不再回 completed 更新——本侧不能干等(实测挂 12 分钟)。
+      c.p.update(toolCall('call_empty', 'DelegateTool', {}))
+      c.p.update(phase('tool_executing'))
+      setTimeout(() => { c.p.update(message('继续')); c.settle() }, 60)
+    })
+    await step(h.adapter, makeOptions('s1'))
+    const tool = h.registeredTools.get('cli_delegate_tool')!
+    await expect((tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_empty' }))
+      .rejects.toThrow(/toolId/)
   }, 15_000)
 
   it('工具失败(failed)→ 回放工具以错误收尾', async () => {
@@ -390,7 +405,7 @@ describe('回放工具:结果与别名', () => {
       setTimeout(() => { c.p.update(message('失败了')); c.settle() }, 60)
     })
     await step(h.adapter, makeOptions('s1'))
-    const tool = h.registeredTools.get('bash')!
+    const tool = h.registeredTools.get('cli_bash')!
     await expect((tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_1' }))
       .rejects.toThrow(/exit code 1/)
   }, 15_000)
@@ -616,6 +631,31 @@ describe('尾巴窗口(后台任务续跑)', () => {
     expect(second.some(c => c.includes('续跑内容'))).toBe(true)
   }, 15_000)
 
+  it('tail 期间 CLI 持续报空闲(idle 心跳)→ 短预算收尾,不等后台宽限', async () => {
+    // 用户场景:会话跑完后 CLI 仍周期发 session_info 心跳;若心跳参与静默
+    // 判定,回合要等满 tailBgQuietMs/tailCapMs 才收尾,UI 一直显示"进行中"。
+    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, tailBgQuietMs: 60_000 })
+    mockTurn((c) => {
+      c.p.update(toolCall('call_1', 'Bash', { command: 'npm run dev', run_in_background: true }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'running in background'))
+      c.p.update(message('答复'))
+      c.settle()
+      // settle 之后 CLI 仍周期报空闲(心跳)。
+      let ticks = 0
+      const timer = setInterval(() => {
+        ticks += 1
+        if (ticks > 200) { clearInterval(timer); return }
+        c.p.update(phase('idle'))
+      }, 30)
+    })
+    const started = Date.now()
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(chunks.some(c => c.includes('答复'))).toBe(true)
+    // 后台宽限 60s,但 idle 心跳把预算拉回 40ms。
+    expect(Date.now() - started).toBeLessThan(5_000)
+  }, 15_000)
+
   it('session_end 广播 → 立即收尾', async () => {
     const h = makeAdapter({}, { ...FAST, tailQuietMs: 5_000, tailBgQuietMs: 5_000 })
     mockTurn((c) => {
@@ -731,7 +771,7 @@ describe('回放工具的等待面', () => {
       setTimeout(() => c.settle(), 120)
     })
     await step(h.adapter, makeOptions('s1'))
-    const tool = h.registeredTools.get('bash')!
+    const tool = h.registeredTools.get('cli_bash')!
     let settled = false
     const waiting = (tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_1' })
     waiting.then(() => { settled = true }, () => { settled = true })

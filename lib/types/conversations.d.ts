@@ -12,6 +12,11 @@ export interface ConversationRecord {
     acpId: string;
     /** 上次发送 prompt 时 dsh 消息总数(缺失轮次补发的锚点)。 */
     sentCount: number;
+    /**
+     * 上次发送覆盖到的最后一条 dsh 消息 id(补发主锚——数量锚在压缩/编辑后
+     * 不可靠,切模型再切回时会漏掉期间上下文)。
+     */
+    lastSentMessageId?: string;
     /** 最后使用时间(逐出排序用)。 */
     at: number;
 }
@@ -30,6 +35,7 @@ export declare class ConversationStore {
     set(sessionId: string, record: {
         acpId: string;
         sentCount: number;
+        lastSentMessageId?: string;
     }): void;
     /** 删除会话记录(如 CodeBuddy 侧会话丢失时)。 */
     delete(sessionId: string): void;

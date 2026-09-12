@@ -168,13 +168,19 @@ export async function messagesToRecords(
       for (const block of message.content) {
         if (block.type !== 'tool-result') continue
         const callId = String(block.toolCallId)
+        // 每条记录只带本块自己的文本(一条消息可能含多个 tool-result;
+        // 之前整条拼接会让每个记录重复全部结果)。
+        const resultParts: string[] = []
+        for (const inner of block.content) {
+          if (inner.type === 'text') resultParts.push(inner.text)
+        }
         push({
           timestamp: stamp(),
           type: 'function_call_result',
           name: toolNames.get(callId) ?? 'tool',
           callId,
           status: 'completed',
-          output: { type: 'text', text: messageText(message) },
+          output: { type: 'text', text: resultParts.join('') },
           providerData: { agent: 'cli' },
           ...base(),
         })

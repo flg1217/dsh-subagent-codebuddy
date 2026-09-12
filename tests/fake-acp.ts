@@ -16,6 +16,11 @@ export interface FakeAcp {
   close(code: number | null): void
   requestLog(): string[]
   notifications(): Array<{ method: string; params: Record<string, unknown> }>
+  /**
+   * CLI → 客户端的方法请求(extMethod,如 `_codebuddy.ai/delegateTool`):
+   * 写入 stdout 并等待客户端经 stdin 回响应。
+   */
+  extRequest(method: string, params: Record<string, unknown>): Promise<{ result?: unknown; error?: { code: number; message: string } }>
 }
 
 let last: FakeAcp | undefined
@@ -34,6 +39,9 @@ export function fakeAcpProc(): FakeAcp {
   const requests: Array<{ id: number; method: string }> = []
   const notifs: Array<{ method: string; params: Record<string, unknown> }> = []
   let handler: (msg: { id: number; method: string; params: Record<string, unknown> }) => void = () => {}
+  /** CLI → 客户端请求的未决响应(extRequest)。 */
+  let serverNextId = 100_000
+  const serverPending = new Map<number, (value: { result?: unknown; error?: { code: number; message: string } }) => void>()
   const stdin = new ReadableStream({ read(): void {} })
   ;(stdin as unknown as { write: (s: string) => void }).write = (s: string): void => {
     stdinBuffer += s
@@ -42,7 +50,16 @@ export function fakeAcpProc(): FakeAcp {
       const line = stdinBuffer.slice(0, idx)
       stdinBuffer = stdinBuffer.slice(idx + 1)
       if (!line.trim().startsWith('{')) continue
-      const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown> }
+      const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { code: number; message: string } }
+      // 客户端 → 我们的响应(extRequest 的回包)。
+      if (msg.method === undefined && msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        const settle = serverPending.get(msg.id)
+        if (settle !== undefined) {
+          serverPending.delete(msg.id)
+          settle(msg.error !== undefined ? { error: msg.error } : { result: msg.result })
+        }
+        continue
+      }
       if (msg.method === undefined) continue
       if (msg.id !== undefined) {
         requests.push({ id: msg.id, method: msg.method })
@@ -82,6 +99,13 @@ export function fakeAcpProc(): FakeAcp {
   }
   fake.requestLog = (): string[] => requests.map(r => r.method)
   fake.notifications = (): Array<{ method: string; params: Record<string, unknown> }> => notifs
+  fake.extRequest = (method, params) => {
+    const id = serverNextId++
+    return new Promise(resolve => {
+      serverPending.set(id, resolve)
+      stdout.push(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+    })
+  }
   last = fake
   return fake
 }

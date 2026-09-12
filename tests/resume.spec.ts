@@ -15,6 +15,7 @@ import { CodebuddyLlmAdapter } from '../src/adapter.ts'
 import { ConversationStore } from '../src/conversations.ts'
 import { projectSlug } from '../src/native-session.ts'
 import { asSpawnResult, fakeAcpProc, message } from './fake-acp.ts'
+import { DSH_DELEGATION_NOTE } from '../src/pump.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -176,7 +177,8 @@ describe('原生会话种子(已有历史切换)', () => {
       expect(requests()).toContain('session/load')
       expect(requests()).not.toContain('session/new')
       // prompt 只带当前输入,历史不在提示词里。
-      expect(prompts.at(-1)).toBe('当前问题')
+      expect(prompts.at(-1)?.startsWith('当前问题')).toBe(true)
+      expect(prompts.at(-1)?.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
       // 原生文件已写入:含历史消息,不含当前输入(它作为 prompt 发送)。
       const dir = join(baseDir, projectSlug(process.cwd()))
       const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
@@ -253,13 +255,16 @@ describe('跨重启恢复', () => {
     expect(prompt).toContain('问题二')
   })
 
-  it('锚点缺失(历史被压缩收缩)时退回最后一条用户消息', async () => {
+  it('锚点被压缩移除(历史收缩)时整体重建 surface,不再只发最后一条', async () => {
     const store = new ConversationStore(null)
     const { adapter, prompts } = makeHarness(store)
     await drain(adapter, options([msg('u1', 'user', '很长的问题一'), msg('a1', 'assistant', '答一'), msg('u2', 'user', '问题二')]))
-    // 下一次:历史被压缩(长度小于锚点)→ 只发最后一条用户消息。
+    // 下一次:历史被压缩收缩(锚点消息已被移除)→ 当前 surface 整体重建。
     await drain(adapter, options([msg('u3', 'user', '压缩后的新问题')]))
     const prompt = prompts.at(-1)!
-    expect(prompt).toBe('压缩后的新问题')
+    // 重建走 serializeMessages:带 `User: ` 标签,而不是只发最后一条裸文本。
+    expect(prompt).toContain('压缩后的新问题')
+    expect(prompt).toContain('User: 压缩后的新问题')
+    expect(prompt.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
   })
 })

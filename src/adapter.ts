@@ -44,6 +44,7 @@ import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import type { CodebuddyFailure } from './failure.js'
 import { TurnPump } from './pump.js'
+import { syncCliIntegrations } from './cli-integrations.js'
 import type { PumpHost } from './pump.js'
 import { listCodebuddyModelIdsAsync } from './models.js'
 
@@ -325,6 +326,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         options.messages,
         record.sentCount,
         this.forwardedInsertions.get(sessionId),
+        record.lastSentMessageId,
       )
       if (replay.skippedForwarded === true && record.sentCount !== undefined) return { kind: 'skip' }
       prompt = replay.prompt
@@ -376,11 +378,20 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         const built = await buildPrompt(this.ctx, fullPromptOptions)
         return { prompt: built.prompt, images: built.images }
       },
-      rememberConversation: (acpId, sentCount) => {
-        this.conversations.set(sessionId, { acpId, sentCount })
+      rememberConversation: (acpId, sentCount, lastSentMessageId) => {
+        this.conversations.set(sessionId, {
+          acpId,
+          sentCount,
+          ...(lastSentMessageId === undefined ? {} : { lastSentMessageId }),
+        })
       },
       forgetConversation: () => { this.conversations.delete(sessionId) },
       sentCount: options.messages.length,
+      // 补发主锚:本次发送覆盖到的最后一条消息(数量锚在压缩/编辑后不可靠——
+      // 切到其他模型跑一段再切回时,数量锚越界会让补发退化成"只发最后一条")。
+      ...(options.messages.length === 0
+        ? {}
+        : { sentLastMessageId: String(options.messages[options.messages.length - 1]!.id) }),
       session: {
         ownEvents: () => childSession.ownEvents?.() ?? [],
         ...childSession.append === undefined
@@ -510,6 +521,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         options.messages,
         record.sentCount,
         dshSessionId === undefined ? undefined : this.forwardedInsertions.get(dshSessionId),
+        record.lastSentMessageId,
       )
       prompt = replay.prompt
       promptImages = replay.images
@@ -552,8 +564,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       const to = { ...DEFAULT_ACP_RUN_TIMEOUTS, ...this.options.timeouts }
       const startedAt = Date.now()
       let stallTimedOut = false
-      let firstTimer: ReturnType<typeof setTimeout> | undefined
-      let idleTimer: ReturnType<typeof setTimeout> | undefined
       let killTimer: ReturnType<typeof setTimeout> | undefined
       let maxGapMs = state.maxGapMs
       let lastProgressAt = startedAt
@@ -604,33 +614,24 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         // 第二段:5s 仍无响应才杀进程——纯死挂只有这一条路。
         if (killTimer === undefined) killTimer = setTimeout(kill, 5_000)
       }
-      const touch = (): void => {
-        if (firstTimer !== undefined) {
-          clearTimeout(firstTimer)
-          firstTimer = undefined
-        }
-        if (idleTimer !== undefined) clearTimeout(idleTimer)
-        idleTimer = setTimeout(failStall, lastBudgetMs)
-      }
 
       /**
        * 独立看门狗:与消费方是否还在迭代生成器无关(消费方被回收时生成器的
-       * finally 可能永不执行——实测进程泄漏、子会话回合悬空)。静默超预算直接
-       * 强杀:conn 的挂起请求随之 reject,上游能收尾回合。
+       * finally 可能永不执行——实测进程泄漏、子会话回合悬空)。静默判死已
+       * 整体移除:CLI 等上游/长思考时可长时间零事件,只保留"在途工具永不
+       * 返回"的硬顶;其余终止交给进程退出(挂起请求 reject)或调用方取消。
        */
       const guardTimer = setInterval(() => {
         if (stallTimedOut) {
           clearInterval(guardTimer)
           return
         }
-        const idleFor = Date.now() - lastProgressAt
         if (pendingTools.size > 0) {
-          // 在途工具期间暂停计时,只设硬顶兜底(cap<=0 = 关闭硬顶)。
+          // 在途工具的硬顶兜底(cap<=0 = 关闭硬顶)。
           const cap = to.guardCapMs ?? 30 * 60_000
+          const idleFor = Date.now() - lastProgressAt
           if (cap > 0 && idleFor > cap) failStall()
-          return
         }
-        if (idleFor > lastBudgetMs) failStall()
       }, 3_000)
       guardTimer.unref?.()
       const armIdle = (): void => {
@@ -639,17 +640,9 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         state.maxGapMs = maxGapMs
         lastProgressAt = now
         progressSamples += 1
-        if (pendingTools.size > 0) {
-          if (idleTimer !== undefined) {
-            clearTimeout(idleTimer)
-            idleTimer = undefined
-          }
-          return
-        }
         lastBudgetMs = progressSamples <= to.idleWarmupLines
           ? to.idleMaxMs
           : Math.min(Math.max(maxGapMs * to.idleFactor, to.idleMinMs), to.idleMaxMs)
-        touch()
       }
 
       /** 处理一条 ACP update:续命 + 流累积(不写会话事件)。 */
@@ -712,12 +705,14 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       const effortArgs = options.reasoningEffort === undefined
         ? []
         : ['--effort', String(options.reasoningEffort)]
+      // CLI 进程将在启动时读取 ~/.codebuddy/mcp.json 与 skills 目录:启动前
+      // 同步一次(dsh 的 MCP 配置 / skills → CLI 原生通道),保证最新。
+      syncCliIntegrations({ projectCwd: cwd })
       const conn = new AcpConnection(
         [command, ...prefixArgs, '--acp', '--model', model, ...effortArgs, '--dangerously-skip-permissions', ...this.options.extraArgs],
         cwd,
         onUpdate,
       )
-      touch()
       let exitError: Error | undefined
       conn.onExit(info => {
         if (conn.wasKilled || stallTimedOut) return
@@ -832,9 +827,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         if (stallTimedOut) {
           flushPending()
           throw new RetryableError(`CodeBuddy ACP 调用超时(已等待 ${Math.round((Date.now() - startedAt) / 1000)}s;`
-            + `静默超过 ${Math.round(lastBudgetMs / 1000)}s 无进展,本次历史最大进展间隔 ${Math.round(maxGapMs / 1000)}s,`
-            + `阈值 = clamp(间隔 × ${to.idleFactor}, ${Math.round(to.idleMinMs / 1000)}s, ${Math.round(to.idleMaxMs / 1000)}s),`
-            + `已收 ${progressSamples} 次进展,在途工具 ${pendingTools.size} 个${conn.stderrNote()})`)
+            + `在途工具 ${pendingTools.size} 个超过硬顶未返回,本次历史最大进展间隔 ${Math.round(maxGapMs / 1000)}s,`
+            + `已收 ${progressSamples} 次进展${conn.stderrNote()})`)
         }
         if (promptError !== undefined) {
           throwFailure('CodeBuddy ACP 请求失败:', failureOfError(promptError), conn.stderrNote())
@@ -885,8 +879,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         }
       } finally {
         clearInterval(guardTimer)
-        if (firstTimer !== undefined) clearTimeout(firstTimer)
-        if (idleTimer !== undefined) clearTimeout(idleTimer)
         if (killTimer !== undefined) clearTimeout(killTimer)
         if (cancelLoopTimer !== undefined) clearInterval(cancelLoopTimer)
         options.signal?.removeEventListener('abort', onAbort)

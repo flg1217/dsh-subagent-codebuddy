@@ -142,9 +142,9 @@ describe('chunk 流契约:一个回合的多个 step 都能被无损组装', () 
     // 工具名归一化、参数完整、id 与回放工具一一对应(趁泵还在,结果可取)。
     const callA = blocks1.find(block => block.type === 'tool-call')
     expect(callA).toBeDefined()
-    expect(callA && callA.type === 'tool-call' ? callA.name : '').toBe('bash')
-    expect(registeredTools.has('bash')).toBe(true)
-    const resultA = await (registeredTools.get('bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    expect(callA && callA.type === 'tool-call' ? callA.name : '').toBe('cli_bash')
+    expect(registeredTools.has('cli_bash')).toBe(true)
+    const resultA = await (registeredTools.get('cli_bash')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: callA && callA.type === 'tool-call' ? callA.id : '' },
     )
     expect(JSON.stringify(resultA)).toContain('a')
@@ -152,8 +152,8 @@ describe('chunk 流契约:一个回合的多个 step 都能被无损组装', () 
     const second = await stepChunks(adapter)
     const callB = assemble(second).find(block => block.type === 'tool-call')
     expect(callB).toBeDefined()
-    expect(callB && callB.type === 'tool-call' ? callB.name : '').toBe('read')
-    const toolB = registeredTools.get('read')!
+    expect(callB && callB.type === 'tool-call' ? callB.name : '').toBe('cli_read')
+    const toolB = registeredTools.get('cli_read')!
     await expect((toolB['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: callB && callB.type === 'tool-call' ? callB.id : '' },
     )).rejects.toThrow('boom')
@@ -203,7 +203,7 @@ describe('chunk 流契约:一个回合的多个 step 都能被无损组装', () 
     const call = blocks.find(block => block.type === 'tool-call')
     expect(call).toBeDefined()
     // 结果永不到:回放工具被拒(不悬挂)。
-    const tool = registeredTools.get('bash')!
+    const tool = registeredTools.get('cli_bash')!
     await expect((tool['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)({}, { callId: 'call_x' }))
       .rejects.toThrow()
   }, 15_000)

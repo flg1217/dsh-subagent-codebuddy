@@ -141,9 +141,23 @@ export declare function toolNameOf(update: AcpUpdate): string;
 export declare function usageOfUpdate(update: AcpUpdate): TokenUsage | undefined;
 /** 进展性事件:代表任务真实推进,重置动态空闲计时。 */
 export declare function isProgressUpdate(update: AcpUpdate): boolean;
+/**
+ * CLI → 客户端的方法请求(ACP extMethod,如 `_codebuddy.ai/delegateTool`)。
+ * 与客户端 → CLI 的 `request()` 方向相反,需要客户端在 pending 之外单独应答。
+ */
+export interface AcpClientRequest {
+    method: string;
+    params: Record<string, unknown>;
+}
+/**
+ * 客户端方法处理器:返回值作为 JSON-RPC result;
+ * 返回 undefined 表示本客户端不支持该方法(回 -32601),抛错回 -32000。
+ */
+export type AcpClientRequestHandler = (request: AcpClientRequest) => Promise<unknown | undefined> | unknown | undefined;
 /** 一个 ACP 进程连接:JSON-RPC 请求/通知 + update 事件回调。 */
 export declare class AcpConnection {
     private readonly onUpdate;
+    private readonly onClientRequest?;
     readonly proc: ChildProcess;
     private nextId;
     private readonly pending;
@@ -153,7 +167,7 @@ export declare class AcpConnection {
     private stderrTail;
     /** close 原因:正常退出 / 被主动 kill(避免把自杀报成崩溃)。 */
     private killed;
-    constructor(argvPrefix: readonly string[], cwd: string, onUpdate: (update: AcpUpdate) => void);
+    constructor(argvPrefix: readonly string[], cwd: string, onUpdate: (update: AcpUpdate) => void, onClientRequest?: AcpClientRequestHandler | undefined);
     /** 进程退出(含退出码);已在退出后调用则立即返回。 */
     onExit(listener: (info: AcpExitInfo) => void): void;
     /**
@@ -165,6 +179,14 @@ export declare class AcpConnection {
      */
     request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T>;
     notify(method: string, params: Record<string, unknown>): void;
+    /**
+     * 应答 CLI 发来的方法请求(extMethod)。
+     * 没有处理器 ≥ 不支持的方法回 -32601,处理器抛错回 -32000——
+     * CLI 侧等待的是响应,静默丢弃会让对方卡到自己的超时。
+     */
+    private answerClientRequest;
+    /** 写一行 JSON 到 CLI stdin(进程已退出的写入静默丢弃)。 */
+    private replyJson;
     /** stderr 尾部(有内容才带分号前缀)。 */
     stderrNote(): string;
     /** 主动终止:标记自杀,避免 close 被误判为崩溃。 */

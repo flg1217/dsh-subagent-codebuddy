@@ -24,6 +24,11 @@ export interface SerializedPrompt {
      * 调用方据此空跑收尾,而不是发 CONTINUE_PROMPT 把模型拽回旧任务。
      */
     skippedForwarded?: boolean;
+    /**
+     * 本次发送覆盖到的最后一条消息 id(写回续接记录,充当下一次补发的主锚——
+     * 数量锚在压缩/编辑后不可靠)。
+     */
+    lastMessageId?: string;
 }
 /**
  * 续聊兜底:只发**用户自己发的**最后一条消息(锚点缺失/历史被压缩收缩时)。
@@ -35,19 +40,23 @@ export interface SerializedPrompt {
  */
 export declare function lastUserPrompt(ctx: Context, messages: readonly Message[]): Promise<SerializedPrompt>;
 /**
- * 续聊补发:把上次发送锚点(`sentCount`)之后的消息完整补发。
+ * 续聊补发:把"CLI 尚未见过"的消息补发给 CodeBuddy。
  *
- * 锚点之后先跳过 CodeBuddy 自己产生的消息(assistant 与 tool 结果——其会话里
- * 已有)与**已中途转发的插入消息**(`skipIds`——其文本已作为排队 prompt 送达,
- * 补发会重复),其余(切换其他模型期间产生的轮次、新的用户输入、压缩摘要等)
- * 全部按 User/Assistant 序列化发出。锚点缺失或历史被压缩收缩时退回最后一条用户消息。
+ * 主锚是**消息 id**(`lastSentMessageId`):上次发送覆盖到的最后一条消息。
+ * 数量锚(`sentCount`)在历史被压缩/编辑后不可靠——切到其他模型跑一段再切回时,
+ * 数量锚越界会让补发退化成"只发最后一条",切换期间的上下文永久丢失(实测)。
+ * 锚点已被压缩移除时,CLI 缺的就是"当前 surface 全部",整体序列化重建。
+ *
+ * 补发按 User/Assistant 序列化;CodeBuddy 自己产生的消息(assistant/tool)与
+ * 已中途转发的插入消息(`skipIds`)跳过。
  * @param ctx - 插件上下文(读取附件服务)。
  * @param messages - 当前 dsh 折叠视图的完整消息序列。
- * @param sentCount - 上次发送时的消息数锚点(未知则退回兜底)。
+ * @param sentCount - 旧的数量锚(仅兼容历史记录;新锚见下)。
  * @param skipIds - 已在生成中转发过的插入消息 id 集合(可选)。
- * @returns 序列化结果(prompt + 原生图片块)。
+ * @param lastSentMessageId - 上次发送覆盖到的最后一条消息 id(主锚,可选)。
+ * @returns 序列化结果(prompt + 原生图片块 + 本次覆盖到的最后消息 id)。
  */
-export declare function resumeReplayPrompt(ctx: Context, messages: readonly Message[], sentCount: number | undefined, skipIds?: ReadonlySet<string>): Promise<SerializedPrompt>;
+export declare function resumeReplayPrompt(ctx: Context, messages: readonly Message[], sentCount: number | undefined, skipIds?: ReadonlySet<string>, lastSentMessageId?: string, ownProvider?: string): Promise<SerializedPrompt>;
 /** 把一组消息序列化为 prompt(无系统提示);图片走原生内容块。 */
 export declare function serializeMessages(ctx: Context, messages: readonly Message[]): Promise<SerializedPrompt>;
 /** 把 harness 消息序列化为 CodeBuddy 单轮 prompt;图片走原生内容块。 */

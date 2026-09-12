@@ -27,6 +27,7 @@
  * @module subagent-codebuddy/pump
  */
 import type { Context } from '@deepseek-ai/cordis';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { AcpTimeouts } from './acp.js';
 import type { TodoListState } from './todo-bridge.js';
@@ -74,8 +75,10 @@ export interface PumpHost {
             mimeType: string;
         }>;
     }>;
-    /** 会话登记(续接锚点:sentCount = 本次发送时 dsh 消息总数)。 */
-    rememberConversation: (acpId: string, sentCount: number) => void;
+    /** 会话登记(续接锚点:sentCount = 本次发送时 dsh 消息总数;lastMessageId = 本次覆盖到的最后一条消息)。 */
+    rememberConversation: (acpId: string, sentCount: number, lastMessageId?: string) => void;
+    /** 本次发送覆盖到的最后一条消息 id(补发主锚,写回续接记录)。 */
+    sentLastMessageId?: string;
     /** 登记失效(CodeBuddy 侧会话丢失)。 */
     forgetConversation: () => void;
     sentCount: number;
@@ -95,6 +98,29 @@ export interface PumpHost {
 }
 /** 仅供测试:清空模块级注册表并释放残留的泵(跨用例隔离)。 */
 export declare function resetPumpStateForTests(): void;
+/**
+ * 回放工具的 presentationMeta 投影:只透传显式 meta(无损 JSON 对象),
+ * 缺失/非法一律给 `{}`。
+ *
+ * dsh 的工具框架对投影结果做无损 JSON 快照——返回 `undefined` 会被判
+ * `INVALID_TOOL_OUTPUT` 并把**真实工具结果整个吞掉**(实测:委托工具的子代理
+ * 输出因此变成 "returned invalid output",模型只看到报错)。
+ * @param value - 回放工具返回值(`{ blocks, meta? }`)。
+ * @returns 可快照的投影元数据(至少是空对象)。
+ */
+export declare function replayPresentationMeta(value: unknown): Record<string, JsonValue>;
+/**
+ * dsh 发起的调用的固定尾注(附在每条 prompt 末端)。
+ *
+ * CodeBuddy CLI 自带子代理体系(Task/Agent 团队)与自带后台任务(bash
+ * run_in_background / docker exec -d),而这条链路里它是被 dsh 拉起的模型
+ * 后端:子任务必须交给 dsh 的子代理(委托工具 `dsh_subagent`),长命令必须
+ * 走 `dsh_bash`——只有 dsh 通道的任务会进会话树/后台面板,并在完成时唤起
+ * 下一轮。尾注同时声明"回合结束后不会自动恢复"的落点:否则模型会承诺
+ * "等 X 完成后继续汇报",而外部任务没有完成事件,用户只能主动催。
+ * 位置固定在末尾——模型对最新一条输入的尾部指令最敏感。
+ */
+export declare const DSH_DELEGATION_NOTE: string;
 /** 重启跨 attempt 保留的执行状态(重试是同一任务的延续,已学到的间隔不丢)。 */
 export interface PumpStepState {
     mirroredCalls: Set<string>;
@@ -149,6 +175,10 @@ export declare class TurnPump {
     private lastContentAt;
     private tailStartAt;
     private tailDeadline;
+    /** CLI 报"空闲"相位的时间(agentPhase=idle);undefined = 本轮未报过。 */
+    private lastIdlePhaseAt;
+    /** 最近一次"工具执行中"相位的时间(它算活动;session_info 心跳不算)。 */
+    private lastToolExecutingAt;
     /** 收段判定辅助。 */
     private boundarySeenAt;
     /** 边界/收尾的一次性补判定定时器(心跳粒度不够时的精确收口)。 */
@@ -209,6 +239,11 @@ export declare class TurnPump {
     }>;
     /** 为此 agent 注册一个回放工具(同名工具名只注册一次)。 */
     private ensureReplayTool;
+    /**
+     * CLI 发来的方法请求:统一入口——`dsh_<工具名>` 的委托工具执行。
+     * 返回 undefined 表示本客户端不支持该方法(AcpConnection 会回 -32601)。
+     */
+    private handleClientRequest;
     private onUpdate;
     /** 单条 update 的状态机(不触发收段判定)。 */
     private applyUpdate;
@@ -224,7 +259,7 @@ export declare class TurnPump {
     private checkSegmentBoundary;
     /** tail 窗口:prompt 干净收尾后继续抽流(后台任务会自发续跑)。 */
     private checkTail;
-    /** 动态空闲看门狗:进展性事件续命;在途工具/等结果期间只保留硬顶。 */
+    /** 看门狗:静默判死已整体移除——只保留"在途工具永不返回"的硬顶兜底。 */
     private checkStall;
     private stall;
     private armProgress;

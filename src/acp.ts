@@ -207,6 +207,23 @@ function toRpcError(raw: unknown): AcpRpcError {
   return new AcpRpcError(typeof error.code === 'number' ? error.code : undefined, `ACP ${message}`, data)
 }
 
+/**
+ * CLI → 客户端的方法请求(ACP extMethod,如 `_codebuddy.ai/delegateTool`)。
+ * 与客户端 → CLI 的 `request()` 方向相反,需要客户端在 pending 之外单独应答。
+ */
+export interface AcpClientRequest {
+  method: string
+  params: Record<string, unknown>
+}
+
+/**
+ * 客户端方法处理器:返回值作为 JSON-RPC result;
+ * 返回 undefined 表示本客户端不支持该方法(回 -32601),抛错回 -32000。
+ */
+export type AcpClientRequestHandler = (
+  request: AcpClientRequest,
+) => Promise<unknown | undefined> | unknown | undefined
+
 /** 一个 ACP 进程连接:JSON-RPC 请求/通知 + update 事件回调。 */
 export class AcpConnection {
   readonly proc: ChildProcess
@@ -223,6 +240,7 @@ export class AcpConnection {
     argvPrefix: readonly string[],
     cwd: string,
     private readonly onUpdate: (update: AcpUpdate) => void,
+    private readonly onClientRequest?: AcpClientRequestHandler,
   ) {
     // argvPrefix[0] 是可执行(如 node 或 CLI .exe),其余是前置参数(CLI 路径等)。
     this.proc = spawn(argvPrefix[0]!, [...argvPrefix.slice(1)], {
@@ -239,7 +257,7 @@ export class AcpConnection {
         method?: string
         result?: unknown
         error?: unknown
-        params?: { update?: AcpUpdate }
+        params?: unknown
       }
       try { msg = JSON.parse(line) } catch { return }
       if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
@@ -251,13 +269,27 @@ export class AcpConnection {
         }
         return
       }
-      const update = msg.params?.update
-      if (update !== undefined) this.onUpdate(update)
+      // CLI → 客户端的请求(extMethod):先于通知判定——它带 id 且带 method。
+      if (msg.id !== undefined && msg.method !== undefined) {
+        void this.answerClientRequest(msg.id, msg.method, msg.params)
+        return
+      }
+      const update = (msg.params as { update?: AcpUpdate } | undefined)?.update
+      if (update !== undefined) {
+        // 单条坏 update 不该拖垮整个服务:状态机异常由回合超时/恢复路径兜底。
+        try { this.onUpdate(update) } catch (error: unknown) {
+          console.error('[codebuddy-acp] update handler failed:', error)
+        }
+      }
     })
     this.proc.stderr?.setEncoding('utf8')
     this.proc.stderr?.on('data', (chunk: string) => {
       this.stderrTail = (this.stderrTail + chunk).slice(-4000)
     })
+    // 进程退出后的 stdin 写入产生 EPIPE(异步 'error' 事件)——没有监听器时
+    // 会升级为 uncaughtException 拖垮整个 dsh 服务;这里吞掉(写入由调用方
+    // 的 try/catch 与 request 超时兜底)。
+    this.proc.stdin?.on('error', () => { /* 进程已退出:忽略写入错误 */ })
     this.proc.on('close', (code, signal) => {
       this.exitInfo = { code, signal: signal ?? null }
       // 进程退出时 reject 所有未决请求,避免悬挂到超时。
@@ -302,6 +334,34 @@ export class AcpConnection {
     this.proc.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n')
   }
 
+  /**
+   * 应答 CLI 发来的方法请求(extMethod)。
+   * 没有处理器 ≥ 不支持的方法回 -32601,处理器抛错回 -32000——
+   * CLI 侧等待的是响应,静默丢弃会让对方卡到自己的超时。
+   */
+  private async answerClientRequest(id: number, method: string, params: unknown): Promise<void> {
+    const record = params !== null && typeof params === 'object' && !Array.isArray(params)
+      ? params as Record<string, unknown>
+      : {}
+    let result: unknown
+    try {
+      result = await this.onClientRequest?.({ method, params: record })
+    } catch (error) {
+      this.replyJson({ jsonrpc: '2.0', id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } })
+      return
+    }
+    if (result === undefined) {
+      this.replyJson({ jsonrpc: '2.0', id, error: { code: -32601, message: `method not supported by client: ${method}` } })
+      return
+    }
+    this.replyJson({ jsonrpc: '2.0', id, result: result ?? {} })
+  }
+
+  /** 写一行 JSON 到 CLI stdin(进程已退出的写入静默丢弃)。 */
+  private replyJson(payload: unknown): void {
+    try { this.proc.stdin?.write(JSON.stringify(payload) + '\n') } catch { /* 进程已退出 */ }
+  }
+
   /** stderr 尾部(有内容才带分号前缀)。 */
   stderrNote(): string {
     const tail = this.stderrTail.trim()
@@ -313,6 +373,7 @@ export class AcpConnection {
     this.killed = true
     try { this.proc.kill() } catch { /* 已退出 */ }
     try { this.proc.stdout?.destroy() } catch { /* 已关闭 */ }
+    try { this.proc.stdin?.destroy() } catch { /* 已关闭 */ }
   }
 
   get wasKilled(): boolean { return this.killed }

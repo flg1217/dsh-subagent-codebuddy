@@ -12,14 +12,16 @@ function tempFile(): string {
 }
 
 describe('ConversationStore', () => {
-  it('写入后可重载(跨重启恢复)', () => {
+  it('写入后可重载(跨重启恢复)——含补发主锚 lastSentMessageId', () => {
     const file = tempFile()
     const store = new ConversationStore(file)
-    store.set('session-a', { acpId: 'acp-1', sentCount: 7 })
+    store.set('session-a', { acpId: 'acp-1', sentCount: 7, lastSentMessageId: 'msg-42' })
     // 等防抖落盘
     return new Promise<void>(resolve => setTimeout(resolve, 700)).then(() => {
       const reloaded = new ConversationStore(file)
-      expect(reloaded.get('session-a')).toMatchObject({ acpId: 'acp-1', sentCount: 7 })
+      // 主锚漏恢复会让重启后的补发退回数量锚(压缩/编辑后不可靠)。
+      expect(reloaded.get('session-a'))
+        .toMatchObject({ acpId: 'acp-1', sentCount: 7, lastSentMessageId: 'msg-42' })
     })
   })
 

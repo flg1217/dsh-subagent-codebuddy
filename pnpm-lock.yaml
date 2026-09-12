@@ -9,29 +9,38 @@ importers:
   .:
     devDependencies:
       '@deepseek-ai/cordis':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/vendor/cordis
-        version: link:../deepseek-harness/vendor/cordis
+        specifier: link:D:/Projects/DeepseekHarness/repo/vendor/cordis
+        version: link:../../repo/vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: link:d:/Projects/DeepseekHarness/repo/packages/core/agent
+        version: link:../../repo/packages/core/agent
+      '@deepseek-ai/dsh-jobs':
+        specifier: link:d:/Projects/DeepseekHarness/repo/packages/jobs/jobs
+        version: link:../../repo/packages/jobs/jobs
       '@deepseek-ai/dsh-llm':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/llm/llm
-        version: link:../deepseek-harness/packages/llm/llm
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/llm/llm
+        version: link:../../repo/packages/llm/llm
       '@deepseek-ai/dsh-session':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/core/session
-        version: link:../deepseek-harness/packages/core/session
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/core/session
+        version: link:../../repo/packages/core/session
       '@deepseek-ai/dsh-session-format-v0-to-v1':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/session/session-format-v0-to-v1
-        version: link:../deepseek-harness/packages/session/session-format-v0-to-v1
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/session/session-format-v0-to-v1
+        version: link:../../repo/packages/session/session-format-v0-to-v1
       '@deepseek-ai/dsh-settings':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/settings/settings
-        version: link:../deepseek-harness/packages/settings/settings
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/settings/settings
+        version: link:../../repo/packages/settings/settings
+      '@deepseek-ai/dsh-shell':
+        specifier: link:d:/Projects/DeepseekHarness/repo/packages/shell/shell
+        version: link:../../repo/packages/shell/shell
       '@deepseek-ai/dsh-subagent':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/subagent/subagent
-        version: link:../deepseek-harness/packages/subagent/subagent
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/subagent/subagent
+        version: link:../../repo/packages/subagent/subagent
       '@deepseek-ai/dsh-tools':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/core/tools
-        version: link:../deepseek-harness/packages/core/tools
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/core/tools
+        version: link:../../repo/packages/core/tools
       '@deepseek-ai/dsh-util-values':
-        specifier: link:h:/Projects/DeepseekHarness/deepseek-harness/packages/util/values
-        version: link:../deepseek-harness/packages/util/values
+        specifier: link:D:/Projects/DeepseekHarness/repo/packages/util/values
+        version: link:../../repo/packages/util/values
       '@deepseek-ai/schemastery':
         specifier: ^3.0.0
         version: 3.18.1
