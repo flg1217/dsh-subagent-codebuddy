@@ -58,16 +58,20 @@ describe('bridgeToolId / bridgeTargetTool:命名与排除', () => {
     expect(bridgeTargetTool('dsh_pwsh')).toBe('pwsh')
     expect(bridgeTargetTool('dsh_subagent')).toBe('subagent')
     expect(bridgeTargetTool('dsh_send_message')).toBe('send_message')
-    // 排除:ptc 保留名;MCP 走 CLI 原生通道。
+    // 模型对 toolId 填写不稳定(实测会把展示名 Dsh-read / 变体 dsh-read 当
+    // toolId 传):统一归一化受理,减少"unknown delegate tool"重试。
+    expect(bridgeTargetTool('Dsh-read')).toBe('read')
+    expect(bridgeTargetTool('dsh-read')).toBe('read')
+    expect(bridgeTargetTool('read')).toBe('read')
+    // 排除:ptc 保留名;MCP 走 CLI 原生通道;空 id。
     expect(bridgeTargetTool('dsh_run_code')).toBeUndefined()
     expect(bridgeTargetTool('dsh_mcp__codegraph__explore')).toBeUndefined()
-    expect(bridgeTargetTool('read')).toBeUndefined()
-    expect(bridgeTargetTool(BRIDGE_TOOL_PREFIX)).toBeUndefined()
+    expect(bridgeTargetTool('')).toBeUndefined()
   })
 })
 
 describe('listDshBridgeTools:注册描述符', () => {
-  it('列出可见工具:前缀 id、唯一展示名、描述带 dsh 侧语义与"优先用"引导', () => {
+  it('列出可见工具:前缀 id、唯一展示名、描述=身份标记+原描述(不拼接桥侧说明)', () => {
     const { ctx } = makeBridgeCtx({
       schemas: [
         { name: 'read', description: 'Read a file.', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
@@ -80,7 +84,10 @@ describe('listDshBridgeTools:注册描述符', () => {
     const description = tools[0]!.description
     expect(description).toContain('[dsh-side tool: "read"]')
     expect(description).toContain('Read a file.')
-    expect(description).toContain('prefer this dsh-side tool')
+    // 工具说明保持 dsh 原文,不把桥接语义(优先用/执行位置)逐工具拼接——
+    // 那些引导只属于 prompt 尾注(DSH_DELEGATION_NOTE)。
+    expect(description).not.toContain('prefer this')
+    expect(description).toBe('[dsh-side tool: "read"] Read a file.')
     expect(tools[0]!.inputSchema).toEqual({ type: 'object', properties: { path: { type: 'string' } } })
   })
 
@@ -118,6 +125,18 @@ describe('listDshBridgeTools:注册描述符', () => {
     // 即便模型手滑拼出 dsh_cli_*,也不解析成工具调用。
     expect(bridgeTargetTool('dsh_cli_read')).toBeUndefined()
     expect(bridgeTargetTool('dsh_read')).toBe('read')
+  })
+
+  it('被镜像占名的 read_image 不桥接(CLI 原生 Read 读图 + dsh 图片卡片覆盖)', () => {
+    const { ctx } = makeBridgeCtx({
+      schemas: [
+        { name: 'read_image', description: 'Read an image.', parameters: { type: 'object', properties: {} } },
+        { name: 'read', description: 'Read a file.', parameters: { type: 'object', properties: {} } },
+      ],
+    })
+    const tools = listDshBridgeTools(ctx, { id: 'parent-1' } as never)
+    expect(tools.map(tool => tool.id)).toEqual(['dsh_read'])
+    expect(bridgeTargetTool('dsh_read_image')).toBeUndefined()
   })
 
   it('schemas 抛错或 tools 服务缺失 → 空列表(桥不拖垮注册)', () => {

@@ -230,6 +230,15 @@ export function failureOfError(error: unknown): CodebuddyFailure {
     })
     const failure = parseCodebuddyFailure(raw, error.code)
     if (failure !== undefined && failure.category !== 'unknown') return failure
+    // 带未知负数码的 RPC 错误(CLI 新增的配额/风控类码不在映射表)按不可重试
+    // 处理——兜底 retryable:true 会让配额类错误被反复重试(与纯文本路径
+    // 「unknown → 不可重试」的语义对齐)。负数码是 CLI 自定义错误段,
+    // 大多是终态业务失败;协议层(超时/进程退出)异常不带 AcpRpcError。
+    const message = error instanceof Error ? error.message : String(error)
+    if (typeof error.code === 'number' && error.code < 0) {
+      return { category: 'unknown', reason: '未知错误', retryable: false, detail: message, bizCode: error.code }
+    }
+    return { category: 'unknown', reason: '未知错误', retryable: true, detail: message }
   }
   // 无结构信息的异常(进程退出/请求超时/协议错误):按历史语义恢复续跑。
   const message = error instanceof Error ? error.message : String(error)

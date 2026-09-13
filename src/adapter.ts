@@ -27,6 +27,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { createHash } from 'node:crypto'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -36,10 +37,10 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { ConversationStore } from './conversations.js'
 import { conversationFilePath, messagesToRecords, uuidv7, writeConversationFile } from './native-session.js'
 import type { NativeRecord } from './native-session.js'
-import { buildPrompt, lastUserPrompt, resumeReplayPrompt } from './serialize.js'
+import { buildPrompt, lastUserPrompt, resumeReplayPrompt, systemInstructionsText } from './serialize.js'
 import { TodoListState } from './todo-bridge.js'
 import { AttachmentsSaveFace } from './tool-image.js'
-import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, usageOfUpdate } from './acp.js'
+import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, isProgressUpdate, usageOfUpdate } from './acp.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import type { CodebuddyFailure } from './failure.js'
@@ -47,6 +48,19 @@ import { TurnPump } from './pump.js'
 import { syncCliIntegrations } from './cli-integrations.js'
 import type { PumpHost } from './pump.js'
 import { listCodebuddyModelIdsAsync } from './models.js'
+
+/**
+ * dsh system prompt 的版本哈希(16 位十六进制)。
+ *
+ * dsh 默认**每个请求**都带当前 system prompt,其内容会随工具注册/设置/
+ * 工作区指令/技能目录等变化;CLI 侧是持久历史,所以按"首次随 seed 或首包
+ * 发送 + 内容变化时补发"实现等价语义(见 startTurn)。哈希记在续接记录里,
+ * 重启后不会重复灌已发过的版本。
+ */
+function systemHashOf(system: string | undefined): string | undefined {
+  if (system === undefined || system.trim().length === 0) return undefined
+  return createHash('sha256').update(system).digest('hex').slice(0, 16)
+}
 
 /** purpose 调用的隔离工作目录(懒建;一次性旁路会话不落进用户项目)。 */
 function purposeWorkDir(): string {
@@ -305,13 +319,11 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
 
     const model = options.model ?? this.options.modelOf()
     const cwd = childSession.header.cwd ?? process.cwd()
-    const isChild = childSession.header.parentSession !== undefined
-      || childSession.header.origin === 'subagent'
-    // 主代理轮不走 dsh 的 system prompt:它描述的是 CodeBuddy 调不到的 dsh
-    // 工具(全权驱动语义,见 README)。子代理/未知名会话保持原样。
-    const fullPromptOptions: GenerateOptions = !isChild
-      ? { ...options, system: undefined }
-      : options
+    // dsh 的 system prompt 对齐原生语义:主代理轮也要带(工具桥已齐,旧注释
+    // "它描述的是 CodeBuddy 调不到的工具"已失效)。带法见 systemHashOf:
+    // 新会话随 seed 首条记录进入 CLI 历史;已存在的会话在内容变化时补发一次。
+    const system = options.system
+    const systemHash = systemHashOf(system)
 
     const record = this.conversations.get(sessionId)
     let resume: { acpId: string } | undefined
@@ -331,6 +343,12 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       if (replay.skippedForwarded === true && record.sentCount !== undefined) return { kind: 'skip' }
       prompt = replay.prompt
       images = replay.images
+      // system prompt 变了(或这个会话还从未发过):整份补发一次,模型由此拿到
+      // 最新的 dsh 侧纪律(优先用 dsh_* 工具等)。
+      if (system !== undefined && system.trim().length > 0 && record.systemHash !== systemHash) {
+        const block = systemInstructionsText(system, record.systemHash !== undefined)
+        prompt = `${block}\n\n${prompt}`
+      }
       resume = { acpId: record.acpId }
     } else {
       // 新会话且带历史:把折叠后的历史转成 CodeBuddy 原生记录写成会话文件,
@@ -344,12 +362,12 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           prompt = last.prompt
           images = last.images
         } catch {
-          const built = await buildPrompt(this.ctx, fullPromptOptions)
+          const built = await buildPrompt(this.ctx, options)
           prompt = built.prompt
           images = built.images
         }
       } else {
-        const built = await buildPrompt(this.ctx, fullPromptOptions)
+        const built = await buildPrompt(this.ctx, options)
         prompt = built.prompt
         images = built.images
       }
@@ -375,14 +393,16 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       prompt,
       images,
       fallbackPrompt: async () => {
-        const built = await buildPrompt(this.ctx, fullPromptOptions)
+        const built = await buildPrompt(this.ctx, options)
         return { prompt: built.prompt, images: built.images }
       },
-      rememberConversation: (acpId, sentCount, lastSentMessageId) => {
+      ...(systemHash === undefined ? {} : { systemHash }),
+      rememberConversation: (acpId, sentCount, lastSentMessageId, hash) => {
         this.conversations.set(sessionId, {
           acpId,
           sentCount,
           ...(lastSentMessageId === undefined ? {} : { lastSentMessageId }),
+          ...(hash === undefined ? {} : { systemHash: hash }),
         })
       },
       forgetConversation: () => { this.conversations.delete(sessionId) },
@@ -435,6 +455,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
               readImage: ref => attachments.readImage(ref),
               ...this.options.nativeBaseDir === undefined ? {} : { blobsRoot: join(this.options.nativeBaseDir, '..', 'blobs') },
             },
+        // dsh 的 system prompt 作为首条记录进 CLI 历史(对齐 dsh 原生行为)。
+        options.system,
       )
       if (records.length === 0) return undefined
       return { sessionId, file: conversationFilePath(sessionId, cwd, this.options.nativeBaseDir), records }
@@ -502,14 +524,6 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     // 辅助调用(标题/压缩)在独立临时目录跑:一次性旁路会话不落进用户项目,
     // 避免 CodeBuddy 历史列表被标题小会话刷屏。
     const acpCwd = purposeCall ? purposeWorkDir() : cwd
-    const isChild = childSession?.header.parentSession !== undefined
-      || childSession?.header.origin === 'subagent'
-
-    // 主代理轮不走 dsh 的 system prompt(见 stream 路由注释)。
-    const fullPromptOptions: GenerateOptions = !isChild
-      ? { ...options, system: undefined }
-      : options
-
     let prompt: string
     let promptImages: Array<{ data: string; mimeType: string }> = []
     // 新会话且带历史:历史走原生会话文件(session/load)。
@@ -536,7 +550,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       prompt = last.prompt
       promptImages = last.images
     } else {
-      const built = await buildPrompt(this.ctx, fullPromptOptions)
+      const built = await buildPrompt(this.ctx, options)
       prompt = built.prompt
       promptImages = built.images
     }
@@ -709,7 +723,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       // 同步一次(dsh 的 MCP 配置 / skills → CLI 原生通道),保证最新。
       syncCliIntegrations({ projectCwd: cwd })
       const conn = new AcpConnection(
-        [command, ...prefixArgs, '--acp', '--model', model, ...effortArgs, '--dangerously-skip-permissions', ...this.options.extraArgs],
+        [command, ...prefixArgs, '--acp', '--model', model, ...effortArgs, '--dangerously-skip-permissions', ...cliToolPolicyArgs(), ...this.options.extraArgs],
         cwd,
         onUpdate,
       )
@@ -747,7 +761,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           } catch {
             // CodeBuddy 侧会话存储丢失:回退新会话 + 完整历史重发。
             this.conversations.delete(dshSessionId)
-            const full = await buildPrompt(this.ctx, fullPromptOptions)
+            const full = await buildPrompt(this.ctx, options)
             prompt = full.prompt
             promptImages = full.images
             const created = await conn.request<{ sessionId: string }>('session/new', { cwd: acpCwd, mcpServers: [] }, to.firstMs)
@@ -761,7 +775,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             acpSessionId = nativeSeed.sessionId
           } catch {
             // 合成文件未被接受(未来版本变更等):退回新会话 + 全量提示词。
-            const full = await buildPrompt(this.ctx, fullPromptOptions)
+            const full = await buildPrompt(this.ctx, options)
             prompt = full.prompt
             promptImages = full.images
             const created = await conn.request<{ sessionId: string }>('session/new', { cwd: acpCwd, mcpServers: [] }, to.firstMs)

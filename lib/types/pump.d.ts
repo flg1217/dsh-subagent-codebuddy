@@ -76,7 +76,12 @@ export interface PumpHost {
         }>;
     }>;
     /** 会话登记(续接锚点:sentCount = 本次发送时 dsh 消息总数;lastMessageId = 本次覆盖到的最后一条消息)。 */
-    rememberConversation: (acpId: string, sentCount: number, lastMessageId?: string) => void;
+    rememberConversation: (acpId: string, sentCount: number, lastMessageId?: string, systemHash?: string) => void;
+    /**
+     * 本次回合 dsh system prompt 的版本哈希(随续接记录落盘):记录"CLI 已见过
+     * 哪一版 system prompt",内容变化时适配器才补发(见 adapter.systemHashOf)。
+     */
+    systemHash?: string;
     /** 本次发送覆盖到的最后一条消息 id(补发主锚,写回续接记录)。 */
     sentLastMessageId?: string;
     /** 登记失效(CodeBuddy 侧会话丢失)。 */
@@ -144,6 +149,12 @@ export declare class TurnPump {
     private readonly usageGraceMs;
     private readonly stepState;
     private attempts;
+    /**
+     * 尝试代次令牌:restart 立即使其失效(与 attempts 不同——attempts 要等
+     * 下一次 runAttempt 才 +1,而旧连接的挂起请求会在 restart 之后立刻迟到
+     * reject,那段时间里用 attempts 比对拦不住)。
+     */
+    private attemptToken;
     /** 段队列:进行中/已完成的模型调用段(attach 顺序消费)。 */
     private segments;
     private readonly calls;
@@ -174,6 +185,8 @@ export declare class TurnPump {
     private lastUpdateAt;
     private lastContentAt;
     private tailStartAt;
+    /** 疑似卡住诊断的下次打印时刻(节流;0 = 无待打印)。 */
+    private nextDiagAt;
     private tailDeadline;
     /** CLI 报"空闲"相位的时间(agentPhase=idle);undefined = 本轮未报过。 */
     private lastIdlePhaseAt;
@@ -255,6 +268,11 @@ export declare class TurnPump {
     private closeSegment;
     /** 心跳:steer 轮询 → 看门狗 → 收段判定 → tail 收尾。 */
     private tick;
+    /**
+     * 疑似卡住时的现场诊断:真实活动静默 >20s 且回合未收尾时,每 30s 打一行
+     * 完整状态到日志——"跑完仍显示进行中"类问题据此一眼定位(卡在哪个条件)。
+     */
+    private diagStuck;
     /** 收段判定:工具边界。 */
     private checkSegmentBoundary;
     /** tail 窗口:prompt 干净收尾后继续抽流(后台任务会自发续跑)。 */

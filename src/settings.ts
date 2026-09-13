@@ -11,6 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { listCodebuddyModelIds } from './models.js'
 import type { Config } from './index.js'
@@ -84,7 +85,11 @@ export function codebuddyInstalled(command: string, prefixArgs: string[]): boole
  * 会话记录(说明完成过登录与使用)。会话可能过期,以"测试"按钮结果为准。
  */
 export function codebuddyLoggedIn(): boolean {
-  const base = join(process.env.USERPROFILE ?? '', '.codebuddy')
+  // USERPROFILE 缺失时(homedir 才是跨平台可靠来源)不能拼出相对路径 ".codebuddy"。
+  const home = process.env.USERPROFILE && process.env.USERPROFILE.length > 0
+    ? process.env.USERPROFILE
+    : homedir()
+  const base = join(home, '.codebuddy')
   if (!existsSync(base)) return false
   const sessions = join(base, 'sessions')
   if (existsSync(sessions)) {
@@ -158,9 +163,12 @@ export function registerCodebuddySettings(
   })
   const sectionOf = (): EffectiveCodebuddySettings => {
     const s = current() as Partial<EffectiveCodebuddySettings>
+    // 空串与 undefined 同义:设置面板清空字段时不能让 '' 覆盖兜底值(spawn ENOENT)。
+    const filled = (value: unknown): string | undefined =>
+      typeof value === 'string' && value.trim().length > 0 ? value : undefined
     return {
-      command: s.command ?? config.command ?? 'codebuddy',
-      model: s.model ?? config.model ?? 'deepseek-v4-flash',
+      command: filled(s.command) ?? filled(config.command) ?? 'codebuddy',
+      model: filled(s.model) ?? filled(config.model) ?? 'deepseek-v4-flash',
       permissionMode: s.permissionMode ?? config.permissionMode ?? 'bypassPermissions',
       registerSubagentTools: s.registerSubagentTools ?? config.registerSubagentTools ?? false,
     }

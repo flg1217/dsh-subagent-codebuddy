@@ -56,6 +56,17 @@ const BRIDGE_EXCLUDED = new Set(['run_code'])
 /** MCP 工具名前缀(dsh 与 CLI 同名约定)。 */
 const MCP_TOOL_PREFIX = 'mcp__'
 
+/**
+ * 被 CLI 镜像工具占用的 dsh 工具名:不桥接、不受理。
+ *
+ * `read_image`:CLI 原生 Read 读图时,泵把这次调用以镜像工具 `read_image` 记进
+ * dsh 会话——**名字必须与真工具一致**:dsh Web UI 的图片卡片按
+ * `call.name === 'read_image'` 才出预览(image-card-model 硬编码),改名就退化成
+ * 普通文本行(实测)。真工具因此被镜像遮蔽,桥便不再暴露 `dsh_read_image`
+ * (调了也会打到镜像上):CLI 自带 Read 读图已覆盖该能力,且结果同样进 dsh。
+ */
+const BRIDGE_MIRROR_OWNED = new Set(['read_image'])
+
 /** dsh 工具 schema(桥只需要这三个字段)。 */
 interface DshToolSchemaFace {
   readonly name: string
@@ -75,13 +86,27 @@ export function bridgeToolId(name: string): string {
   return `${BRIDGE_TOOL_PREFIX}${name}`
 }
 
+/**
+ * 模型填写的 toolId 规范化为 dsh 原名。
+ *
+ * 模型对 DelegateTool 的 toolId 填写不稳定(实测:会把展示名 `Dsh-bash`
+ * 当 toolId 传,也出现 `dsh-bash` 这类连字符变体)——统一剥前缀
+ * (dsh_ / Dsh- / dsh-)、连字符归一为下划线、小写化(dsh 工具原名全小写,
+ * 无损)。解析不出的原样返回,由调用方给 unknown 错误。
+ */
+function canonicalBridgeName(toolId: string): string {
+  const raw = toolId.replace(/^(?:dsh_|Dsh-|dsh-)/, '')
+  return raw.replace(/-/g, '_').toLowerCase()
+}
+
 /** 桥工具 id → dsh 工具名;非桥命名、ptc 保留名、MCP 或 CLI 镜像名时返回 undefined。 */
 export function bridgeTargetTool(toolId: string): string | undefined {
-  if (!toolId.startsWith(BRIDGE_TOOL_PREFIX)) return undefined
-  const name = toolId.slice(BRIDGE_TOOL_PREFIX.length)
+  const name = canonicalBridgeName(toolId)
   if (name.length === 0 || BRIDGE_EXCLUDED.has(name) || name.startsWith(MCP_TOOL_PREFIX)) return undefined
   // CLI 镜像代理不暴露、也不受理(它只在会话 scope 里承接 CLI 原生调用)。
   if (name.startsWith(CLI_MIRROR_TOOL_PREFIX)) return undefined
+  // 被镜像占名的 dsh 工具:调了只会打到镜像上,不认。
+  if (BRIDGE_MIRROR_OWNED.has(name)) return undefined
   return name
 }
 
@@ -90,15 +115,12 @@ function bridgeToolName(name: string): string {
   return `Dsh-${name.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 60)}`
 }
 
-/** 桥工具描述:原描述 + dsh 侧执行语义与"优先用"引导。 */
+/** 桥工具描述:原描述原样保留,只加最短身份标记(桥语义引导在 prompt 尾注,不逐工具拼说明)。 */
 function bridgeDescription(name: string, original: string): string {
   const head = original.trim().length > 0
     ? `${original.trim()}`
     : `(the dsh-side tool "${name}")`
   return `[dsh-side tool: "${name}"] ${head}`
-    + ' — It runs on the dsh side of the harness: the execution is visible in the dsh session,'
-    + ' subject to the session\'s sandbox and approval policy, and logged in the conversation.'
-    + ' When a CLI built-in tool could do the same job, prefer this dsh-side tool: CLI built-in results never reach dsh.'
 }
 
 /**
@@ -126,6 +148,8 @@ export function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpe
     if (schema.name.startsWith(MCP_TOOL_PREFIX)) continue
     // CLI 镜像代理不是真工具,别暴露给 CLI(它的 schema/描述对模型是噪音)。
     if (schema.name.startsWith(CLI_MIRROR_TOOL_PREFIX)) continue
+    // 被镜像占名的工具不桥接(见 BRIDGE_MIRROR_OWNED)。
+    if (BRIDGE_MIRROR_OWNED.has(schema.name)) continue
     const base = bridgeDescription(schema.name, typeof schema.description === 'string' ? schema.description : '')
     specs.push({
       id: bridgeToolId(schema.name),

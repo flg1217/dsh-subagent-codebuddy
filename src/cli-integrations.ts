@@ -69,6 +69,8 @@ export function parseMcpClientRows(text: string): McpRow[] {
   let current: { isMcpClient: boolean; config: Record<string, string | string[]> } | undefined
   let inConfig = false
   let configIndent = 0
+  /** config 内最近一个"空值键":其后的 `- item` 行并进这个键的数组。 */
+  let arrayKey: string | undefined
   const flush = (): void => {
     if (current?.isMcpClient === true) {
       const serverName = current.config['serverName']
@@ -78,26 +80,49 @@ export function parseMcpClientRows(text: string): McpRow[] {
     }
     current = undefined
     inConfig = false
+    arrayKey = undefined
   }
   for (const line of text.split(/\r?\n/)) {
     const indent = line.length - line.trimStart().length
     const trimmed = line.trim()
     if (trimmed.length === 0 || trimmed.startsWith('#')) continue
-    // 新的列表项(`- id: ...`)开启一个块。
+    // config 块内(缩进更深):键与块式数组项都从这里解析——不能把 `- item`
+    // 误判为"新列表项"而提前 flush,否则块式写的 args 被整段截断丢弃
+    // (实测坑:args 换行写 `- '-y'` 时会开伪块,args 静默丢失)。
+    if (current !== undefined && inConfig && indent > configIndent) {
+      if (trimmed.startsWith('- ')) {
+        if (arrayKey !== undefined) {
+          const item = parseYamlValue(trimmed.slice(2).trim())
+          if (typeof item === 'string') {
+            const prev = current.config[arrayKey]
+            const list = Array.isArray(prev) ? prev : []
+            list.push(item)
+            current.config[arrayKey] = list
+          }
+        }
+        continue
+      }
+      const nested = /^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/.exec(trimmed)
+      if (nested !== null) {
+        const value = parseYamlValue(nested[2]!)
+        if (value !== undefined) {
+          current.config[nested[1]!] = value
+          arrayKey = undefined
+        } else {
+          // 空值键:先占位空数组,后续块式 `- item` 行并进来。
+          arrayKey = nested[1]!
+          current.config[arrayKey] = []
+        }
+      }
+      continue
+    }
+    // 新的列表项(`- id: ...`)开启一个块(仅 config 外的顶层项)。
     if (trimmed.startsWith('- ')) {
       flush()
       current = { isMcpClient: false, config: {} }
       continue
     }
     if (current === undefined) continue
-    if (inConfig && indent > configIndent) {
-      const match = /^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/.exec(trimmed)
-      if (match !== null) {
-        const value = parseYamlValue(match[2]!)
-        if (value !== undefined) current.config[match[1]!] = value
-      }
-      continue
-    }
     // 块级键(name / config)。
     inConfig = false
     const match = /^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/.exec(trimmed)
@@ -197,7 +222,9 @@ export function syncMcpToCodebuddy(profilesRoot?: string, targetFile?: string): 
   doc['mcpServers'] = mcpServers
   if (changed) {
     mkdirSync(dirname(target), { recursive: true })
-    const tmp = `${target}.tmp`
+    // tmp 名带 pid:固定 `${target}.tmp` 在两个进程并发同步时互相覆写
+    // (Windows 下对方持有写句柄还会让 renameSync 报 EPERM 丢写入)。
+    const tmp = `${target}.${process.pid}.tmp`
     writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`)
     renameSync(tmp, target)
   }

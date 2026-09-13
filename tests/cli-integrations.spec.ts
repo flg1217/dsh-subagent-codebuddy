@@ -73,6 +73,32 @@ describe('parseMcpClientRows:profile 配置解析', () => {
 `)
     expect(rows).toEqual([])
   })
+
+  it('块式写的 args(换行 `- item`)完整解析,不误开新块', () => {
+    // 回归:此前 `- ` 行无条件开新块,块式数组会把 args 整段截断丢弃。
+    const rows = parseMcpClientRows(`
+    - id: mcp-block
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: blocky
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - '@upstash/context7-mcp'
+          - '--api-key'
+
+    - id: mcp-after
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: next-one
+        command: x
+`)
+    expect(rows.map(row => row.serverName)).toEqual(['blocky', 'next-one'])
+    expect(rows[0]!.config['args']).toEqual(['-y', '@upstash/context7-mcp', '--api-key'])
+    // 块式数组之后必须能正常开启下一个块。
+    expect(rows[1]!.config['command']).toBe('x')
+  })
 })
 
 describe('syncMcpToCodebuddy:合并写入 mcp.json', () => {

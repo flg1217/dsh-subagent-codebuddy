@@ -21,6 +21,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { writeImageBlob } from './image-blob.js'
+import { systemInstructionsText } from './serialize.js'
 
 /** 一条 CodeBuddy 原生记录(宽松结构,字段与 CLI 写出的一致)。 */
 export type NativeRecord = Record<string, unknown> & { type: string; id: string }
@@ -98,6 +99,7 @@ export async function messagesToRecords(
   messages: readonly Message[],
   context: NativeSessionContext,
   images?: NativeSessionImages,
+  system?: string,
 ): Promise<NativeRecord[]> {
   const records: NativeRecord[] = []
   const toolNames = new Map<string, string>()
@@ -117,6 +119,20 @@ export async function messagesToRecords(
     const full = { id: uuidv7(), ...record } as NativeRecord
     records.push(full)
     parentId = full.id
+  }
+
+  // dsh 的 system prompt 作为**首条记录**进原生历史:CLI 的对话是持久历史,
+  // 放开头等价于 dsh 每个请求都带当前 system(见 adapter 的哈希补发)。
+  if (system !== undefined && system.trim().length > 0) {
+    push({
+      timestamp: stamp(),
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: systemInstructionsText(system) }],
+      __codebuddyLocal: { sensitiveUserInputReviewed: true },
+      providerData: { agent: 'cli' },
+      ...base(),
+    })
   }
 
   for (const message of messages) {
@@ -179,7 +195,9 @@ export async function messagesToRecords(
           type: 'function_call_result',
           name: toolNames.get(callId) ?? 'tool',
           callId,
-          status: 'completed',
+          // 错误结果必须保留失败标记:seed 成 completed 会让 CLI 载入的历史
+          // 里失败调用看起来成功,模型据此继续推理。
+          status: block.isError === true ? 'failed' : 'completed',
           output: { type: 'text', text: resultParts.join('') },
           providerData: { agent: 'cli' },
           ...base(),

@@ -315,4 +315,44 @@ describe('registerCompactDelegation:自动压缩委托', () => {
     expect(result).toEqual({ handled: false })
     expect(next).toHaveBeenCalledTimes(1)
   }, 15_000)
+
+  it('agent 带 runMaintenance → 转发在 maintenance 相位内执行(与手动 /compact 同语义)', async () => {
+    // TOCTOU 防护:busy 检查通过后若用户消息开了新回合,该轮请求会与压缩
+    // 并发写同一 CLI 会话把结果盖掉——必须进 maintenance 让消息排队。
+    const { prompts } = mockCompactCli()
+    const deps = makeDeps()
+    deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
+    const watcher = makeWatcher()
+    registerCompactDelegation({ ...deps, ctx: watcher.ctx })
+    let maintenanceUsed = false
+    const agent = {
+      session: { id: 's-1', header: { cwd: process.cwd() } },
+      runMaintenance: async <T>(job: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+        maintenanceUsed = true
+        return await job(new AbortController().signal)
+      },
+    }
+    const next = vi.fn().mockResolvedValue({ handled: false })
+    const result = await watcher.fire({ agent, signal: new AbortController().signal }, next)
+    expect(maintenanceUsed).toBe(true)
+    expect(result).toEqual({ handled: true })
+    expect(prompts).toEqual(['/compact'])
+    expect(next).not.toHaveBeenCalled()
+  }, 15_000)
+
+  it('agent 忙(runMaintenance 抛错)→ 回落 next,不阻塞对话', async () => {
+    mockCompactCli()
+    const deps = makeDeps()
+    deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
+    const watcher = makeWatcher()
+    registerCompactDelegation({ ...deps, ctx: watcher.ctx })
+    const agent = {
+      session: { id: 's-1', header: { cwd: process.cwd() } },
+      runMaintenance: async (): Promise<never> => { throw new Error('busy: turn in progress') },
+    }
+    const next = vi.fn().mockResolvedValue({ handled: false })
+    const result = await watcher.fire({ agent, signal: new AbortController().signal }, next)
+    expect(result).toEqual({ handled: false })
+    expect(next).toHaveBeenCalledTimes(1)
+  }, 15_000)
 })

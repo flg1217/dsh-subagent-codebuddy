@@ -17,6 +17,12 @@ export interface ConversationRecord {
      * 不可靠,切模型再切回时会漏掉期间上下文)。
      */
     lastSentMessageId?: string;
+    /**
+     * 已发送给 CLI 的 dsh system prompt 哈希(见 adapter 的 systemHash)。
+     * dsh 默认每个请求都带当前 system;CLI 侧是持久历史,所以按"首次随 seed/
+     * 首包发送 + 内容变化时补发"实现,这里记录已发版本。
+     */
+    systemHash?: string;
     /** 最后使用时间(逐出排序用)。 */
     at: number;
 }
@@ -36,6 +42,7 @@ export declare class ConversationStore {
         acpId: string;
         sentCount: number;
         lastSentMessageId?: string;
+        systemHash?: string;
     }): void;
     /** 删除会话记录(如 CodeBuddy 侧会话丢失时)。 */
     delete(sessionId: string): void;

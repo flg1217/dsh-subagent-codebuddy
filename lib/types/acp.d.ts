@@ -27,6 +27,20 @@ export declare const DEFAULT_ACP_RUN_TIMEOUTS: {
     tailBgQuietMs: number;
     tailCapMs: number;
 };
+/**
+ * 禁用的 CodeBuddy 原生工具名单(spawn 时以 `--disallowedTools` 传入)。
+ *
+ * CodeBuddy CLI 的内置提示词极强,仅靠尾注/system 块"劝"模型优先用 dsh_*
+ * 桥接工具,实测模型仍大面积直调原生工具(会话 01a093c7 全程 Bash×733 /
+ * Edit×366,而 dsh_bash 仅×47)——原生调用的结果不进 dsh:无审批/沙箱、
+ * 无会话树审计、后台任务不进面板且完成不唤醒回合。
+ * 名单 = dsh 侧有完整对等工具且桥接链路为纯文本的项;**Read 必须保留**:
+ * 读图片只能走 CLI 原生 Read(结果镜像为 read_image 卡片;桥接回传
+ * blocksToText 会丢图片块)。
+ */
+export declare const CLI_DISALLOWED_TOOLS: readonly ["Bash", "PowerShell", "Edit", "Write", "NotebookEdit", "Glob", "Grep"];
+/** spawn 参数:禁用原生同类工具,让模型直接看见 dsh_* 桥接工具并使用它。 */
+export declare function cliToolPolicyArgs(): string[];
 /** 动态空闲超时预算(测试注入小值压缩时间)。 */
 export interface AcpTimeouts {
     firstMs?: number;

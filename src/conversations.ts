@@ -22,6 +22,12 @@ export interface ConversationRecord {
    * 不可靠,切模型再切回时会漏掉期间上下文)。
    */
   lastSentMessageId?: string
+  /**
+   * 已发送给 CLI 的 dsh system prompt 哈希(见 adapter 的 systemHash)。
+   * dsh 默认每个请求都带当前 system;CLI 侧是持久历史,所以按"首次随 seed/
+   * 首包发送 + 内容变化时补发"实现,这里记录已发版本。
+   */
+  systemHash?: string
   /** 最后使用时间(逐出排序用)。 */
   at: number
 }
@@ -54,7 +60,10 @@ export class ConversationStore {
   }
 
   /** 写入/更新续接记录(自动落盘)。 */
-  set(sessionId: string, record: { acpId: string; sentCount: number; lastSentMessageId?: string }): void {
+  set(
+    sessionId: string,
+    record: { acpId: string; sentCount: number; lastSentMessageId?: string; systemHash?: string },
+  ): void {
     this.map.set(sessionId, { ...record, at: Date.now() })
     while (this.map.size > MAX_CONVERSATIONS) {
       let oldestKey: string | undefined
@@ -89,6 +98,10 @@ export class ConversationStore {
           // 数量锚越界,切换模型期间的上下文会被静默丢弃。
           ...(typeof value.lastSentMessageId === 'string' && value.lastSentMessageId.length > 0
             ? { lastSentMessageId: value.lastSentMessageId }
+            : {}),
+          // system 哈希随盘恢复:重启后不会把已发过的 system prompt 再灌一遍。
+          ...(typeof value.systemHash === 'string' && value.systemHash.length > 0
+            ? { systemHash: value.systemHash }
             : {}),
           at: Number.isSafeInteger(value.at) ? (value.at as number) : 0,
         })

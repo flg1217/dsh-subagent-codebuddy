@@ -32,7 +32,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
-import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, isProgressUpdate, toolNameOf, usageOfUpdate } from './acp.js'
+import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, isProgressUpdate, toolNameOf, usageOfUpdate } from './acp.js'
 import type { AcpClientRequest, AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { agentIdFromOutput, SubagentMirror } from './mirror.js'
 import { foldPendingInsertions } from './inbox.js'
@@ -118,7 +118,12 @@ export interface PumpHost {
   /** load 失败时回退:完整历史重发的提示词。 */
   fallbackPrompt: () => Promise<{ prompt: string; images: Array<{ data: string; mimeType: string }> }>
   /** 会话登记(续接锚点:sentCount = 本次发送时 dsh 消息总数;lastMessageId = 本次覆盖到的最后一条消息)。 */
-  rememberConversation: (acpId: string, sentCount: number, lastMessageId?: string) => void
+  rememberConversation: (acpId: string, sentCount: number, lastMessageId?: string, systemHash?: string) => void
+  /**
+   * 本次回合 dsh system prompt 的版本哈希(随续接记录落盘):记录"CLI 已见过
+   * 哪一版 system prompt",内容变化时适配器才补发(见 adapter.systemHashOf)。
+   */
+  systemHash?: string
   /** 本次发送覆盖到的最后一条消息 id(补发主锚,写回续接记录)。 */
   sentLastMessageId?: string
   /** 登记失效(CodeBuddy 侧会话丢失)。 */
@@ -184,9 +189,10 @@ export const DSH_DELEGATION_NOTE = [
   '[dsh 运行环境]',
   '本次调用由 dsh 框架发起:你(CodeBuddy)作为 dsh 的模型后端运行。',
   '本会话的全部 dsh 工具都以 DelegateTool 的 toolId="dsh_<原工具名>" 注册(常见:dsh_bash、dsh_subagent、dsh_read、dsh_grep)——它们在 dsh 侧执行(受沙箱/审批约束、进会话日志与审计):',
-  '- 知道工具名就直接用 dsh_<原工具名> 调用;绝不要发空的 DelegateTool 调用(delegate_tool {})来"枚举工具"——它会挂起整个回合且不会有任何返回。不确定某个工具是否存在时,直接按原工具名加 dsh_ 前缀试即可。',
-  '- 优先用 dsh_* 工具,不要用 CLI 自带的同类工具——CLI 内置工具的结果不进 dsh。',
-  '- 长命令(构建/测试/对战模拟/服务等可能跑几分钟的):dsh_bash 必须带 run_in_background:true——任务进侧栏"后台任务",完成时会自动通知并唤醒你继续。绝不要用 CLI 自己的后台方式(bash 的 run_in_background、docker exec -d、自写轮询脚本):它们不进 dsh——面板不显示、完成收不到,回合结束后对话显示"已完成"而任务还在跑,用户只能来催你。',
+  '- toolId 必须用小写下划线原名:dsh_bash ✓、Dsh-bash ✗、dsh-bash ✗。绝不要发空的 DelegateTool 调用(delegate_tool {})来"枚举工具"——它会挂起整个回合且不会有任何返回。不确定某个工具是否存在时,直接按原工具名加 dsh_ 前缀试即可。',
+  '- JSON 参数转义:要在文件里写字面反斜杠+n(如 Python 的 print("\\n"))时,JSON 参数必须写 \\\\n(双反斜杠);写单 \\\\n 会按 JSON 标准解析成真实换行——这是 JSON 语义不是工具的错。含大量转义的文件优先用 dsh_write 的 content 配 chr(10)/拼接构造,或分段小步写入。',
+  '- DelegateTool 前台执行 30 秒超时:可能超过 20 秒的命令(构建/测试/对战模拟/服务等)一律 dsh_bash + run_in_background:true——任务进侧栏"后台任务",完成时自动通知并唤醒你继续;前台只跑秒级命令。绝不要用 docker exec -d、自写轮询脚本等外部后台方式:它们不进 dsh——面板不显示、完成收不到,回合结束后对话显示"已完成"而任务还在跑,用户只能来催你。',
+  '- Bash/PowerShell/Edit/Write/Glob/Grep 等 CLI 原生工具已被禁用(调用会被拒绝):同类能力一律直接用 dsh_<原工具名>;Read 仍可用——读图片必须走 Read。不要换方式绕过禁用(例如用 PowerShell 顶替 Bash、用自写脚本顶替被禁工具)。',
   '- 沙箱拒绝不绕行:dsh_bash 报 [sandbox: file access denied ...] 时,不要改用 CLI 自带工具执行同一命令绕过沙箱;按工具描述用 sandbox_permissions + justification 走提权审批(审批弹窗即用户同意);被拒或会话禁用审批时即为最终结果,不要换路重试。',
   '- 委派子任务:先 dsh_list_subagent_models 查可用路由,再用 dsh_subagent 委派(默认后台;结算通知会唤醒你);继续同一子代理用 dsh_send_message(input.childId)。不要用 CLI 自带的 agent/Task 工具。',
   '- 你的回合结束后不会自动恢复:不要承诺"等 X 完成后我再汇报/继续"——只有走 dsh 通道的任务会在完成时唤醒你;确实必须用外部方式时,请在回复里如实告诉用户"跑完后需要你叫我一声"。',
@@ -219,6 +225,12 @@ export class TurnPump {
   private readonly stepState: PumpStepState
 
   private attempts = 0
+  /**
+   * 尝试代次令牌:restart 立即使其失效(与 attempts 不同——attempts 要等
+   * 下一次 runAttempt 才 +1,而旧连接的挂起请求会在 restart 之后立刻迟到
+   * reject,那段时间里用 attempts 比对拦不住)。
+   */
+  private attemptToken = 0
   /** 段队列:进行中/已完成的模型调用段(attach 顺序消费)。 */
   private segments: Segment[] = []
   private readonly calls = new Map<string, CallState>()
@@ -251,6 +263,8 @@ export class TurnPump {
   private lastUpdateAt = Date.now()
   private lastContentAt = 0
   private tailStartAt: number | undefined
+  /** 疑似卡住诊断的下次打印时刻(节流;0 = 无待打印)。 */
+  private nextDiagAt = 0
   private tailDeadline: number | undefined
   /** CLI 报"空闲"相位的时间(agentPhase=idle);undefined = 本轮未报过。 */
   private lastIdlePhaseAt: number | undefined
@@ -395,6 +409,7 @@ export class TurnPump {
       this.deps.model,
       ...this.deps.reasoningEffort === undefined ? [] : ['--effort', this.deps.reasoningEffort],
       '--dangerously-skip-permissions',
+      ...cliToolPolicyArgs(),
       ...this.deps.extraArgs,
     ]
     // CLI 进程将在启动时读取 ~/.codebuddy/mcp.json 与 skills 目录:每次
@@ -439,23 +454,50 @@ export class TurnPump {
         const created = await conn.request<{ sessionId: string }>('session/new', { cwd: this.deps.acpCwd, mcpServers: [] }, this.to.firstMs)
         this.acpSessionId = created.sessionId
       }
-      this.deps.rememberConversation(this.acpSessionId, this.deps.sentCount, this.deps.sentLastMessageId)
+      this.deps.rememberConversation(
+        this.acpSessionId,
+        this.deps.sentCount,
+        this.deps.sentLastMessageId,
+        this.deps.systemHash,
+      )
       // 统一委托面:当前会话可见的全部 dsh 工具以 `dsh_<原名>` 注册为
       // CodeBuddy 的 delegate tools(含 bash/subagent——原生本就是后台任务
       // 与可续用子代理);调用经 dsh 官方工具管线执行(审批/沙箱/事件一致)。
       // MCP 工具走 CLI 原生 MCP 通道、Skill 走 CLI 的 skill 目录,都不在此列。
-      // 分批注册:数量上限未知,单批失败不影响其余批次与会话基本功能。
+      // 分批注册(数量上限未知)。**必须等全部批次确认完成再发 prompt**:
+      // 注册与 prompt 并发时,CLI 忙于回放大历史会晚处理注册,模型首轮工具
+      // 列表就缺 dsh_*(实测:调 dsh_bash 报 "Tool 'dsh_bash' not found",
+      // 间歇性、哪批丢看时序——正是"部分工具掉线"的形态)。失败重试一轮,
+      // 仍有失败则 failRun 交上层重启回合:没有桥工具的回合是废回合。
       const parentAgent = this.deps.ctx.get('agents')?.get(this.deps.dshSessionId as SessionId)
       const bridgeTools = parentAgent === undefined
         ? []
         : listDshBridgeTools(this.deps.ctx, parentAgent)
+      // 诊断:名单与注册结果落 dsh-start.log——"某桥工具 not found"时第一时间
+      // 区分"名单就没生成它"(dsh 侧 schemas 缺失)还是"CLI 侧注册丢失"。
+      console.error(`[codebuddy-bridge] session=${this.deps.dshSessionId} announce ${bridgeTools.length}: ${bridgeTools.map(tool => tool.id).join(',') || '(none)'}`)
       const BRIDGE_BATCH = 20
+      let failedBatches: typeof bridgeTools[] = []
       for (let offset = 0; offset < bridgeTools.length; offset += BRIDGE_BATCH) {
-        void announceDelegateTools(
-          (method, params) => conn.request(method, params, this.to.firstMs),
-          this.acpSessionId,
-          bridgeTools.slice(offset, offset + BRIDGE_BATCH),
-        ).catch(() => { /* 该批注册失败:其余批次仍在 */ })
+        failedBatches.push(bridgeTools.slice(offset, offset + BRIDGE_BATCH))
+      }
+      for (let round = 0; round < 2 && failedBatches.length > 0; round += 1) {
+        const pending = failedBatches
+        failedBatches = []
+        for (const batch of pending) {
+          try {
+            await announceDelegateTools(
+              (method, params) => conn.request(method, params, this.to.firstMs),
+              this.acpSessionId,
+              batch,
+            )
+          } catch {
+            failedBatches.push(batch)
+          }
+        }
+      }
+      if (failedBatches.length > 0) {
+        throw new Error(`CodeBuddy delegate 工具注册失败(${failedBatches.length}/${Math.ceil(bridgeTools.length / BRIDGE_BATCH)} 批):模型将无法调用 dsh 工具,需重启回合重试`)
       }
       this.capturing = false
       this.sendPrompt(this.deps.prompt, this.deps.images)
@@ -471,6 +513,10 @@ export class TurnPump {
     if (conn === undefined) return
     this.inFlight += 1
     this.promptSettled = false
+    // 捕获本次尝试代次:restart 会立即令其失效——旧连接的挂起请求在 kill 后
+    // 异步迟到 reject,不设防会把旧请求的错误写进新 attempt 的 promptError,
+    // 重试刚发车就被判失败。
+    const token = this.attemptToken
     void conn.request<AcpPromptResult>(
       'session/prompt',
       {
@@ -483,6 +529,7 @@ export class TurnPump {
       0,
     ).then(
       value => {
+        if (this.attemptToken !== token) return
         this.stopReason = value.stopReason
         // 失败详情优先取顶层 errorMessage;refusal 场景只有
         // `_meta["codebuddy.ai/errorMessage"]`(JSON:code/category/statusCode/
@@ -498,10 +545,12 @@ export class TurnPump {
         }
       },
       error => {
+        if (this.attemptToken !== token) return
         this.promptError = error instanceof Error ? error : new Error(String(error))
       },
     ).finally(() => {
       this.inFlight -= 1
+      if (this.attemptToken !== token) return
       if (this.promptError === undefined && this.promptFailure === undefined) this.promptSettled = true
       this.wakeAll()
     })
@@ -546,6 +595,8 @@ export class TurnPump {
   private restart(): void {
     this.disposeProcess()
     this.capturing = true
+    // 立即作废旧连接的全部在途回调(迟到 reject 不得污染新 attempt)。
+    this.attemptToken += 1
     // 已登记的 CodeBuddy 会话继续复用之(避免重试丢历史)。
     if (this.acpSessionId !== '') this.deps.resume = { acpId: this.acpSessionId }
     this.acpSessionId = ''
@@ -555,6 +606,25 @@ export class TurnPump {
     this.lastProgressAt = Date.now()
     this.segments = []
     this.backgroundLaunched = false
+    this.calls.clear()
+    // attempt 级判定状态必须整体复位:新 attempt 发 prompt 前,旧的 settled/
+    // 相位/尾巴时间戳会让 checkTail 走「正常尾巴」或「静默失败」路径——零产出
+    // 首段恰好命中 failRun(段为空 + promptSettled 旧值),重试刚发车即被判死。
+    this.promptSettled = false
+    this.stopReason = undefined
+    this.agentPhaseSeen = false
+    this.sessionEnded = false
+    this.lastIdlePhaseAt = undefined
+    this.lastContentAt = 0
+    this.lastToolExecutingAt = 0
+    this.lastUpdateAt = Date.now()
+    this.tailStartAt = undefined
+    this.tailDeadline = undefined
+    this.nextDiagAt = 0
+    this.boundarySeenAt = 0
+    this.usageGraceUntil = 0
+    this.toolExecutingSeen = false
+    this.firstResultSeen = false
     const timer = setTimeout(() => { void this.runAttempt() }, this.retryDelayMs)
     timer.unref?.()
     this.wakeAll()
@@ -611,12 +681,19 @@ export class TurnPump {
     // 已中止的调用方不再登记等待者:否则要等回合收尾的兜底才失败。
     if (call.outcome === undefined && signal?.aborted === true) throw new Error('tool call aborted')
     const outcome = call.outcome ?? await new Promise<ToolOutcome>((resolve, reject) => {
-      call.waiting.push({ resolve, reject })
-      signal?.addEventListener('abort', () => {
-        const index = call.waiting.findIndex(waiter => waiter.resolve === resolve)
+      const waiter: CallState['waiting'][number] = {
+        // 包装 resolve:结果到达(或失败)时同步摘掉 abort 监听器——信号是
+        // 回合级的,裸注册会随每次工具调用在信号上累积监听器直到 abort。
+        resolve: value => { signal?.removeEventListener('abort', onAbort); resolve(value) },
+        reject: error => { signal?.removeEventListener('abort', onAbort); reject(error) },
+      }
+      const onAbort = (): void => {
+        const index = call.waiting.indexOf(waiter)
         if (index >= 0) call.waiting.splice(index, 1)
-        reject(new Error('tool call aborted'))
-      }, { once: true })
+        waiter.reject(new Error('tool call aborted'))
+      }
+      call.waiting.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
     })
     if (outcome.isError) throw new Error(outcome.text.slice(0, 2000))
     let blocks: ContentBlock[] = [{ type: 'text', text: outcome.text.slice(0, 2000) }]
@@ -859,11 +936,19 @@ export class TurnPump {
           }
         : {}),
     })
-    if (/"run_in_background"\s*:\s*true|"background"\s*:\s*true/.test(argsJson)) this.backgroundLaunched = true
-    // 镜像代理必须用保留前缀注册:同名注册会**遮蔽 dsh 真工具**,桥的
+    // 后台任务识别:只认 CLI **自己**的后台调用(原生 Bash/Task 的 background
+    // 参数)。delegate 调用(dsh_bash 的 run_in_background 等)是 dsh 侧 job:
+    // 立即返回、完成由 dsh 唤醒新回合,与 CLI 本回合的收尾无关——此前一并误判,
+    // 回合尾巴被拉到 10 分钟 bg 宽限(实测:任务完成仍显示"进行中"9 分多钟)。
+    const isDelegateCall = rawName === 'delegate_tool'
+    if (!isDelegateCall && /"run_in_background"\s*:\s*true|"background"\s*:\s*true/.test(argsJson)) this.backgroundLaunched = true
+    // 镜像代理默认加保留前缀:同名注册会**遮蔽 dsh 真工具**,桥的
     // `dsh_<name>` 调用就会打到镜像上(实测 dsh_read 全程报"未知的工具调用",
     // 模型据此判定工具坏掉)。`cli_read` 只承接 CLI 原生调用,与桥彻底分名。
-    const mirrorName = `${CLI_MIRROR_TOOL_PREFIX}${dshName}`
+    // 例外:图片别名的镜像名保持 `read_image`——dsh Web UI 的图片卡片按
+    // `call.name === 'read_image'` 出预览(硬编码),改名就没有预览;该名由
+    // 桥侧 BRIDGE_MIRROR_OWNED 让位(不再桥接 dsh_read_image)。
+    const mirrorName = alias !== undefined ? dshName : `${CLI_MIRROR_TOOL_PREFIX}${dshName}`
     this.ensureReplayTool(mirrorName)
     const segment = this.openSegment()
     this.closeOpenBlock(segment)
@@ -921,6 +1006,30 @@ export class TurnPump {
     if (this.disposed || this.finished) return
     this.checkSegmentBoundary()
     this.checkTail()
+    this.diagStuck()
+  }
+
+  /**
+   * 疑似卡住时的现场诊断:真实活动静默 >20s 且回合未收尾时,每 30s 打一行
+   * 完整状态到日志——"跑完仍显示进行中"类问题据此一眼定位(卡在哪个条件)。
+   */
+  private diagStuck(): void {
+    const now = Date.now()
+    const lastActivityAt = Math.max(this.lastContentAt, this.lastToolExecutingAt)
+    if (lastActivityAt === 0 || now - lastActivityAt < 20_000) {
+      this.nextDiagAt = 0
+      return
+    }
+    if (now < this.nextDiagAt) return
+    this.nextDiagAt = now + 30_000
+    const pending = [...this.calls.values()].filter(call => call.announced && call.outcome === undefined).length
+    console.error('[codebuddy-bridge] diag'
+      + ` session=${this.deps.dshSessionId}`
+      + ` silent=${Math.round((now - lastActivityAt) / 1000)}s`
+      + ` settled=${this.promptSettled} inflight=${this.inFlight}`
+      + ` idlePhase=${this.lastIdlePhaseAt === undefined ? 'never' : `${Math.round((now - this.lastIdlePhaseAt) / 1000)}s ago`}`
+      + ` pendingMirrors=${pending} bgLaunched=${this.backgroundLaunched}`
+      + ` stop=${this.stopReason ?? '-'} seg=${this.segments.length}`)
   }
 
   /** 收段判定:工具边界。 */
@@ -963,7 +1072,36 @@ export class TurnPump {
       )
       return
     }
-    if (!this.promptSettled || this.inFlight > 0 || this.aborted) return
+    if (!this.promptSettled || this.inFlight > 0 || this.aborted) {
+      // CLI 端回合已实际结束(agentPhase=idle、内容推完)但 session/prompt 的
+      // RPC 结果迟迟不回:CLI 的 turn 结束判定偶尔被内部状态挂住(后台任务/
+      // 子代理未结算,实测反复出现)。此短路会让下面的尾巴窗口逻辑整体失效,
+      // 而看门狗又只咬"在途镜像工具"——纯等待状态下 dsh 永远显示"进行中"。
+      // 静默判定与下方尾巴窗口同一套口径:CLI 报过 idle(且在最后一次真实活动
+      // 之后) + 真实活动静默超过空闲预算(起过后台任务用长预算)即强制收尾,
+      // 放弃 prompt 结果,dispose 杀进程兜底。零产出仍留给静默失败分类。
+      if (!this.aborted && this.agentPhaseSeen && this.lastIdlePhaseAt !== undefined
+        && (this.hasText || this.calls.size > 0)) {
+        const quietMs = this.to.tailQuietMs ?? 5_000
+        const bgQuietMs = this.to.tailBgQuietMs ?? 600_000
+        const lastActivityAt = Math.max(this.lastContentAt, this.lastToolExecutingAt)
+        const silentFor = Date.now() - lastActivityAt
+        const budget = this.backgroundLaunched ? bgQuietMs : quietMs
+        if (this.lastIdlePhaseAt >= lastActivityAt && silentFor >= budget) {
+          console.error(`[codebuddy-bridge] session=${this.deps.dshSessionId} prompt 结果挂起但 CLI 已空闲(真实活动静默 ${Math.round(silentFor / 1000)}s)——强制收尾(放弃 RPC 结果,杀进程兜底)`)
+          const seg = this.segments[this.segments.length - 1]
+          if (seg !== undefined && !seg.closed) this.closeSegment(seg, 'settle')
+          this.finishTurn()
+          return
+        }
+        // 静默未满:CLI 心跳停了就没有 update 驱动重入——定时器补刀,到期再判。
+        if (this.lastIdlePhaseAt >= lastActivityAt) {
+          this.armCheck(budget - silentFor + 10)
+          return
+        }
+      }
+      return
+    }
     // 静默失败:end_turn 但零文本零工具(配额/服务端异常)——首段重启,否则报错。
     if (this.progressSamples === 0 || (!this.hasText && this.calls.size === 0)) {
       this.failRun(new Error(`CodeBuddy 静默失败(stopReason: ${this.stopReason ?? 'none'};`

@@ -122,6 +122,15 @@ describe('failureOfError:异常 → 分类', () => {
     expect(failure.retryable).toBe(true)
     expect(failure.detail).toContain('ACP 进程已退出')
   })
+
+  it('AcpRpcError 带未知负数码 → 不可重试(CLI 新增配额/风控类码不能反复重试)', () => {
+    // 回归:此前 unknown + 负码穿透到兜底 retryable:true,配额类错误会被
+    // 反复重试;协议层异常(超时/退出)不带 AcpRpcError,不受影响。
+    const failure = failureOfError(new AcpRpcError(-32099, 'new quota-ish code'))
+    expect(failure.category).toBe('unknown')
+    expect(failure.retryable).toBe(false)
+    expect(failure.detail).toContain('new quota-ish code')
+  })
 })
 
 describe('formatFailureLine:单行原因', () => {

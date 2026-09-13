@@ -25,11 +25,16 @@ function assistant(id: string, content: Message['content']): Message {
   return { id, role: 'assistant', content, source: { kind: 'model', provider: 'codebuddy', model: 'glm-5.3' } } as unknown as Message
 }
 
-function toolResult(id: string, callId: string, text: string): Message {
+function toolResult(id: string, callId: string, text: string, isError = false): Message {
   return {
     id,
     role: 'user',
-    content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text }] }],
+    content: [{
+      type: 'tool-result',
+      toolCallId: callId,
+      content: [{ type: 'text', text }],
+      ...(isError ? { isError: true } : {}),
+    }],
     source: { kind: 'tool', callId },
   } as unknown as Message
 }
@@ -83,6 +88,18 @@ describe('messagesToRecords', () => {
       status: 'completed',
       output: { type: 'text', text: 'hi' },
     })
+  })
+
+  it('失败的 tool-result(isError)→ function_call_result 保留 failed 状态', async () => {
+    // 回归:此前恒写 completed,seed 后的历史里失败调用看起来成功。
+    const records = await messagesToRecords([
+      user('u1', '跑个命令'),
+      assistant('a1', [
+        { type: 'tool-call', id: 'call_2', name: 'Bash', arguments: '{}' },
+      ] as unknown as Message['content']),
+      toolResult('t2', 'call_2', 'boom', true),
+    ], context)
+    expect(records[2]).toMatchObject({ type: 'function_call_result', callId: 'call_2', status: 'failed' })
   })
 
   it('reasoning 块跳过;图片块转为 [图片] 文本', async () => {

@@ -371,9 +371,11 @@ describe('回放工具:结果与别名', () => {
       setTimeout(() => { c.p.update(message('看到了')); c.settle() }, 60)
     })
     const first = await step(h.adapter, makeOptions('s1'))
-    expect(first.some(c => c.includes('cli_read_image'))).toBe(true)
-    expect(h.registeredTools.has('cli_read_image')).toBe(true)
-    const value = await (h.registeredTools.get('cli_read_image')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    // 图片别名的镜像名保持 `read_image`(不加 cli_ 前缀):dsh Web UI 的图片卡片
+    // 按 call.name === 'read_image' 出预览,改名就没有预览(实测)。
+    expect(first.some(c => c.includes('read_image'))).toBe(true)
+    expect(h.registeredTools.has('read_image')).toBe(true)
+    const value = await (h.registeredTools.get('read_image')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: 'call_img' },
     ) as { blocks: Array<Record<string, unknown>>; meta?: { path?: string } }
     expect(value.blocks.some(block => block['type'] === 'image')).toBe(true)
@@ -677,6 +679,76 @@ describe('尾巴窗口(后台任务续跑)', () => {
     const chunks = await step(h.adapter, makeOptions('s1'))
     expect(chunks.some(c => c.includes('答'))).toBe(true)
     expect(Date.now() - started).toBeLessThan(2_000)
+  }, 15_000)
+
+  it('prompt 结果挂起但 CLI 已报空闲+真实活动静默 → 强制收尾(不再无限等)', async () => {
+    // 用户反复踩的场景:CLI 端回合已实际结束(内容推完、agentPhase=idle)但
+    // session/prompt 的 RPC 结果不回(CLI 内部 turn 判定被后台任务/子代理挂
+    // 住)。promptSettled=false 会短路尾巴窗口,看门狗又只咬在途镜像工具——
+    // 此前 dsh 永远显示"进行中"。现在:真实活动静默超过空闲预算即强制收尾。
+    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, tailBgQuietMs: 60_000 })
+    mockTurn((c) => {
+      c.p.update(toolCall('call_1', 'Bash', { command: 'npm run dev', run_in_background: true }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'running in background'))
+      c.p.update(message('答复'))
+      c.p.update(phase('idle'))
+      // 故意不 settle:模拟 CLI 的 prompt 结果挂起。空闲心跳继续(CLI 空闲时
+      // 会持续报 idle)——静默判定必须只看真实活动,不被心跳续命。
+      let ticks = 0
+      const timer = setInterval(() => {
+        ticks += 1
+        if (ticks > 400) { clearInterval(timer); return }
+        c.p.update(phase('idle'))
+      }, 30)
+    })
+    const started = Date.now()
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(chunks.some(c => c.includes('答复'))).toBe(true)
+    // 后台宽限 60s、心跳不断,但真实活动静默 40ms 预算 → 秒级强制收尾。
+    expect(Date.now() - started).toBeLessThan(5_000)
+  }, 15_000)
+
+  it('dsh_bash 的 run_in_background 不算 CLI 后台任务 → 短预算收尾(不等 10 分钟)', async () => {
+    // 用户反复踩的"跑完仍显示进行中":delegate 调用(dsh_bash)带
+    // run_in_background:true 是 **dsh 侧 job**——立即返回、完成由 dsh 唤醒
+    // 新回合,与 CLI 本回合收尾无关。此前它把尾巴预算拉到 tailBgQuietMs
+    // (10 分钟),任务完成后 UI 一直转。
+    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, tailBgQuietMs: 60_000 })
+    mockTurn((c) => {
+      c.p.update(toolCall('call_1', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'npm run dev', run_in_background: true } }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'job started'))
+      c.p.update(message('答复'))
+      c.p.update(phase('idle'))
+      c.settle()
+    })
+    const started = Date.now()
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(chunks.some(c => c.includes('答复'))).toBe(true)
+    // 若误判为 CLI 后台任务:60s 预算,本断言必超时失败。
+    expect(Date.now() - started).toBeLessThan(5_000)
+  }, 15_000)
+
+  it('重启后旧 attempt 的相位/尾巴状态已复位 → 新 attempt 不被提前收尾截断', async () => {
+    // 旧实现:restart 不清 agentPhaseSeen/lastIdlePhaseAt/lastContentAt——
+    // 新 attempt 发 prompt 期间,prompt-pending 强制收尾分支用**旧 attempt**
+    // 的 idle 时间戳与归零的活动时间算出巨大静默,产出第一句后即被强制收尾,
+    // 后续内容(第二句/真实结果)全部丢失。复位后必须完整收进。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 2, retryDelayMs: 20, tailQuietMs: 5_000 })
+    mockTurn((c, index) => {
+      if (index === 1) {
+        c.p.update(phase('idle'))
+        c.settle() // 零产出 end_turn → 静默失败 → restart
+        return
+      }
+      c.p.update(message('第一句'))
+      setTimeout(() => { c.p.update(message('第二句')); c.settle() }, 150)
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(h.spawns()).toBe(2)
+    expect(chunks.some(c => c.includes('第一句'))).toBe(true)
+    expect(chunks.some(c => c.includes('第二句'))).toBe(true)
   }, 15_000)
 })
 

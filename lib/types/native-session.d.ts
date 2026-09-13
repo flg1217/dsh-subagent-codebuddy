@@ -56,7 +56,7 @@ export declare function conversationFilePath(sessionId: string, cwd: string, bas
  * @param images - 图片读取面(缺省时图片退化为 `[图片]` 文本占位)。
  * @returns 记录数组(按时间顺序,可直接写 JSONL)。
  */
-export declare function messagesToRecords(messages: readonly Message[], context: NativeSessionContext, images?: NativeSessionImages): Promise<NativeRecord[]>;
+export declare function messagesToRecords(messages: readonly Message[], context: NativeSessionContext, images?: NativeSessionImages, system?: string): Promise<NativeRecord[]>;
 /** 会话文件的头部记录(CLI 自己也会写,合成时补一份保证结构完整)。 */
 export declare function sessionMetaRecords(context: NativeSessionContext): NativeRecord[];
 /** 写入(覆盖)会话文件;原子写(tmp + rename)。 */

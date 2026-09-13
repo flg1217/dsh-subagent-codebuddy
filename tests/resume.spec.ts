@@ -192,6 +192,56 @@ describe('原生会话种子(已有历史切换)', () => {
     }
   })
 
+  it('system prompt 随原生 seed 发送:进首条记录,不进 prompt 正文', async () => {
+    const store = new ConversationStore(null)
+    const baseDir = mkdtempSync(join(tmpdir(), 'cb-native-'))
+    try {
+      const { adapter, prompts } = makeHarness(store, 's1', false, baseDir)
+      await drain(adapter, {
+        ...options([
+          msg('u1', 'user', '历史问题一'),
+          msg('a1', 'assistant', '历史回答一'),
+          msg('u2', 'user', '当前问题'),
+        ]),
+        system: 'DSS-SYSTEM-PROMPT',
+      } as GenerateOptions)
+      // prompt 只带当前输入(尾注仍是 dsh 委派说明),system 走 seed 首条记录。
+      expect(prompts.at(-1)).toContain('当前问题')
+      expect(prompts.at(-1)).not.toContain('DSS-SYSTEM-PROMPT')
+      const dir = join(baseDir, projectSlug(process.cwd()))
+      const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
+      const lines = readFileSync(join(dir, files[0]!), 'utf8').trim().split(/\r?\n/)
+      // 头部 session-meta 之后的第一条消息记录就是 system 指令。
+      const firstMessage = lines.find(line => line.includes('"type":"message"'))!
+      expect(firstMessage).toContain('DSS-SYSTEM-PROMPT')
+      // 哈希落盘:重启后不重发。
+      expect(store.get('s1')?.systemHash).toBeTruthy()
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true })
+    }
+  })
+
+  it('已存在的会话:system 变化才补发一次(哈希记录已发版本)', async () => {
+    const store = new ConversationStore(null)
+    store.set('s1', { acpId: 'cb-1', sentCount: 0 })
+    const { adapter, prompts } = makeHarness(store)
+    const u1 = msg('u1', 'user', '第一问')
+    await drain(adapter, { ...options([u1]), system: 'SYS-A' } as GenerateOptions)
+    expect(prompts[0]).toContain('SYS-A')
+    const hashA = store.get('s1')?.systemHash
+    expect(hashA).toBeTruthy()
+
+    const u2 = msg('u2', 'user', '第二问')
+    await drain(adapter, { ...options([u1, u2]), system: 'SYS-A' } as GenerateOptions)
+    expect(prompts[1]).not.toContain('SYS-A')
+
+    const u3 = msg('u3', 'user', '第三问')
+    await drain(adapter, { ...options([u1, u2, u3]), system: 'SYS-B' } as GenerateOptions)
+    expect(prompts[2]).toContain('SYS-B')
+    expect(prompts[2]).toContain('updated')
+    expect(store.get('s1')?.systemHash).not.toBe(hashA)
+  })
+
   it('原生载入被拒 → 回退新会话 + 全量提示词', async () => {
     const store = new ConversationStore(null)
     const baseDir = mkdtempSync(join(tmpdir(), 'cb-native-'))

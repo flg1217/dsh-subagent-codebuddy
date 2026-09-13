@@ -25,7 +25,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, usageOfUpdate } from './acp.js'
+import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, usageOfUpdate } from './acp.js'
 import type { ConversationStore } from './conversations.js'
 import { TurnPump } from './pump.js'
 
@@ -103,6 +103,7 @@ export async function forwardCompactToCli(
     '--model',
     deps.modelOf(),
     '--dangerously-skip-permissions',
+    ...cliToolPolicyArgs(),
     ...deps.extraArgs,
   ]
   // 压缩过程中的用量样本:CLI 的压缩 agent 会把整段历史读进去摘要,它的
@@ -191,14 +192,29 @@ export function registerCompactDelegation(deps: CompactCommandDeps): void {
       ? request.agent.session.header.cwd
       : process.cwd()
     const signal = request.signal instanceof AbortSignal ? request.signal : new AbortController().signal
-    const result = await forwardCompactToCli(deps, sessionId, cwd, signal)
-    if (result.kind === 'success') return { handled: true }
-    try {
-      (deps.ctx as unknown as { logger?: { warn?: (message: string) => void } }).logger?.warn?.(
-        `compaction delegate: CLI compact failed, falling back to built-in: ${result.text}`,
-      )
-    } catch { /* logging must never throw */ }
-    return await next()
+    // 与手动 /compact 同一语义:进 agent 的 maintenance 相位再转发——否则
+    // 阈值触发瞬间若用户消息开了新回合,该轮请求与压缩并发写同一 CLI 会话,
+    // 压缩结果被盖掉(TOCTOU:busy 检查通过后回合泵仍可能启动)。回合忙时
+    // runMaintenance 抛错 → 回落 next() 用内置压缩,不阻塞对话。
+    const agent = request.agent as unknown as MaintenanceAgentFace | undefined
+    const forward = async (runSignal: AbortSignal): Promise<unknown> => {
+      const result = await forwardCompactToCli(deps, sessionId, cwd, runSignal)
+      if (result.kind === 'success') return { handled: true }
+      try {
+        (deps.ctx as unknown as { logger?: { warn?: (message: string) => void } }).logger?.warn?.(
+          `compaction delegate: CLI compact failed, falling back to built-in: ${result.text}`,
+        )
+      } catch { /* logging must never throw */ }
+      return await next()
+    }
+    if (agent?.runMaintenance !== undefined) {
+      try {
+        return await agent.runMaintenance(runSignal => forward(AbortSignal.any([runSignal, signal])))
+      } catch {
+        return await next()
+      }
+    }
+    return await forward(signal)
   }
   ;(deps.ctx as unknown as { on?: (name: string, handler: unknown) => void }).on?.('compaction/delegate', onDelegate)
 }
