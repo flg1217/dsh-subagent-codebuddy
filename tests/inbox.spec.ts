@@ -27,7 +27,7 @@ describe('foldPendingInsertions', () => {
     expect(foldPendingInsertions(events)).toEqual([])
   })
 
-  it('非 user 来源(插件注入)保留位置对齐但不转发', () => {
+  it('插件注入的上下文(plugin)保留位置对齐但不转发;子代理通信即时投递', () => {
     const events = [
       {
         type: 'agent/inbox/spliced',
@@ -37,11 +37,17 @@ describe('foldPendingInsertions', () => {
           inserted: [
             { id: 'ctx-1', role: 'user', content: [{ type: 'text', text: '<system-reminder>内部</system-reminder>' }], source: { kind: 'plugin' } },
             userMessage('ins-2', '真插话'),
+            // 子代理结算通知与 send_message 回传:必须即时投递(回归:此前
+            // 只放行 user,通知在长 step 里永远到不了模型,主代理一直"等待")。
+            { id: 'note-1', role: 'user', content: [{ type: 'text', text: 'Background subagent x finished' }], source: { kind: 'subagent-settled' } },
+            { id: 'relay-1', role: 'user', content: [{ type: 'text', text: 'Agent y sent a message: 完成' }], source: { kind: 'agent-message' } },
           ],
         },
       },
     ]
-    expect(foldPendingInsertions(events)).toEqual([{ id: 'ins-2', text: '真插话', steer: true }])
+    const folded = foldPendingInsertions(events)
+    expect(folded.map(item => item.id).sort()).toEqual(['ins-2', 'note-1', 'relay-1'])
+    expect(folded.every(item => item.steer)).toBe(true)
   })
 
   it('多 target 队列独立;同 id 去重;空文本跳过;next-turn 是排队而非插话', () => {

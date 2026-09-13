@@ -58,6 +58,8 @@ interface Harness {
   registeredTools: Map<string, Record<string, unknown>>
   promptParams: Array<Record<string, unknown>>
   spawns: () => number
+  /** 触发一次 session/event(真工具直发的结果交付通道)。 */
+  emitSessionEvent: (event: { type: string; data: unknown }) => void
 }
 
 function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>, store?: ConversationStore): Harness {
@@ -71,6 +73,8 @@ function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>
   const savedImages: Array<{ mediaType: string; bytes: number }> = []
   const registeredTools = new Map<string, Record<string, unknown>>()
   const promptParams: Array<Record<string, unknown>> = []
+  /** 会话事件通道:pump 订阅 session/event(真工具直发的结果交付)。 */
+  const sessionEventHandlers = new Set<(...args: unknown[]) => void>()
   const session = {
     header: shape.header ?? { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
     append: (type: string, data: unknown, opts?: unknown) => {
@@ -97,6 +101,11 @@ function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>
   }
   const agentFace = { ctx: { get: (key: string) => (key === 'tools' ? toolsFace : undefined) } }
   const ctx = {
+    on: (name: string, handler: (...args: unknown[]) => void): (() => void) => {
+      if (name !== 'session/event') return () => {}
+      sessionEventHandlers.add(handler)
+      return () => { sessionEventHandlers.delete(handler) }
+    },
     get: (key: string) => {
       if (key === 'sessions' && shape.hasSession !== false) return { get: () => session, create: session.create }
       if (key === 'agents') return { get: (id: string) => (id === 's1' ? agentFace : undefined) }
@@ -125,6 +134,10 @@ function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>
   return {
     adapter, appended, events, createdMetas, shadowEvents, savedImages, registeredTools, promptParams,
     spawns: () => mockedSpawn.mock.results.length,
+    emitSessionEvent: (event: { type: string; data: unknown }) => {
+      const session = { header: { id: 's1' }, id: 's1' }
+      for (const handler of [...sessionEventHandlers]) handler(session, event)
+    },
   }
 }
 
@@ -749,6 +762,282 @@ describe('尾巴窗口(后台任务续跑)', () => {
     expect(h.spawns()).toBe(2)
     expect(chunks.some(c => c.includes('第一句'))).toBe(true)
     expect(chunks.some(c => c.includes('第二句'))).toBe(true)
+  }, 15_000)
+})
+
+describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('delegate 调用以真工具名发射;CLI 请求经 tool/result 事件拿到结果', async () => {
+    // 全量改造:delegate 调用不再走 cli_delegate_tool 镜像回放,而是翻译成
+    // 真工具调用块(名字 edit),loop 直接执行 dsh 真工具——原生卡片/审批/
+    // 沙箱/事件;结果由 loop 写 tool/result,泵从会话事件取回交给 CLI 请求。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let extResponse: { result?: unknown; error?: { message: string } } | undefined
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(toolCall('call_edit_1', 'DelegateTool', {
+        toolId: 'dsh_edit',
+        input: { file_path: 'a.ts', old_string: 'x', new_string: 'y' },
+      }))
+      c.p.update(phase('tool_executing'))
+      void c.p.extRequest('_codebuddy.ai/delegateTool', {
+        toolCallId: 'delegate-dsh_edit-1',
+        toolId: 'dsh_edit',
+        input: { file_path: 'a.ts', old_string: 'x', new_string: 'y' },
+        timeout: 30_000,
+      }).then(response => { extResponse = response })
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    // 块用真工具名 + 翻译后的参数(不再是 cli_delegate_tool 包裹)。
+    expect(chunks.some(c => c.includes('"name":"edit"'))).toBe(true)
+    expect(chunks.some(c => c.includes('cli_delegate_tool'))).toBe(false)
+    expect(chunks.some(c => c.includes('old_string'))).toBe(true)
+    // 不再为 delegate 调用注册回放工具(真工具已在 agent plane)。
+    expect(h.registeredTools.has('cli_delegate_tool')).toBe(false)
+    // loop 执行真工具后写 tool/result → 等待中的 CLI 请求拿到结果。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          source: { kind: 'tool', callId: 'call_edit_1' },
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'call_edit_1',
+            content: [{ type: 'text', text: '已编辑 a.ts' }],
+          }],
+        },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(extResponse?.result).toEqual({ status: 'success', output: '已编辑 a.ts' })
+    settleFn?.()
+  }, 15_000)
+
+  it('结果先到(请求未到)→ 缓存;请求到达时立即认领;失败结果转 status:error', async () => {
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let extResponse: { result?: unknown; error?: { message: string } } | undefined
+    let fakeProc: ReturnType<typeof lastFake>
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      fakeProc = c.p
+      settleFn = () => c.settle()
+      c.p.update(toolCall('call_bash_2', 'DelegateTool', {
+        toolId: 'dsh_bash',
+        input: { command: 'false' },
+      }))
+      c.p.update(phase('tool_executing'))
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(chunks.some(c => c.includes('"name":"bash"'))).toBe(true)
+    // loop 很快执行完(结果先于 CLI 请求到达):事件先到 → 结果缓存。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          source: { kind: 'tool', callId: 'call_bash_2' },
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'call_bash_2',
+            content: [{ type: 'text', text: 'exit code 1' }],
+            isError: true,
+          }],
+        },
+      },
+    })
+    // 请求此刻才到 → 立刻拿缓存结果(失败 → status:error)。
+    const pending = fakeProc!.extRequest('_codebuddy.ai/delegateTool', {
+      toolCallId: 'delegate-dsh_bash-2',
+      toolId: 'dsh_bash',
+      input: { command: 'false' },
+      timeout: 30_000,
+    })
+    void pending.then(response => { extResponse = response })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(extResponse?.result).toEqual({ status: 'error', error: { message: 'exit code 1' } })
+    settleFn?.()
+  }, 15_000)
+
+  it('回合中新注入的 user/message(已 claim 的通知)→ steer 投递给运行中的 CLI', async () => {
+    // 回归:官方架构每 step 重组 messages(含新注入——UI 显示为"上下文注入");
+    // codebuddy 回合中途注入曾无投递通道——子代理结算通知被 claim 后模型
+    // 同回合内永远收不到,主代理一直"等待"。现在按注入水位线扫描并 steer。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.onRequest(msg => {
+        if (msg.method === 'session/steer') c.p.respond(msg.id, { steered: true })
+      })
+      c.p.update(message('第一段'))
+      c.p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'hi'))
+      setTimeout(() => {
+        c.p.update(message('第二段'))
+        c.p.update(toolCall('call_2', 'Bash', { command: 'echo hi2' }))
+        c.p.update(phase('tool_executing'))
+        c.p.update(toolUpdate('call_2', 'completed', 'hi2'))
+      }, 400)
+    })
+    const first = await step(h.adapter, makeOptions('s1'))
+    expect(first.some(c => c.includes('第一段'))).toBe(true)
+    // 回合运行中注入一条已 claim 的子代理结算通知(构造时间之后)。
+    h.events.push({
+      type: 'user/message',
+      time: Date.now(),
+      data: {
+        id: 'note-1',
+        role: 'user',
+        content: [{ type: 'text', text: 'Background subagent abc finished and will do no further work.' }],
+        source: { kind: 'subagent-settled' },
+      },
+    } as never)
+    const second = await step(h.adapter, makeOptions('s1'))
+    expect(second.some(c => c.includes('第二段'))).toBe(true)
+    // 通知已通过 steer 投递(20ms 轮询窗口内),且只投一次(markForwarded 去重)。
+    const steers = lastFake()!.requestLog().filter(m => m === 'session/steer')
+    expect(steers.length).toBeGreaterThanOrEqual(1)
+    settleFn?.()
+  }, 15_000)
+
+  it('同工具并发调用按参数精确配对(请求/结果乱序也不错配)', async () => {
+    // 两个 dsh_bash 并发:先到的是 bbb 的请求与 bbb 的结果——必须匹配到
+    // call_b(参数精确),FIFO 会把 call_a 的结果错配给 bbb 的请求。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    let fakeProc: ReturnType<typeof lastFake>
+    const responses: Array<{ result?: unknown }> = []
+    mockTurn((c) => {
+      fakeProc = c.p
+      settleFn = () => c.settle()
+      c.p.update(toolCall('call_a', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'aaa' } }))
+      c.p.update(toolCall('call_b', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'bbb' } }))
+      c.p.update(phase('tool_executing'))
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    expect(chunks.filter(c => c.includes('"name":"bash"')).length).toBe(2)
+    // 乱序:b 的请求先到。
+    const pendingB = fakeProc!.extRequest('_codebuddy.ai/delegateTool', {
+      toolCallId: 'delegate-b',
+      toolId: 'dsh_bash',
+      input: { command: 'bbb' },
+      timeout: 30_000,
+    })
+    void pendingB.then(response => { responses.push(response) })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    // b 的结果也先到 → 精确配对交付给 b 的请求。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          source: { kind: 'tool', callId: 'call_b' },
+          content: [{ type: 'tool-result', toolCallId: 'call_b', content: [{ type: 'text', text: 'RESULT-B' }] }],
+        },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect((responses[0]?.result as { output?: string } | undefined)?.output).toBe('RESULT-B')
+    settleFn?.()
+  }, 15_000)
+
+  it('steer 被拒(steered:false)→ 回退独立 prompt 补发,消息不丢', async () => {
+    // 回归:fallback 路径此前零覆盖——steer 拒绝时必须回退 sendPrompt,
+    // 且 prompt 请求层失败时要回滚 forwarded 标记(留给补发)。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    let fakeProc: ReturnType<typeof lastFake>
+    let promptCount = 0
+    mockTurn((c) => {
+      fakeProc = c.p
+      settleFn = () => c.settle()
+      c.p.onRequest(msg => {
+        if (msg.method === 'session/prompt') promptCount += 1
+        if (msg.method === 'session/steer') c.p.respond(msg.id, { steered: false })
+      })
+      c.p.update(message('段一'))
+      c.p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'hi'))
+    })
+    const first = await step(h.adapter, makeOptions('s1'))
+    expect(first.some(c => c.includes('段一'))).toBe(true)
+    const before = promptCount
+    h.events.push({
+      type: 'user/message',
+      time: Date.now(),
+      data: {
+        id: 'note-fb',
+        role: 'user',
+        content: [{ type: 'text', text: 'Background subagent fb finished.' }],
+        source: { kind: 'subagent-settled' },
+      },
+    } as never)
+    // 等轮询:steer 被拒 → 回退 sendPrompt(计数增长)。
+    await new Promise(resolve => setTimeout(resolve, 200))
+    expect(fakeProc!.requestLog().filter(m => m === 'session/steer').length).toBeGreaterThanOrEqual(1)
+    expect(promptCount).toBeGreaterThan(before)
+    settleFn?.()
+  }, 15_000)
+
+  it('同一条悬挂消息多轮轮询只投递一次(isForwarded 去重)', async () => {
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.onRequest(msg => {
+        if (msg.method === 'session/steer') c.p.respond(msg.id, { steered: true })
+      })
+      c.p.update(message('挂起段'))
+      c.p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'hi'))
+    })
+    const first = await step(h.adapter, makeOptions('s1'))
+    expect(first.some(c => c.includes('挂起段'))).toBe(true)
+    // 悬挂插入(splice, 未 claim):每轮折叠都会返回它,但只应投递一次。
+    h.events.push({
+      type: 'agent/inbox/spliced',
+      time: Date.now(),
+      data: {
+        target: 'next-step',
+        start: 0,
+        inserted: [{
+          id: 'hang-1',
+          role: 'user',
+          content: [{ type: 'text', text: '悬挂插话' }],
+          source: { kind: 'user' },
+        }],
+      },
+    } as never)
+    await new Promise(resolve => setTimeout(resolve, 300))
+    const steers = lastFake()!.requestLog().filter(m => m === 'session/steer')
+    expect(steers.length).toBe(1)
+    settleFn?.()
+  }, 15_000)
+
+  it('参数平铺在顶层的 DelegateTool 调用 → 兼容解析进 input(实测高频形态)', async () => {
+    // 回归:白名单模式下模型高频把 dsh 工具参数与 toolId 平铺
+    // (`{"pattern":...,"toolId":"dsh_grep"}`,无 input 包装)——此前直接丢参
+    // 导致工具全线报 missing required property。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(toolCall('call_flat', 'DelegateTool', { pattern: 'boot', path: 'src', toolId: 'dsh_grep' }))
+      c.p.update(phase('tool_executing'))
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    const block = chunks.find(c => c.includes('"name":"grep"'))
+    expect(block).toBeDefined()
+    // chunk 内 arguments 是二次转义的 JSON 字符串:解析后比对,避免转义断言坑。
+    const parsed = JSON.parse(block!) as { block: { arguments: string } }
+    expect(JSON.parse(parsed.block.arguments)).toEqual({ pattern: 'boot', path: 'src' })
+    settleFn?.()
   }, 15_000)
 })
 

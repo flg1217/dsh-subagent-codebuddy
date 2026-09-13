@@ -71,7 +71,7 @@ describe('bridgeToolId / bridgeTargetTool:命名与排除', () => {
 })
 
 describe('listDshBridgeTools:注册描述符', () => {
-  it('列出可见工具:前缀 id、唯一展示名、描述=身份标记+原描述(不拼接桥侧说明)', () => {
+  it('列出可见工具:前缀 id、唯一展示名、调用形态提示+身份标记+原描述', () => {
     const { ctx } = makeBridgeCtx({
       schemas: [
         { name: 'read', description: 'Read a file.', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
@@ -82,12 +82,14 @@ describe('listDshBridgeTools:注册描述符', () => {
     expect(tools.map(tool => tool.id)).toEqual(['dsh_read', 'dsh_grep'])
     expect(tools[0]!.name).toBe('Dsh-read')
     const description = tools[0]!.description
+    // 调用形态提示放最前(截断保护),toolId 与参数名单从真实 schema 提取。
+    expect(description).toContain('[call: toolId="dsh_read", input={path}]')
     expect(description).toContain('[dsh-side tool: "read"]')
     expect(description).toContain('Read a file.')
     // 工具说明保持 dsh 原文,不把桥接语义(优先用/执行位置)逐工具拼接——
     // 那些引导只属于 prompt 尾注(DSH_DELEGATION_NOTE)。
     expect(description).not.toContain('prefer this')
-    expect(description).toBe('[dsh-side tool: "read"] Read a file.')
+    expect(description).toBe('[call: toolId="dsh_read", input={path}] [dsh-side tool: "read"] Read a file.')
     expect(tools[0]!.inputSchema).toEqual({ type: 'object', properties: { path: { type: 'string' } } })
   })
 

@@ -236,6 +236,16 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     return true
   }
 
+  /** 查询一条插入是否已投递过。 */
+  private isForwarded(sessionId: string, id: string): boolean {
+    return this.forwardedInsertions.get(sessionId)?.has(id) ?? false
+  }
+
+  /** 撤销一条转发标记(投递确认失败时回滚,留给补发路径)。 */
+  private unmarkForwarded(sessionId: string, id: string): void {
+    this.forwardedInsertions.get(sessionId)?.delete(id)
+  }
+
   constructor(
     private readonly ctx: Context,
     private readonly options: CodebuddyAdapterOptions,
@@ -427,6 +437,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       attachmentsOf: () => attachments,
       todoStateOf: () => this.todoStateFor(sessionId, childSession),
       markForwarded: id => this.markForwarded(sessionId, id),
+      isForwarded: id => this.isForwarded(sessionId, id),
+      unmarkForwarded: id => this.unmarkForwarded(sessionId, id),
     }
     return { kind: 'pump', pump: new TurnPump(host, options.signal, { mirroredCalls: new Set(), maxGapMs: 0 }) }
   }

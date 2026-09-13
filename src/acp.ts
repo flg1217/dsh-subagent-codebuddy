@@ -33,21 +33,46 @@ export const DEFAULT_ACP_RUN_TIMEOUTS = {
 }
 
 /**
- * 禁用的 CodeBuddy 原生工具名单(spawn 时以 `--disallowedTools` 传入)。
+ * CLI 内置工具的**白名单**(spawn 时以 `--tools` 传入)。
  *
- * CodeBuddy CLI 的内置提示词极强,仅靠尾注/system 块"劝"模型优先用 dsh_*
- * 桥接工具,实测模型仍大面积直调原生工具(会话 01a093c7 全程 Bash×733 /
- * Edit×366,而 dsh_bash 仅×47)——原生调用的结果不进 dsh:无审批/沙箱、
- * 无会话树审计、后台任务不进面板且完成不唤醒回合。
- * 名单 = dsh 侧有完整对等工具且桥接链路为纯文本的项;**Read 必须保留**:
- * 读图片只能走 CLI 原生 Read(结果镜像为 read_image 卡片;桥接回传
- * blocksToText 会丢图片块)。
+ * 为什么必须用白名单而不是 `--disallowedTools`:实测(2026-09-13,ACP 对照
+ * 实验)`--disallowedTools` 在 `--acp` 模式下**完全不生效**——模型仍报
+ * "Edit=有 Bash=有 Write=有",会话记录里 cli_edit 在禁用后成功执行 11 次
+ * (与 `--append-system-prompt` 同类的"ACP 忽略交互模式参数"现象)。
+ * `--tools` 白名单在 ACP 下生效(同实验:禁项全"没有",保留项"有")。
+ *
+ * **`DelegateTool` 必须在白名单里**(实测:白名单会连同"委托工具合成器"一起
+ * 过滤——漏掉它模型只剩只读原生工具、全部 dsh_* 桥工具不可见,模型自称
+ * "只有只读权限";只加这一个名字即可放行全部 Dsh-* 委托工具,无需逐个枚举)。
+ *
+ * 白名单 = CLI 独有/机制类工具 + **Read**(读图片只能走 CLI 原生 Read,结果
+ * 镜像为 read_image 卡片;桥接回传 blocksToText 会丢图片块)+ DelegateTool。
+ * 被排除的:Bash/PowerShell/Edit/Write/NotebookEdit/Glob/Grep(dsh 侧有完整
+ * 对等工具,走 dsh 才有审批/沙箱/会话审计/后台面板)、EnterPlanMode/
+ * ExitPlanMode(CLI 的 plan 模式是 CLI 内部状态,dsh 不知情,该模式下 CLI
+ * 对 delegate 判权失败并中断整个回合;规划走 dsh 原生 plan 工作流)。
+ * 版本升级若新增内置工具:默认不可见(比"漏禁"安全),按需加入白名单。
  */
-export const CLI_DISALLOWED_TOOLS = ['Bash', 'PowerShell', 'Edit', 'Write', 'NotebookEdit', 'Glob', 'Grep'] as const
+export const CLI_ALLOWED_TOOLS = [
+  'Read',
+  'WebSearch',
+  'WebFetch',
+  'Task',
+  'TaskCreate',
+  'TaskUpdate',
+  'TaskList',
+  'TaskOutput',
+  'TaskStop',
+  'Skill',
+  'ToolSearch',
+  'DeferExecuteTool',
+  // 委托工具合成器:漏掉它 = 全部 dsh_* 桥工具不可见(模型只剩只读)。
+  'DelegateTool',
+] as const
 
-/** spawn 参数:禁用原生同类工具,让模型直接看见 dsh_* 桥接工具并使用它。 */
+/** spawn 参数:白名单放行 CLI 独有工具,主力工具全部走 dsh_* 桥接。 */
 export function cliToolPolicyArgs(): string[] {
-  return ['--disallowedTools', CLI_DISALLOWED_TOOLS.join(',')]
+  return ['--tools', CLI_ALLOWED_TOOLS.join(',')]
 }
 
 /** 动态空闲超时预算(测试注入小值压缩时间)。 */

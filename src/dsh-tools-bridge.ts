@@ -124,6 +124,23 @@ function bridgeDescription(name: string, original: string): string {
 }
 
 /**
+ * 调用形态提示:toolId + 参数名清单(从真实 schema 的 properties 提取)。
+ *
+ * CLI 合成 DelegateTool 的 input 字段是无结构的 object——模型端对"参数怎么
+ * 包"完全没有 schema 约束(实测:模型把参数平铺在顶层、toolId 大小写混写、
+ * 发空参——dsh 原生链路里 API tools 的结构化 schema 不会出现这类问题)。
+ * 把"精确 toolId + 参数名单"钉在每个工具描述最前(截断也先保住),模型可
+ * 直接照抄,把约束补回接近原生的强度。
+ */
+function callShapeHint(name: string, inputSchema: unknown): string {
+  const properties = (inputSchema as { properties?: unknown } | undefined)?.properties
+  const keys = properties !== null && typeof properties === 'object' && !Array.isArray(properties)
+    ? Object.keys(properties as Record<string, unknown>).slice(0, 12)
+    : []
+  return `[call: toolId="dsh_${name}", input={${keys.join(', ')}}]`
+}
+
+/**
  * 列出当前会话可见、应当桥接的全部 dsh 工具(delegate tool 描述符)。
  * 工具集来自 `ctx.tools.schemas(agent)`——dsh 的 per-agent scope 过滤已生效。
  * @param ctx - 插件上下文(tools 服务)。
@@ -150,21 +167,28 @@ export function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpe
     if (schema.name.startsWith(CLI_MIRROR_TOOL_PREFIX)) continue
     // 被镜像占名的工具不桥接(见 BRIDGE_MIRROR_OWNED)。
     if (BRIDGE_MIRROR_OWNED.has(schema.name)) continue
-    const base = bridgeDescription(schema.name, typeof schema.description === 'string' ? schema.description : '')
+    const inputSchema = (schema.parameters !== null && typeof schema.parameters === 'object'
+      ? schema.parameters
+      : { type: 'object', properties: {} }) as Record<string, unknown>
+    const base = `${callShapeHint(schema.name, inputSchema)} ${bridgeDescription(
+      schema.name,
+      typeof schema.description === 'string' ? schema.description : '',
+    )}`
     specs.push({
       id: bridgeToolId(schema.name),
       name: bridgeToolName(schema.name),
       description: EXECUTION_TOOLS.has(schema.name) ? base + EXECUTION_HINT : base,
-      inputSchema: (schema.parameters !== null && typeof schema.parameters === 'object'
-        ? schema.parameters
-        : { type: 'object', properties: {} }) as Record<string, unknown>,
+      inputSchema,
     })
   }
   return specs
 }
 
-/** 内容块数组 → 文本(text 原样;tool-result 递归;图片/结构化降级)。 */
-function blocksToText(content: readonly unknown[]): string {
+/**
+ * 工具结果内容块 → 文本(嵌套 tool-result 递归,图片块降级为提示)。
+ * 桥执行与真工具直发路径共用同一文本口径。
+ */
+export function blocksToText(content: readonly unknown[]): string {
   const parts: string[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue

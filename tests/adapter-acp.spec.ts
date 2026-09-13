@@ -10,7 +10,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
  import { ConversationStore } from '../src/conversations.ts'
-import { DEFAULT_ACP_RUN_TIMEOUTS, usageOfUpdate } from '../src/acp.ts'
+import { DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, usageOfUpdate } from '../src/acp.ts'
 import { resetPumpStateForTests } from '../src/pump.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -354,6 +354,22 @@ describe('adapter(ACP):取消与错误', () => {
       tailBgQuietMs: 10 * 60_000,
       tailCapMs: 30 * 60_000,
     })
+  })
+
+  it('spawn 工具策略:--tools 白名单(实测 ACP 下 --disallowedTools 无效)', () => {
+    // 白名单必须:保留 Read(读图链路)与 DelegateTool(委托工具合成器,
+    // 漏掉它全部 dsh_* 桥工具不可见);排除 Bash/Edit/Write/Glob/Grep/
+    // PowerShell/NotebookEdit/EnterPlanMode 等(走 dsh_* 或不被支持)。
+    const args = cliToolPolicyArgs()
+    expect(args[0]).toBe('--tools')
+    const allowed = args[1]!.split(',')
+    expect(allowed).toContain('Read')
+    expect(allowed).toContain('DelegateTool')
+    expect(allowed).toContain('WebSearch')
+    expect(allowed).toContain('TaskUpdate')
+    for (const banned of ['Bash', 'Edit', 'Write', 'Glob', 'Grep', 'PowerShell', 'NotebookEdit', 'EnterPlanMode', 'ExitPlanMode']) {
+      expect(allowed).not.toContain(banned)
+    }
   })
 })
 

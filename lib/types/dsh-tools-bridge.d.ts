@@ -45,6 +45,11 @@ export declare function bridgeTargetTool(toolId: string): string | undefined;
  * @returns 桥工具描述符(不含专用委托工具)。
  */
 export declare function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpec[];
+/**
+ * 工具结果内容块 → 文本(嵌套 tool-result 递归,图片块降级为提示)。
+ * 桥执行与真工具直发路径共用同一文本口径。
+ */
+export declare function blocksToText(content: readonly unknown[]): string;
 /** 执行一次桥工具调用:走 dsh 的完整工具管线,结果转文本回 CLI。 */
 export interface DelegatedDshToolOptions {
     /** 发起会话(dsh 会话 id;执行归属的 agent)。 */

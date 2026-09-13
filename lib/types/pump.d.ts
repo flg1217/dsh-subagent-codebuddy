@@ -100,6 +100,10 @@ export interface PumpHost {
     todoStateOf: () => TodoListState | undefined;
     /** 转发 id 标记(next-step 插话);已标记过返回 false。 */
     markForwarded: (id: string) => boolean;
+    /** 查询 id 是否已投递过(悬挂条目每轮重折叠,靠它跳过已发的)。 */
+    isForwarded?: (id: string) => boolean;
+    /** 撤销投递标记(prompt 回退发送失败时回滚,留给补发路径)。 */
+    unmarkForwarded?: (id: string) => void;
 }
 /** 仅供测试:清空模块级注册表并释放残留的泵(跨用例隔离)。 */
 export declare function resetPumpStateForTests(): void;
@@ -201,9 +205,42 @@ export declare class TurnPump {
     private firstResultSeen;
     /** steer 轮询。 */
     private lastSteerPoll;
+    /** 泵构造时刻(回合开始):插入水位线在锚点不可用时的兜底。 */
+    private readonly constructedAt;
     /** 子代理镜像 / todo 桥。 */
     private readonly mirrors;
     private readonly subagentCallIds;
+    /**
+     * 真工具直发的 delegate 请求等待器:callId → 等待者。
+     * pump 把 delegate 调用发射为真工具块,loop 执行后写 tool/result 事件,
+     * onSessionEvent 按 callId 把结果交给等待中的 `_codebuddy.ai/delegateTool`
+     * 请求。
+     */
+    private readonly delegateWaiters;
+    /**
+     * 已发射但请求还没到的 delegate 块:toolId → 队列(FIFO + args 精确优先)。
+     * 请求先于 update 到达时反向登记进 pendingDelegateRequests,由
+     * claimDelegateRequest 双向认领。
+     */
+    private readonly unclaimedDelegates;
+    /** 请求先到、块还没发射的 delegate 请求:toolId → 认领回调队列(FIFO + args 精确优先)。 */
+    private readonly pendingDelegateRequests;
+    /** 结果先到(请求未到)的缓存:callId → 结果,由 awaitDelegateResult 认领。 */
+    private readonly delegateResults;
+    /** session/event 订阅解绑句柄。 */
+    private disposeEventHook;
+    /** steer 在飞防重:同一条消息不等响应完成不重复发起。 */
+    private readonly inFlightForwards;
+    /**
+     * 增量扫描水位:timeline(events 只 append)已处理到的下标;-1 = 未初始化。
+     * 早前每轮从锚点全量重扫,长回合里 markForwarded(256 条上限)把最早的
+     * 已投 id 挤出后会重复投递旧消息;增量扫描同时解决性能与重投。
+     */
+    private lastScannedIndex;
+    /** 悬挂折叠的短路键(events 长度 + 尾 seq):未变化则复用上轮折叠结果。 */
+    private lastFoldKey;
+    /** 上轮折叠出的悬挂插入(events 未变化时复用)。 */
+    private lastFolded;
     private readonly tickTimer;
     private wake;
     /** 外部 abort(agent-loop 的回合信号)。 */
@@ -227,6 +264,11 @@ export declare class TurnPump {
     private isMaxTokens;
     /** 起一次 ACP 进程 + 握手 + prompt(重启路径也走它)。 */
     private runAttempt;
+    /**
+     * 发一次 `session/prompt`。
+     * @returns 请求是否被 CLI 成功处理(false = 连接缺失或请求层失败,供投递
+     *   回滚判断——注意 resolve 代表整段 prompt 处理完毕,可能很晚)。
+     */
     private sendPrompt;
     /** 回合收尾:断开进程、清空活跃表、唤醒所有等待者。 */
     private finishTurn;
@@ -260,6 +302,21 @@ export declare class TurnPump {
     private onUpdate;
     /** 单条 update 的状态机(不触发收段判定)。 */
     private applyUpdate;
+    /** 订阅会话事件(取 loop 执行真工具后的 tool/result)。 */
+    private subscribeSessionEvents;
+    /** 会话事件入口:tool/result → 交付等待中的 delegate 请求(或缓存结果)。 */
+    private onSessionEvent;
+    /** 发射真工具块后,认领可能已挂起的 delegate 请求(请求先到场景)。 */
+    private claimDelegateRequest;
+    /**
+     * 等一次真工具直发的 delegate 调用结果。
+     * 块已发射 → 直接绑 callId;请求先到 → 挂起等块发射认领;
+     * 结果先到 → 取缓存。同 toolId 并发调用优先按参数精确配对(乱序不错配),
+     * 无精确匹配时退回队首。abort/dispose 统一拒绝。
+     */
+    private awaitDelegateResult;
+    /** 把等待者绑定到某个 callId(含 abort 清理)。 */
+    private bindDelegateWaiter;
     /** 参数完整的工具调用:注册回放工具 → 段内发射 tool-call 块。 */
     private announceCall;
     /** 取(或建)当前打开的段。 */
@@ -282,12 +339,32 @@ export declare class TurnPump {
     private stall;
     private armProgress;
     /**
-     * 未 claim 的 next-step 插话 → ACP `session/steer`(下一个内部边界注入)。
+     * 回合内生**所有**未投递的新 user/message → ACP `session/steer`(下一个内部
+     * 边界注入)。
      *
-     * C1 下 loop 会在**下一个模型调用边界**claim 这条消息并原生写 `user/message`
-     * ——插话的队列停留不再是一整轮(旧实现的巨型 step 才需要手工摘队列)。
+     * 对齐官方架构:dsh 原生链路里 agent-loop 每个 step 都重新组装 messages
+     * (含本步前新注入的一切——用户插话、子代理结算通知、agent 间消息、插件
+     * 上下文:UI 上显示为"上下文注入"),模型每步都看得到。codebuddy 链路的
+     * prompt 只在回合开始发一次,回合中途的新消息没有重发通道——实测漏投后果:
+     * 子代理做完并结算,主代理同回合内永远收不到通知,一直"等待"到下个回合。
+     *
+     * 两个来源都要覆盖:inbox 悬挂(next-step 未 claim,毫秒级 step 边界 claim
+     * 前就被轮询抢到的窗口)与已 claim 的 `user/message`(timeline 里的正式
+     * 消息——claim 发生在 step 边界,1.2s 轮询窗口内几乎必然已被 claim)。
+     * 统一按 id 去重(markForwarded):下回合补发时由 skipIds 再兜一次不重复。
      */
     private pollInsertions;
+    /** 回合内新注入的水位线:发送锚点之后;锚点不可用时按构造时间。 */
+    private insertionFloorIndex;
+    /**
+     * 单条消息的 steer 投递。
+     *
+     * markForwarded 只在**确认发出后**才落(steer 成功,或回退 prompt 实际发车):
+     * 早前先标记再投递,回合收尾竞态(conn 已散)下消息会「标了已投却从未发出」,
+     * 且 skipIds 永久跳过、下回合也不补——通知永久丢。在飞期间用
+     * inFlightForwards 防重复发起。
+     */
+    private steerMessage;
     private replayTodos;
     private emitTodo;
     private landTodo;

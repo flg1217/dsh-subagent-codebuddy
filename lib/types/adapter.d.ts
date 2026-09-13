@@ -105,6 +105,10 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private attachmentsFace;
     /** 标记一条插入为已转发;已标记过返回 false。 */
     private markForwarded;
+    /** 查询一条插入是否已投递过。 */
+    private isForwarded;
+    /** 撤销一条转发标记(投递确认失败时回滚,留给补发路径)。 */
+    private unmarkForwarded;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);
     /**
      * 绑定模型元数据与分发流入口(rc.2+ 的 LlmAdapter 接口)。

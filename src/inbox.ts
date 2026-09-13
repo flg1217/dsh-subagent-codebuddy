@@ -29,7 +29,17 @@ export interface PendingInsertion {
 interface QueueEntry {
   id: string
   text: string
-  fromUser: boolean
+  /**
+   * 悬挂路径是否放行这一条(即时投递)。
+   *
+   * 真实用户插话(user)与**子代理通信**(agent-message 的 send_message 回传、
+   * subagent-settled 的结算通知)在悬挂路径就要投——claim 发生在 step 边界,
+   * 1.2s 轮询窗口内这类条目常常已被 claim 吞掉,悬挂路径是最后的即时窗口。
+   * 其余插件注入的上下文(AGENTS.md/文件变更提醒等)不在此放行,但**已 claim
+   * 后会由 pump 的 timeline 扫描统一投递**(对齐官方架构的每步上下文注入);
+   * 这里只是不为它们抢悬挂窗口。
+   */
+  deliverable: boolean
 }
 
 /** 消息文本(text 块拼接)。 */
@@ -68,7 +78,7 @@ export function foldPendingInsertions(
         return {
           id: typeof message?.id === 'string' ? message.id : '',
           text: textOf(raw),
-          fromUser: kind === 'user',
+          deliverable: kind === 'user' || kind === 'agent-message' || kind === 'subagent-settled',
         }
       })
       queue.splice(start, 0, ...entries)
@@ -79,7 +89,7 @@ export function foldPendingInsertions(
   const pending: PendingInsertion[] = []
   for (const [target, queue] of queues) {
     for (const entry of queue) {
-      if (!entry.fromUser || entry.id.length === 0 || entry.text.trim().length === 0) continue
+      if (!entry.deliverable || entry.id.length === 0 || entry.text.trim().length === 0) continue
       if (seen.has(entry.id)) continue
       seen.add(entry.id)
       pending.push({ id: entry.id, text: entry.text, steer: target === 'next-step' })
