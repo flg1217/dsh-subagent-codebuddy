@@ -11,7 +11,12 @@
  * 插件在 `agent/created` 时于 `agent.ctx` 注册 `compact`:
  * - codebuddy 会话 → 进 agent 的 **maintenance 相位**后转发 `/compact` 给 CLI
  *   (`/compact` 是 CLI 的 user-command,压它自己的会话历史);
- * - 其它会话 → 回落到 dsh 自己的 `ctx.compaction.compactNow`,行为不变。
+ * - 其它会话 → 回落到 dsh 自己的 `compaction.compactNow`,行为不变。
+ *
+ * 同一文件还负责**自动压缩接管**:dsh 的两条自动路径对 codebuddy 会话一律不压
+ * (真实上下文归 CLI),判定按每轮路由的 provider 做——同一 preset 上的其它会话
+ * 完全不受影响。寻址方式见 {@link registerCompactDelegation}(realm 隔离 + 名册的
+ * `serviceFor`,不是猜 scope)。
  *
  * **maintenance 相位是必须的**(2026-09-13 实测):不占住 agent 时,用户在压缩
  * 期间发的消息会立刻开新回合抢跑——新回合的请求会和压缩并发写同一个 CLI
@@ -77,10 +82,10 @@ export declare function forwardCompactToCli(deps: CompactCommandDeps, sessionId:
  * **为什么必须拦在 `compactIfNeeded` 上(2026-09-14 实测):** dsh 侧没有
  * "把压缩委托出去"的事件缝(曾按 `compaction/delegate` 事件写过一版,源码核对
  * 后确认 compaction-basic 从不发这个事件 → 监听器永不触发,等于死代码)。
- * 现在改为在 `ctx.compaction` 服务实例上就地接管压缩入口:compaction-basic
- * 的两条自动路径(`agent/pre-step` 的 pressure、`agent/request-error` 的
- * context-overflow)都是 `this.compactIfNeeded(...)`,实例上的自有属性会遮蔽
- * 原型方法,所以接管后 dsh 不再压 codebuddy 会话。
+ * 现在改为在那个 compaction 实例上就地接管压缩入口(实例从哪来见下):
+ * compaction-basic 的两条自动路径(`agent/pre-step` 的 pressure、
+ * `agent/request-error` 的 context-overflow)都是 `this.compactIfNeeded(...)`,
+ * 实例上的自有属性会遮蔽原型方法,所以接管后 dsh 不再压 codebuddy 会话。
  * (源码核对:全仓 `compactIfNeeded` 只有这 2 处调用点,`compactNow` 只有
  * command-compact 一处;两者都接管后,dsh 侧没有任何路径能压 codebuddy 会话。)
  *
@@ -97,12 +102,26 @@ export declare function forwardCompactToCli(deps: CompactCommandDeps, sessionId:
  * 需要重建 CLI 上下文时的素材(`buildPrompt` / 原生 seed)。所以接管要彻底:
  * 那两条自动路径 + `compactNow` 兜底都不许压 codebuddy 会话。
  *
+ * **服务从哪来(2026-09-14 核实):** preset 把 compaction 放在 entry-local
+ * realm 里(`isolate: { compaction: true }`),realm 外的一切都看不到它——宿主
+ * ctx 看不到,**agent 自己的 ctx 也看不到**(`mount.ts:253` 的原文:"invisible to
+ * everything outside the group — including the agent's own scope context and the
+ * host")。所以不能靠 scope 猜;官方给"持有 agent 的外部调用者"留的路是
+ * `agentPresets.serviceFor(agent, name)`:按 fiber 归属在服务表里找出该会话
+ * preset 发布的那一个实例,并直接返回原始对象(不套 cordis 追踪代理)。
+ *
+ * **判定必须 per-agent:** 实例是按 preset 挂载共享的,但覆盖里的判断读的是
+ * "该会话最新一次请求的路由 provider",所以只有走本插件的会话跳过 dsh 压缩,
+ * 同一 preset 上的其它会话原样下调原方法(行为与不装接管时完全一致)。
+ *
  * 手动 `/compact` 不受影响:它走 per-agent 命令覆盖(`handleCompactCommand`),
  * 在回合空闲时由用户触发,那里才转发 CLI 并等 maintenance 相位。`compactNow`
  * 的接管只是兜底(命令覆盖没挂上时全局命令会走到它),避免那条路压镜像。
  * @param deps - 挂载依赖(路由名与会话映射)。
  */
 export declare function registerCompactDelegation(deps: CompactCommandDeps): void;
+/** 测试用:清掉"同一原因只报一次"与"每会话播报一次"的记忆。 */
+export declare function resetTakeoverStateForTests(): void;
 /**
  * 处理一次 /compact:codebuddy 会话转发 CLI,其它回落 dsh。
  * @param deps - 挂载依赖。

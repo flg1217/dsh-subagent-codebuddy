@@ -11,7 +11,6 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { spawn } from 'node:child_process'
-import { symbols } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { ConversationStore } from '../src/conversations.ts'
 import {
@@ -19,6 +18,7 @@ import {
   handleCompactCommand,
   mountCompactCommand,
   registerCompactDelegation,
+  resetTakeoverStateForTests,
 } from '../src/compact-command.ts'
 import type { CompactCommandDeps, CompactInvocation } from '../src/compact-command.ts'
 import { asSpawnResult, autoHandshake, fakeAcpProc, usage } from './fake-acp.ts'
@@ -31,6 +31,7 @@ const mockedSpawn = vi.mocked(spawn)
 
 beforeEach(() => {
   mockedSpawn.mockReset()
+  resetTakeoverStateForTests()
 })
 
 /** 内存态会话映射(不落盘)。 */
@@ -72,8 +73,10 @@ function mockCompactCliWithUsage(promptTokens: number, cacheHit: number): void {
 
 function makeDeps(compaction?: unknown): CompactCommandDeps & { store: ConversationStore } {
   const store = makeStore()
+  // 压缩实例按 dsh 的官方寻址取:realm 隔离让 `ctx.get('compaction')` 永远拿不到
+  // (宿主 ctx 与 agent.ctx 都看不到),只有 `agentPresets.serviceFor(agent, name)` 能。
   const ctx = {
-    get: (key: string) => (key === 'compaction' ? compaction : undefined),
+    get: (key: string) => (key === 'agentPresets' ? { serviceFor: () => compaction } : undefined),
   } as unknown as Context
   return {
     ctx,
@@ -273,31 +276,55 @@ describe('registerCompactDelegation:压缩接管', () => {
     }
   }
 
-  /** 假 compaction 服务 + 立即回调的 inject + 收集释放函数的 effect + 可触发的 pre-step。 */
-  function makeEngine(): {
+  /**
+   * 假 ctx:compaction 实例按 dsh 的官方寻址(`agentPresets.serviceFor`)给出,
+   * 记录日志、释放函数、serviceFor 调用,并暴露可触发的 agent 事件。
+   */
+  function makeEngine(engine: FakeEngine = new FakeEngine()): {
     ctx: Context
     engine: FakeEngine
+    infos: string[]
+    warns: string[]
+    serviceForCalls: Array<{ agent: unknown; name: string }>
     release: () => void
-    firePreStep: () => Promise<void>
+    fireCreated: (agent?: unknown) => void
+    firePreStep: (agent?: unknown) => Promise<void>
   } {
-    const engine = new FakeEngine()
+    const infos: string[] = []
+    const warns: string[] = []
     const disposers: Array<() => void> = []
+    const created: Array<(payload: unknown) => void> = []
     const preStep: Array<(payload: unknown, next: () => Promise<unknown>) => Promise<unknown> | unknown> = []
+    const serviceForCalls: Array<{ agent: unknown; name: string }> = []
     const ctx = {
-      inject: (_deps: string[], cb: (scoped: unknown) => void) => { cb({ compaction: engine }) },
       effect: (cb: () => () => void) => { disposers.push(cb()) },
-      get: (key: string) => (key === 'compaction' ? engine : undefined),
-      on: (event: string, listener: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown> | unknown) => {
-        if (event === 'agent/pre-step') preStep.push(listener)
+      get: (key: string) => (key === 'agentPresets'
+        ? {
+          serviceFor: (agent: unknown, name: string) => {
+            serviceForCalls.push({ agent, name })
+            return engine
+          },
+        }
+        : undefined),
+      on: (event: string, listener: unknown) => {
+        if (event === 'agent/created') created.push(listener as (payload: unknown) => void)
+        if (event === 'agent/pre-step') {
+          preStep.push(listener as (payload: unknown, next: () => Promise<unknown>) => Promise<unknown> | unknown)
+        }
         return () => {}
       },
+      logger: { info: (message: string) => { infos.push(message) }, warn: (message: string) => { warns.push(message) } },
     } as unknown as Context
     return {
       ctx,
       engine,
+      infos,
+      warns,
+      serviceForCalls,
       release: () => { for (const dispose of disposers) dispose() },
-      firePreStep: async () => {
-        for (const listener of preStep) await listener({}, async () => ({}))
+      fireCreated: (agent: unknown = agentOf('codebuddy')) => { for (const listener of created) listener({ agent }) },
+      firePreStep: async (agent: unknown = agentOf('codebuddy')) => {
+        for (const listener of preStep) await listener({ agent }, async () => ({}))
       },
     }
   }
@@ -318,16 +345,46 @@ describe('registerCompactDelegation:压缩接管', () => {
     // 设计:dsh 只是渲染层,真实上下文与压缩都由 CLI 自己负责。接管自动压缩入口
     // 后 compaction-basic 的两条自动路径都拿不到结果,不会碰会话镜像面。
     const deps = makeDeps()
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
     expect(engine.calls).toBe(0)
   })
 
+  it('按 agent 寻址:实例来自 agentPresets.serviceFor(agent, "compaction")', async () => {
+    // realm 隔离让宿主 ctx 与 agent.ctx 都看不到 compaction(实测:线上 inject 不触发、
+    // ctx.get 也是 undefined),官方通道是名册的 serviceFor——它按 fiber 归属找出该
+    // 会话 preset 发布的那一个实例。接管必须走这条路,不能靠猜 scope。
+    const deps = makeDeps()
+    const { ctx, engine, serviceForCalls, fireCreated } = makeEngine()
+    registerCompactDelegation({ ...deps, ctx })
+    const agent = agentOf('codebuddy')
+    fireCreated(agent)
+    expect(serviceForCalls).toEqual([{ agent, name: 'compaction' }])
+    expect(await engine.compactIfNeeded(agent, 'pressure', signal())).toBeNull()
+  })
+
+  it('agent/created 即接管,且 step 边界复核幂等(不重复包装)', async () => {
+    // compaction 的 pre-step 监听器注册得比我们早:接管晚一步,那一轮就已经被
+    // dsh 压过一次。所以 agent/created 就要装上;复核必须幂等——包装两层会让
+    // "原方法"变成上一层的包装,非 codebuddy 会话就会多绕一圈。
+    const deps = makeDeps()
+    const { ctx, engine, fireCreated, firePreStep } = makeEngine()
+    registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
+    expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
+    await firePreStep()
+    expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
+    expect(await engine.compactIfNeeded(agentOf('cpa'), 'pressure', signal())).toEqual({ compacted: true })
+    expect(engine.calls).toBe(1)
+  })
+
   it('非 codebuddy 路由 → 原样下调原方法(内置压缩不动)', async () => {
     const deps = makeDeps()
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('cpa'), 'pressure', signal()))
       .toEqual({ compacted: true })
     expect(engine.calls).toBe(1)
@@ -338,8 +395,9 @@ describe('registerCompactDelegation:压缩接管', () => {
     // 永不压缩(映射记录不会消失)。判据必须是最新请求的路由 provider。
     const deps = makeDeps()
     deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
     expect(await engine.compactIfNeeded(agentOf('cpa'), 'pressure', signal()))
       .toEqual({ compacted: true })
@@ -354,38 +412,20 @@ describe('registerCompactDelegation:压缩接管', () => {
     // 也不能另开 CLI 连接(会与回合泵持有的同一会话冲突)。
     mockCompactCli()
     const deps = makeDeps()
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'context-overflow', signal())).toBeNull()
     expect(engine.calls).toBe(0)
     expect(mockedSpawn).not.toHaveBeenCalled()
   })
 
-  it('cordis 追踪代理:接管必须落到真实实例(代理读回看不到自有属性)', async () => {
-    // 回归:`ctx.compaction` 是 cordis 代理——读解析原型方法、写转发到实例。若把
-    // 代理当真实实例校验,会误判"不可覆写"并放弃接管(线上压缩风暴的成因之一)。
-    const deps = makeDeps()
-    const engine = new FakeEngine()
-    const proxy = new Proxy(engine, {
-      get: (target, key, receiver) => (key === symbols.original ? target : Reflect.get(target, key, receiver)),
-      set: (target, key, value) => Reflect.set(target, key, value),
-    })
-    const ctx = {
-      inject: (_deps: string[], cb: (scoped: unknown) => void) => cb({ compaction: proxy }),
-      effect: () => {},
-      get: () => proxy,
-      on: () => () => {},
-    } as unknown as Context
-    registerCompactDelegation({ ...deps, ctx })
-    expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
-    expect(engine.calls).toBe(0)
-  })
-
   it('自愈:接管丢失后,step 边界复核就地重装', async () => {
     const deps = makeDeps()
-    const { ctx, engine, firePreStep } = makeEngine()
+    const { ctx, engine, fireCreated, firePreStep } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
     // 模拟接管丢失(服务被替换 / 属性被清):原型方法重新生效。
     delete (engine as unknown as Record<string, unknown>)['compactIfNeeded']
@@ -399,8 +439,9 @@ describe('registerCompactDelegation:压缩接管', () => {
 
   it('插件卸载/热重载 → 还原原型方法(不留接管)', async () => {
     const deps = makeDeps()
-    const { ctx, engine, release } = makeEngine()
+    const { ctx, engine, fireCreated, release } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
     release()
     expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal()))
@@ -412,72 +453,85 @@ describe('registerCompactDelegation:压缩接管', () => {
     // per-agent 的 `compact` 命令覆盖没挂上时,全局 /compact 会走 compactNow。
     // 那条路同样不许压镜像(压缩是 CLI 的事)。
     const deps = makeDeps()
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactNow(agentOf('codebuddy'), signal(), 'cmd-1')).toBeNull()
     expect(engine.manualCalls).toBe(0)
   })
 
   it('手动路径兜底:非 codebuddy 路由的 compactNow 原样下调', async () => {
     const deps = makeDeps()
-    const { ctx, engine } = makeEngine()
+    const { ctx, engine, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(await engine.compactNow(agentOf('cpa'), signal(), 'cmd-1'))
       .toEqual({ compactedManually: true })
     expect(engine.manualCalls).toBe(1)
   })
 
   it('自检:接管失败要吵出来(不静默失效 → 压缩风暴复现)', () => {
-    // dsh 若把 compactIfNeeded 改成实例自有属性/改名,接管会静默失效。用不可写
-    // 的实例属性模拟,断言必须落一条 warn。
+    // dsh 若把 compactIfNeeded 改名/改成不可覆写,接管会静默失效。用不可写的实例
+    // 属性模拟,断言必须落一条 warn——而不是安静地不压(那正是线上踩过的坑)。
     const deps = makeDeps()
-    const warns: string[] = []
     const engine = Object.defineProperty({}, 'compactIfNeeded', {
       value: async (): Promise<unknown> => ({}),
       writable: false,
       configurable: false,
     })
-    const ctx = {
-      inject: (_deps: string[], cb: (scoped: unknown) => void) => cb({ compaction: engine }),
-      get: () => engine,
-      effect: () => {},
-      on: () => () => {},
-      logger: { info: () => {}, warn: (message: string) => { warns.push(message) } },
-    } as unknown as Context
+    const { ctx, warns, fireCreated } = makeEngine(engine as unknown as FakeEngine)
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     expect(warns.some(message => message.includes('未生效'))).toBe(true)
   })
 
   it('接管生效时播报一次(每个会话一次),日志缺失也不炸', async () => {
     const deps = makeDeps()
-    const infos: string[] = []
-    const engine = new FakeEngine()
-    const ctx = {
-      inject: (_deps: string[], cb: (scoped: unknown) => void) => cb({ compaction: engine }),
-      get: () => engine,
-      effect: () => {},
-      on: () => () => {},
-      logger: { info: (message: string) => { infos.push(message) }, warn: () => {} },
-    } as unknown as Context
+    const { ctx, engine, infos, fireCreated } = makeEngine()
     registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
     await engine.compactIfNeeded(agentOf('codebuddy', 's-announce'), 'pressure', signal())
     await engine.compactIfNeeded(agentOf('codebuddy', 's-announce'), 'context-overflow', signal())
     expect(infos.filter(message => message.includes('已接管')).length).toBe(1)
 
     // 没有 logger 的 ctx 不得抛错(日志不该拖垮接管)。
-    const bare = makeEngine()
-    const bareCtx = { ...(bare.ctx as unknown as Record<string, unknown>) }
-    expect(() => registerCompactDelegation({ ...deps, ctx: bareCtx as unknown as Context })).not.toThrow()
-  })
-
-  it('拿不到 compaction 服务的 ctx 不炸(旧版 dsh / 服务未装载)', () => {
-    const deps = makeDeps()
-    const ctx = {
-      inject: (_deps: string[], cb: (scoped: unknown) => void) => cb({}),
+    const bare = {
       effect: () => {},
-      get: () => undefined,
+      get: () => ({ serviceFor: () => engine }),
       on: () => () => {},
     } as unknown as Context
+    expect(() => registerCompactDelegation({ ...deps, ctx: bare })).not.toThrow()
+  })
+
+  it('旧版 dsh 没有名册服务 → 不炸,且只告警一次(不刷屏)', () => {
+    const deps = makeDeps()
+    const warns: string[] = []
+    const ctx = {
+      get: () => undefined,
+      on: (event: string, listener: (payload: unknown) => void) => {
+        if (event === 'agent/created') listener({ agent: agentOf('codebuddy') })
+        return () => {}
+      },
+      logger: { info: () => {}, warn: (message: string) => { warns.push(message) } },
+    } as unknown as Context
     expect(() => registerCompactDelegation({ ...deps, ctx })).not.toThrow()
+    expect(warns.filter(message => message.includes('agentPresets')).length).toBe(1)
+  })
+
+  it('preset 未挂 compaction(serviceFor 返回 undefined)→ 不炸,也不算"失效"', () => {
+    // 没有 compaction 服务的 preset 本来就压不动,不存在压缩风暴:这种情况不该报
+    // "接管未生效"级别的告警(否则日志里全是假警报)。
+    const deps = makeDeps()
+    const warns: string[] = []
+    const ctx = {
+      get: (key: string) => (key === 'agentPresets' ? { serviceFor: () => undefined } : undefined),
+      on: (event: string, listener: (payload: unknown) => void) => {
+        if (event === 'agent/created') listener({ agent: agentOf('codebuddy') })
+        return () => {}
+      },
+      logger: { info: () => {}, warn: (message: string) => { warns.push(message) } },
+    } as unknown as Context
+    expect(() => registerCompactDelegation({ ...deps, ctx })).not.toThrow()
+    expect(warns.some(message => message.includes('未生效'))).toBe(false)
   })
 })
