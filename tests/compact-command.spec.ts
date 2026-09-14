@@ -11,6 +11,7 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { spawn } from 'node:child_process'
+import { symbols } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { ConversationStore } from '../src/conversations.ts'
 import {
@@ -421,6 +422,33 @@ describe('registerCompactDelegation:压缩接管', () => {
     expect(mockedSpawn).not.toHaveBeenCalled()
   })
 
+  it('cordis 追踪代理:覆盖必须落到真实实例(代理上 identity 永远不等)', async () => {
+    // `Service` 实例带 symbols.tracker,经 getTraceable 读出来是追踪代理:get 对函数
+    // 属性每次返回新的 shadow 包装(identity 必然不等),set 把值写到 shadow 而不是
+    // 实例。线上实测就是在这上面报的"不可覆写"——覆盖前必须先解包 symbols.original。
+    // 自动路径调的是实例自己的方法,所以覆盖落在 raw 上才算数。
+    const deps = makeDeps()
+    const raw = new FakeEngine()
+    const shadow: Record<string, unknown> = {}
+    const proxy = new Proxy(raw, {
+      get: (target, key, receiver) => {
+        if (key === symbols.original) return target
+        const value = Reflect.get(target, key, receiver)
+        return typeof value === 'function'
+          ? (...args: unknown[]) => (value as (...a: unknown[]) => unknown).apply(target, args)
+          : value
+      },
+      set: (_target, key, value) => { shadow[String(key)] = value; return true },
+    })
+    const { ctx, fireCreated } = makeEngine(proxy as unknown as FakeEngine)
+    registerCompactDelegation({ ...deps, ctx })
+    fireCreated()
+    expect(await raw.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
+    expect(raw.calls).toBe(0)
+    expect(await raw.compactIfNeeded(agentOf('cpa'), 'pressure', signal())).toEqual({ compacted: true })
+    expect(raw.calls).toBe(1)
+  })
+
   it('自愈:接管丢失后,step 边界复核就地重装', async () => {
     const deps = makeDeps()
     const { ctx, engine, fireCreated, firePreStep } = makeEngine()
@@ -483,6 +511,8 @@ describe('registerCompactDelegation:压缩接管', () => {
     registerCompactDelegation({ ...deps, ctx })
     fireCreated()
     expect(warns.some(message => message.includes('未生效'))).toBe(true)
+    // 告警要带失败原因(只报"没生效"没法定位,线上踩过)。
+    expect(warns.some(message => message.includes('抛错'))).toBe(true)
   })
 
   it('接管生效时播报一次(每个会话一次),日志缺失也不炸', async () => {

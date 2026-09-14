@@ -29,6 +29,7 @@
  * @module subagent-codebuddy/compact-command
  */
 
+import { symbols } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, usageOfUpdate } from './acp.js'
 import { appendFileSync, mkdirSync } from 'node:fs'
@@ -322,6 +323,21 @@ function reportOnce(ctx: Context, key: string, message: string): void {
 /** 已装覆盖的引擎(自愈复核用:读回校验,避免每步重复赋值)。 */
 const patchedEngines = new WeakMap<object, { compactIfNeeded?: unknown; compactNow?: unknown }>()
 
+/**
+ * 解包 cordis 追踪代理,取真实服务实例。
+ *
+ * cordis 的 `Service` 基类在构造时给实例打上 `symbols.tracker`,任何经
+ * `getTraceable` 读出来的引用都是**追踪代理**;而 `serviceFor` 走的也是同一批
+ * 引用。代理上做不了"写后读回"校验:它的 get 对函数属性每次返回一个新的 shadow
+ * 包装(identity 必然不等),set 又把值写到 shadow 而不是真实实例——线上实测
+ * 就是这里报的"不可覆写"。就算写"成功"也影响不到自动路径:compaction-basic 的
+ * 监听器调的是实例自己的方法(`this.compactIfNeeded(...)`),不是代理。
+ * 所以覆盖前必须先解包(`symbols.original` 由代理的 get 直接返回 target)。
+ */
+function realEngineOf(engine: CompactionFace): CompactionFace {
+  return ((engine as unknown as Record<symbol, unknown>)[symbols.original] ?? engine) as CompactionFace
+}
+
 /** 测试用:清掉"同一原因只报一次"与"每会话播报一次"的记忆。 */
 export function resetTakeoverStateForTests(): void {
   reportedReasons.clear()
@@ -338,7 +354,7 @@ function ensureTakeover(deps: CompactCommandDeps, engine: CompactionFace | undef
   // 拿不到实例的原因由 engineForAgent 分类播报(无名册服务 / preset 未挂 compaction),
   // 这里只做"没有可接管对象"的静默返回。
   if (engine === undefined) return false
-  const target = engine
+  const target = realEngineOf(engine)
   let installed = patchedEngines.get(target as object)
   if (installed === undefined) {
     installed = {}
@@ -365,9 +381,10 @@ function ensureTakeover(deps: CompactCommandDeps, engine: CompactionFace | undef
     announceTakeover(log, deps, agent, `自动压缩(${trigger})`)
     return null
   }
-  if (!assignOverride(target, 'compactIfNeeded', patched, deps.ctx)) {
-    takeoverLog(`自动压缩接管失败(via=${via}):compactIfNeeded 不可覆写`)
-    log.warn(`${LOG_TAG} 自动压缩接管未生效(compactIfNeeded 不可覆写):`
+  const failure = assignOverride(target, 'compactIfNeeded', patched, deps.ctx)
+  if (failure !== undefined) {
+    takeoverLog(`自动压缩接管失败(via=${via}):${failure}`)
+    log.warn(`${LOG_TAG} 自动压缩接管未生效(${failure}):`
       + 'codebuddy 会话可能出现 dsh 侧压缩风暴,请核对 dsh 版本')
     return false
   }
@@ -383,31 +400,40 @@ function ensureTakeover(deps: CompactCommandDeps, engine: CompactionFace | undef
       announceTakeover(log, deps, face, '手动压缩')
       return null
     }
-    if (assignOverride(target, 'compactNow', patchedNow, deps.ctx)) installed.compactNow = patchedNow
+    if (assignOverride(target, 'compactNow', patchedNow, deps.ctx) === undefined) {
+      installed.compactNow = patchedNow
+    }
   }
   return true
 }
 
 /**
  * 在真实服务实例上装一个覆盖方法,并在插件卸载时还原(删掉自有属性 → 原型方法
- * 重新生效)。安装不成功返回 `false`,调用方据此决定要不要告警。
+ * 重新生效)。装不上返回失败原因(进日志):接管失效必须一眼看出**为什么**,
+ * 只报一句"没生效"没法定位(实测踩过)。
  */
 function assignOverride<K extends 'compactIfNeeded' | 'compactNow'>(
   target: CompactionFace,
   key: K,
   patched: NonNullable<CompactionFace[K]>,
   ctx: Context,
-): boolean {
+): string | undefined {
   try {
     target[key] = patched
-  } catch {
-    return false
+  } catch (error) {
+    return `赋值抛错(${error instanceof Error ? error.message : String(error)})`
   }
-  if (target[key] !== patched) return false
+  if (target[key] !== patched) {
+    const desc = Object.getOwnPropertyDescriptor(target, key)
+    return '写后读回不是同一个函数(自有描述符='
+      + `${desc === undefined ? '无' : `writable=${String(desc.writable)}`};`
+      + `可扩展=${String(Object.isExtensible(target))};`
+      + `自有键=${Object.getOwnPropertyNames(target).join('|')})`
+  }
   ctx.effect(() => () => {
     if (target[key] === patched) delete target[key]
   })
-  return true
+  return undefined
 }
 
 /**
@@ -460,8 +486,12 @@ function announceTakeover(
   const sessionId = agent.session?.id
   if (typeof sessionId !== 'string' || announcedSessions.has(sessionId)) return
   announcedSessions.add(sessionId)
-  log.info(`${LOG_TAG} 已接管 ${sessionId} 的 dsh 压缩(${what};provider=${deps.providerName}):`
-    + '压缩由 CodeBuddy CLI 自行完成,dsh 不再压镜像消息')
+  // 双写:控制台日志的可见性取决于部署的 logger 配置(实测 ctx.logger.info 到不了
+  // 启动日志文件),而"某个会话到底有没有被拦住"必须可事后核对 → 落盘那份才算数。
+  const line = `${LOG_TAG} 已接管 ${sessionId} 的 dsh 压缩(${what};provider=${deps.providerName}):`
+    + '压缩由 CodeBuddy CLI 自行完成,dsh 不再压镜像消息'
+  takeoverLog(line)
+  log.info(line)
 }
 
 /**
