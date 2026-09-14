@@ -22,6 +22,7 @@ import z from '@deepseek-ai/schemastery'
 import { CodebuddyLlmAdapter } from './adapter.js'
 import { ConversationStore } from './conversations.js'
 import { mountCompactCommand, registerCompactDelegation } from './compact-command.js'
+import { registerCompactMirror } from './compact-mirror.js'
 import { syncCliIntegrations } from './cli-integrations.js'
 import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
@@ -161,9 +162,10 @@ export function apply(ctx: Context, config: Config): void {
     extraArgs: config.extraArgs ?? [],
     modelOf: () => settingsOf().model,
     conversations,
+    providerName,
   })
 
-  // 自动压缩(阈值触发)也交给 CLI:compaction-basic 的委托点由插件接管。
+  // 自动压缩(阈值触发)也交给 CLI:插件接管 compaction 服务的自动压缩入口。
   registerCompactDelegation({
     ctx,
     command: resolved.command,
@@ -171,7 +173,12 @@ export function apply(ctx: Context, config: Config): void {
     extraArgs: config.extraArgs ?? [],
     modelOf: () => settingsOf().model,
     conversations,
+    providerName,
   })
+
+  // CLI 自己压完之后,dsh 界面得有压缩卡(纯逻辑同步:照抄 CLI 的摘要原文,
+  // 不调模型、不消耗 token)。
+  registerCompactMirror({ ctx, conversations, providerName })
 
   /**
    * opt-in 委派工具:spawn 子代理(进程内、continuable 可续聊),模型路由指

@@ -20,6 +20,7 @@
 | **任务/todo 桥接** | `TaskCreate` / `TaskUpdate` / `todo_write` 折算为 dsh `todo/write` 整表快照事件，主轮与子代理会话都复用 dsh 的 TodoPanel 渲染 |
 | **工具桥（MCP / delegate）** | 把本会话可见的 dsh 工具暴露给 CodeBuddy，使它的文件/命令类能力走 dsh 管线（审批/沙箱/审计/后台面板）。默认 `mcp`：dsh 起 HTTP MCP server，工具以 `mcp__dsh__<名>` 一等公民呈现（完整 JSON Schema 强约束）；`delegate` 为旧通道（`dsh_<名>` 合成 DelegateTool），保留作回退 |
 | **opt-in 工具** | `subagent_codebuddy` + `list_codebuddy_models`（`registerSubagentTools: true` 开启；默认关闭，推荐通用工具） |
+| **压缩归属** | codebuddy 会话的压缩由 **CLI 负责**（dsh 的自动压缩被插件接管，不压镜像）；CLI 压完之后镜像成 dsh 的标准压缩卡，**零 token**（见 §三「压缩归属」） |
 
 **语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**文件/命令类原生工具已被
 白名单移除**（spawn 传 `--tools`，见 §三「工具桥」）。因此：
@@ -153,6 +154,36 @@ MCP 端点的安全约束：**仅 loopback 来源 + URL 携带每进程随机 ke
 - **假死防御**:进展性 update 重置动态空闲阈值；**工具在途期间暂停计时**
   （ACP 工具无心跳，完成即重新起算）；静默超阈值先 `session/cancel`、5s 后 kill。
 - CodeBuddy 的模型、网络与配额由 CodeBuddy 侧负责，插件只做桥接。
+
+### 压缩归属（重要）
+
+**codebuddy 会话的压缩由 CLI 负责，dsh 不参与。** 这不是可选项，是架构约束：dsh 只是渲染层，
+真实上下文在 CLI 自己的会话文件里；而 dsh 的压力测量以 CLI 上报的 usage 为基线，它唯一能压的
+却是 dsh 侧的镜像消息面 —— 压完压力不降 → 下一个 step 再触发；`compaction-basic` 的收缩闸门
+（`summary is not smaller than the shadowed content`）在镜像面只剩旧摘要时必然拒绝，于是变成
+**压缩风暴**（实测：11 分钟内 20+ 次 `compaction/start` → `compaction/end(error)`），
+偶发成功的那几次还会把镜像面替换成摘要、把模型带偏。
+
+实现方式（**零 dsh 源码改动**）：
+
+| 路径 | 行为 |
+|---|---|
+| 自动压缩（`agent/pre-step` 的 pressure / `agent/request-error` 的 context-overflow） | 插件在 `ctx.compaction` 服务实例上接管 `compactIfNeeded`；codebuddy 路由的会话一律返回 `null` |
+| 手动 `/compact` | per-agent 命令覆盖 → 转发给 CLI（跑在 `runMaintenance` 相位里，压缩期间消息按原生行为排队） |
+| `compactNow` 兜底 | per-agent 覆盖没挂上时全局命令会走到它 → 同样接管，不压镜像 |
+| **CLI 自己压完之后** | `compact-mirror` 把这次压缩镜像成 dsh 的一次压缩事务 → 界面出现标准压缩卡。**零 token**：照抄 CLI 的摘要原文，不调用任何模型，只有本地文件读取 + 日志写入 |
+
+判据是**会话最新一次请求的路由 provider**（不是持久化的会话映射）——把 codebuddy 会话切回别的
+provider 后，dsh 会恢复正常压缩。
+
+> 压缩卡**不会隐藏或删除任何历史消息**：被遮蔽的消息照常渲染，dsh 的历史接口不做过滤。
+> 压缩改的是 dsh 的 **surface**（上下文压力表，以及插件需要重建 CLI 上下文时的素材
+> `buildPrompt` / 原生 seed）。
+
+**启动自检与告警**（不会再静默失效）：插件装载时自检接管是否真的落到实例上，dsh 升级若改了
+压缩入口，控制台会出现 `[subagent-codebuddy/compact] …未生效/未安装` 的 warn；正常接管时每个
+codebuddy 会话播报一次 `已接管 <sessionId> 的 dsh 压缩`；镜像成功时播报
+`[subagent-codebuddy/mirror] 已把 CodeBuddy CLI 的压缩镜像到 dsh 会话 <id>…`。
 
 ## 四、参与开发
 

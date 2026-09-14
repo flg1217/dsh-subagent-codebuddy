@@ -24,8 +24,12 @@
  * @module subagent-codebuddy/compact-command
  */
 
+import { symbols } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, usageOfUpdate } from './acp.js'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { ConversationStore } from './conversations.js'
 import { TurnPump } from './pump.js'
 
@@ -65,8 +69,18 @@ export interface CompactCommandDeps {
   extraArgs: string[]
   modelOf: () => string
   conversations: ConversationStore
+  /** 本插件注册的 provider 名:自动压缩按"最新请求是否路由到它"判定归属。 */
+  providerName: string
   /** 该会话的回合泵是否在跑(默认查 TurnPump;测试可注入)。 */
   isSessionBusy?: (sessionId: string) => boolean
+}
+
+/** 自动压缩接管要读的会话面(会话 id + 最新一次请求的路由 provider)。 */
+interface CompactDelegableAgent {
+  readonly session?: {
+    readonly id?: unknown
+    readonly requestHeader?: () => { config?: { provider?: string } } | undefined
+  }
 }
 
 /** 转发 `/compact` 的等待上限(压缩可能很久,给足 15 分钟)。 */
@@ -149,10 +163,17 @@ export async function forwardCompactToCli(
 
 /** compaction 服务面(最小结构类型,不引 compaction 包)。 */
 interface CompactionFace {
+  /** 手动压缩入口(空闲会话,`/compact` 用)。 */
   compactNow?: (agent: unknown, signal: AbortSignal, commandId: string) => Promise<{
     shadowedSeqs: readonly unknown[]
     shadowedTokenCount: number
   } | null>
+  /** 自动压缩入口(压力阈值与 context-overflow 共用;接管点见 registerCompactDelegation)。 */
+  compactIfNeeded?: (
+    agent: CompactDelegableAgent,
+    trigger: string,
+    signal: AbortSignal,
+  ) => Promise<unknown>
 }
 
 /** 非 codebuddy 会话:保持 dsh 自己的手动压缩行为。 */
@@ -175,40 +196,216 @@ async function dshCompact(deps: CompactCommandDeps, invocation: CompactInvocatio
 }
 
 /**
- * 自动压缩委托:compaction-basic 在阈值触发时先发 `compaction/delegate`。
+ * 自动压缩接管:codebuddy 会话**一律不做 dsh 压缩** —— dsh 只是渲染层,
+ * 真实上下文与压缩都由 CLI 自己负责。
  *
- * **codebuddy 会话在此一律回报 handled —— dsh 不参与压缩。**
- * 真实上下文与压缩都由 CLI 自己负责(buddy 按自身策略压缩其会话);dsh 侧消息
- * 只是渲染镜像。所以这里**既不做 dsh 压缩,也不代 CLI 发起压缩**,只声明
- * "由我方处理",让 compaction-basic 走 `if (delegated?.handled === true) return null`
- * 跳过自身压缩。若让 dsh 压,有两个害处:① 压不动真实压力(dsh 的测量以 CLI 的
- * usage 为基线,压缩对象却是 dsh 侧残余);② 被压掉的消息会**从 UI 上消失**
- * (替换成摘要)——用户直接看到"消息被删了"。
+ * **为什么必须拦在 `compactIfNeeded` 上(2026-09-14 实测):** dsh 侧没有
+ * "把压缩委托出去"的事件缝(曾按 `compaction/delegate` 事件写过一版,源码核对
+ * 后确认 compaction-basic 从不发这个事件 → 监听器永不触发,等于死代码)。
+ * 现在改为在 `ctx.compaction` 服务实例上就地接管压缩入口:compaction-basic
+ * 的两条自动路径(`agent/pre-step` 的 pressure、`agent/request-error` 的
+ * context-overflow)都是 `this.compactIfNeeded(...)`,实例上的自有属性会遮蔽
+ * 原型方法,所以接管后 dsh 不再压 codebuddy 会话。
+ * (源码核对:全仓 `compactIfNeeded` 只有这 2 处调用点,`compactNow` 只有
+ * command-compact 一处;两者都接管后,dsh 侧没有任何路径能压 codebuddy 会话。)
  *
- * 为什么不能在这里转发 `/compact` 给 CLI(源码核对 + 实测):本委托的**两个**
- * 触发点都在回合进行中——`agent/pre-step` 的 pressure(`compaction-basic:154`)
- * 与 `agent/request-error` 的 context-overflow(`:195`);而 `runMaintenance`
- * 只在 agent `phase==='idle'` 时可用(`agent-loop/src/agent.ts:157`,否则同步
- * 抛错),自动路径**必然**拿不到 maintenance 相位。此时若另开第二条 CLI 连接
- * 去压,又会与回合泵持有的同一会话冲突(压缩结果会被回合泵的 CLI 覆盖)。
- * 故自动压缩交回 CLI 自身,插件不介入。
+ * **不接管的害处(实测复现):** dsh 的压力测量以 CLI 上报的 usage 为基线
+ * (CLI 的真实上下文),能压的却只有 dsh 侧的镜像消息;压完压力不降 → 下一个
+ * step 再次触发 → 每个 step 都跑一次摘要,而 `region.ts` 的收缩闸门
+ * (`summary is not smaller than the shadowed content`)在镜像面只剩旧摘要时
+ * 必然拒绝,于是 11 分钟内连打 20+ 次 `compaction/start` → `compaction/end(error)`
+ * (压缩风暴);偶发成功的那几次还会把镜像面替换成摘要,模型随即"重新找方向"
+ * (日志里出现 "Let me re-orient"),界面上也多出一张本不该有的压缩卡。
+ *
+ * 注意 dsh 的 replace **不会隐藏或删除任何历史消息**(UI 照常渲染被遮蔽的消息,
+ * 历史接口也不做过滤)——它改的是 dsh 的 **surface**:上下文压力表,以及插件
+ * 需要重建 CLI 上下文时的素材(`buildPrompt` / 原生 seed)。所以接管要彻底:
+ * 那两条自动路径 + `compactNow` 兜底都不许压 codebuddy 会话。
  *
  * 手动 `/compact` 不受影响:它走 per-agent 命令覆盖(`handleCompactCommand`),
- * 在回合空闲时由用户触发,那里才转发 CLI 并等 maintenance 相位。
- * @param deps - 挂载依赖(命令/参数/会话映射)。
+ * 在回合空闲时由用户触发,那里才转发 CLI 并等 maintenance 相位。`compactNow`
+ * 的接管只是兜底(命令覆盖没挂上时全局命令会走到它),避免那条路压镜像。
+ * @param deps - 挂载依赖(路由名与会话映射)。
  */
 export function registerCompactDelegation(deps: CompactCommandDeps): void {
-  const onDelegate = async (
-    request: { agent?: { session?: { id?: unknown } } },
-    next: () => Promise<unknown>,
-  ): Promise<unknown> => {
-    const sessionId = request.agent?.session?.id
-    // 非 codebuddy 会话:dsh 自己的压缩,行为不变。
-    if (typeof sessionId !== 'string' || deps.conversations.get(sessionId) === undefined) return await next()
-    // codebuddy 会话:dsh 不参与——真实压缩由 CLI 自行完成。
-    return { handled: true }
+  // 服务访问必须在 inject 作用域内(直接读 ctx.compaction 会抛 "cannot get
+  // property without inject")。compaction 服务热重载时 inject 会重跑,重新接管。
+  deps.ctx.inject(['compaction'], (compactionCtx: Context) => {
+    ensureTakeover(deps, (compactionCtx as unknown as { compaction?: CompactionFace }).compaction, 'inject')
+  })
+  // 自愈复核:每个 step 边界检查一次接管是否仍在(命中缓存即返回,零成本)。
+  // 覆盖 inject 未触发、服务被替换、热重载等"接管静默丢失"的路径——压缩风暴的
+  // 代价远高于一次读表,而静默失效恰恰是最难发现的那种(实测踩过)。
+  deps.ctx.on('agent/pre-step', async (_payload, next) => {
+    ensureTakeover(deps, engineOf(deps.ctx), 'pre-step')
+    return await next()
+  })
+}
+
+/** 真实引擎 → 已装的覆盖(自愈复核用:读回校验,避免每步重复赋值)。 */
+const patchedEngines = new WeakMap<object, { compactIfNeeded?: unknown; compactNow?: unknown }>()
+
+/**
+ * 解包 cordis 追踪代理取真实服务实例:`ctx.compaction` 是代理——赋值会转发,
+ * 但**读回会解析到原型方法**,所以校验/复核必须针对真实实例。
+ */
+function realEngineOf(engine: CompactionFace): CompactionFace {
+  return ((engine as unknown as Record<symbol, unknown>)[symbols.original] ?? engine) as CompactionFace
+}
+
+/** 取 compaction 服务(不抛的安全入口;拿不到返回 undefined)。 */
+function engineOf(ctx: Context): CompactionFace | undefined {
+  try {
+    return (ctx as unknown as { get?: (name: string) => unknown }).get?.('compaction') as CompactionFace | undefined
+  } catch {
+    return undefined
   }
-  ;(deps.ctx as unknown as { on?: (name: string, handler: unknown) => void }).on?.('compaction/delegate', onDelegate)
+}
+
+/**
+ * 安装(或复核)接管。幂等:同一真实引擎只装一次,之后每次调用只是一次读表
+ * 校验;发现覆盖丢失(服务替换/热重载/被清掉)会就地重装。
+ * @returns 自动压缩接管当前是否生效。
+ */
+function ensureTakeover(deps: CompactCommandDeps, engine: CompactionFace | undefined, via: string): boolean {
+  const log = loggerOf(deps.ctx)
+  if (engine === undefined) {
+    takeoverLog(`未拿到 compaction 服务(via=${via}):接管未安装`)
+    log.warn(`${LOG_TAG} 拿不到 compaction 服务(via=${via}):压缩接管未安装,dsh 会压 codebuddy 会话(压缩风暴)`)
+    return false
+  }
+  const target = realEngineOf(engine)
+  let installed = patchedEngines.get(target as object)
+  if (installed === undefined) {
+    installed = {}
+    patchedEngines.set(target as object, installed)
+  }
+
+  // ── 自动路径:pressure + context-overflow ────────────────────────────────
+  if (installed.compactIfNeeded !== undefined && target.compactIfNeeded === installed.compactIfNeeded) {
+    return true
+  }
+  if (typeof target.compactIfNeeded !== 'function') {
+    takeoverLog(`未找到 compaction.compactIfNeeded(via=${via}):自动压缩接管未安装`)
+    log.warn(`${LOG_TAG} 未找到 compaction.compactIfNeeded(via=${via}):自动压缩接管未安装,`
+      + 'codebuddy 会话可能出现 dsh 侧压缩风暴,请核对 dsh 版本')
+    return false
+  }
+  const original = target.compactIfNeeded.bind(target)
+  const patched: NonNullable<CompactionFace['compactIfNeeded']> = async (
+    agent,
+    trigger,
+    signal,
+  ) => {
+    if (!isCodebuddyOwned(deps, agent)) return await original(agent, trigger, signal)
+    announceTakeover(log, deps, agent, `自动压缩(${trigger})`)
+    return null
+  }
+  if (!assignOverride(target, 'compactIfNeeded', patched, deps.ctx)) {
+    takeoverLog(`自动压缩接管失败(via=${via}):compactIfNeeded 不可覆写`)
+    log.warn(`${LOG_TAG} 自动压缩接管未生效(compactIfNeeded 不可覆写):`
+      + 'codebuddy 会话可能出现 dsh 侧压缩风暴,请核对 dsh 版本')
+    return false
+  }
+  installed.compactIfNeeded = patched
+  takeoverLog(`已接管自动压缩(via=${via})`)
+
+  // ── 手动路径兜底:per-agent 命令覆盖没挂上时,全局 /compact 会走这里 ──────
+  if (installed.compactNow === undefined && typeof target.compactNow === 'function') {
+    const originalNow = target.compactNow.bind(target)
+    const patchedNow: NonNullable<CompactionFace['compactNow']> = async (agent, signal, commandId) => {
+      const face = agent as CompactDelegableAgent
+      if (!isCodebuddyOwned(deps, face)) return await originalNow(agent, signal, commandId)
+      announceTakeover(log, deps, face, '手动压缩')
+      return null
+    }
+    if (assignOverride(target, 'compactNow', patchedNow, deps.ctx)) installed.compactNow = patchedNow
+  }
+  return true
+}
+
+/**
+ * 在真实服务实例上装一个覆盖方法,并在插件卸载时还原(删掉自有属性 → 原型方法
+ * 重新生效)。安装不成功返回 `false`,调用方据此决定要不要告警。
+ */
+function assignOverride<K extends 'compactIfNeeded' | 'compactNow'>(
+  target: CompactionFace,
+  key: K,
+  patched: NonNullable<CompactionFace[K]>,
+  ctx: Context,
+): boolean {
+  try {
+    target[key] = patched
+  } catch {
+    return false
+  }
+  if (target[key] !== patched) return false
+  ctx.effect(() => () => {
+    if (target[key] === patched) delete target[key]
+  })
+  return true
+}
+
+/**
+ * 接管诊断落盘(`~/.dsh/codebuddy/compact-takeover.log`):控制台日志会随终端
+ * 滚掉,"接管到底装没装"必须可事后核对(实测:静默失效时无从判断)。
+ */
+function takeoverLog(line: string): void {
+  try {
+    mkdirSync(join(homedir(), '.dsh', 'codebuddy'), { recursive: true })
+    appendFileSync(join(homedir(), '.dsh', 'codebuddy', 'compact-takeover.log'),
+      `${new Date().toISOString()} ${line}\n`)
+  } catch { /* 诊断不影响主流程 */ }
+}
+/** 日志前缀(便于在 dsh 控制台/日志里定位本插件的压缩接管)。 */
+const LOG_TAG = '[subagent-codebuddy/compact]'
+
+/** 只依赖 info/warn 两个方法的最小日志面。 */
+interface LoggerFace {
+  info: (message: string) => void
+  warn: (message: string) => void
+}
+
+const NOOP_LOGGER: LoggerFace = { info: () => {}, warn: () => {} }
+
+/** 取 cordis 日志服务;拿不到就退化成静默(日志不该拖垮接管)。 */
+function loggerOf(ctx: Context): LoggerFace {
+  try {
+    const logger = (ctx as unknown as { logger?: Partial<LoggerFace> }).logger
+    if (logger === undefined) return NOOP_LOGGER
+    return {
+      info: typeof logger.info === 'function' ? logger.info.bind(logger) : NOOP_LOGGER.info,
+      warn: typeof logger.warn === 'function' ? logger.warn.bind(logger) : NOOP_LOGGER.warn,
+    }
+  } catch {
+    return NOOP_LOGGER
+  }
+}
+
+/** 每个会话只播报一次:接管成功要看得见(否则"没报错"和"没生效"分不清)。 */
+const announcedSessions = new Set<string>()
+
+function announceTakeover(
+  log: LoggerFace,
+  deps: CompactCommandDeps,
+  agent: CompactDelegableAgent,
+  what: string,
+): void {
+  const sessionId = agent.session?.id
+  if (typeof sessionId !== 'string' || announcedSessions.has(sessionId)) return
+  announcedSessions.add(sessionId)
+  log.info(`${LOG_TAG} 已接管 ${sessionId} 的 dsh 压缩(${what};provider=${deps.providerName}):`
+    + '压缩由 CodeBuddy CLI 自行完成,dsh 不再压镜像消息')
+}
+
+/**
+ * 该会话的上下文是否由 CodeBuddy CLI 拥有(按最新一次请求的路由 provider 判定)。
+ * 用路由而不是会话映射:用户把 codebuddy 会话切回别的 provider 后,dsh 应当
+ * 恢复自己压缩(映射记录此时仍在,不能作为判据)。
+ */
+function isCodebuddyOwned(deps: CompactCommandDeps, agent: CompactDelegableAgent): boolean {
+  const provider = agent.session?.requestHeader?.()?.config?.provider
+  return provider !== undefined && provider === deps.providerName
 }
 
 /** agent 的 maintenance 面(压缩期间占住它,使新消息排队而不是抢跑)。 */

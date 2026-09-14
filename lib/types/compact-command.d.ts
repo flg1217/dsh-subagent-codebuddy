@@ -56,6 +56,8 @@ export interface CompactCommandDeps {
     extraArgs: string[];
     modelOf: () => string;
     conversations: ConversationStore;
+    /** 本插件注册的 provider 名:自动压缩按"最新请求是否路由到它"判定归属。 */
+    providerName: string;
     /** 该会话的回合泵是否在跑(默认查 TurnPump;测试可注入)。 */
     isSessionBusy?: (sessionId: string) => boolean;
 }
@@ -69,27 +71,36 @@ export interface CompactCommandDeps {
  */
 export declare function forwardCompactToCli(deps: CompactCommandDeps, sessionId: string, cwd: string, signal: AbortSignal): Promise<CompactCommandResult>;
 /**
- * 自动压缩委托:compaction-basic 在阈值触发时先发 `compaction/delegate`。
+ * 自动压缩接管:codebuddy 会话**一律不做 dsh 压缩** —— dsh 只是渲染层,
+ * 真实上下文与压缩都由 CLI 自己负责。
  *
- * **codebuddy 会话在此一律回报 handled —— dsh 不参与压缩。**
- * 真实上下文与压缩都由 CLI 自己负责(buddy 按自身策略压缩其会话);dsh 侧消息
- * 只是渲染镜像。所以这里**既不做 dsh 压缩,也不代 CLI 发起压缩**,只声明
- * "由我方处理",让 compaction-basic 走 `if (delegated?.handled === true) return null`
- * 跳过自身压缩。若让 dsh 压,有两个害处:① 压不动真实压力(dsh 的测量以 CLI 的
- * usage 为基线,压缩对象却是 dsh 侧残余);② 被压掉的消息会**从 UI 上消失**
- * (替换成摘要)——用户直接看到"消息被删了"。
+ * **为什么必须拦在 `compactIfNeeded` 上(2026-09-14 实测):** dsh 侧没有
+ * "把压缩委托出去"的事件缝(曾按 `compaction/delegate` 事件写过一版,源码核对
+ * 后确认 compaction-basic 从不发这个事件 → 监听器永不触发,等于死代码)。
+ * 现在改为在 `ctx.compaction` 服务实例上就地接管压缩入口:compaction-basic
+ * 的两条自动路径(`agent/pre-step` 的 pressure、`agent/request-error` 的
+ * context-overflow)都是 `this.compactIfNeeded(...)`,实例上的自有属性会遮蔽
+ * 原型方法,所以接管后 dsh 不再压 codebuddy 会话。
+ * (源码核对:全仓 `compactIfNeeded` 只有这 2 处调用点,`compactNow` 只有
+ * command-compact 一处;两者都接管后,dsh 侧没有任何路径能压 codebuddy 会话。)
  *
- * 为什么不能在这里转发 `/compact` 给 CLI(源码核对 + 实测):本委托的**两个**
- * 触发点都在回合进行中——`agent/pre-step` 的 pressure(`compaction-basic:154`)
- * 与 `agent/request-error` 的 context-overflow(`:195`);而 `runMaintenance`
- * 只在 agent `phase==='idle'` 时可用(`agent-loop/src/agent.ts:157`,否则同步
- * 抛错),自动路径**必然**拿不到 maintenance 相位。此时若另开第二条 CLI 连接
- * 去压,又会与回合泵持有的同一会话冲突(压缩结果会被回合泵的 CLI 覆盖)。
- * 故自动压缩交回 CLI 自身,插件不介入。
+ * **不接管的害处(实测复现):** dsh 的压力测量以 CLI 上报的 usage 为基线
+ * (CLI 的真实上下文),能压的却只有 dsh 侧的镜像消息;压完压力不降 → 下一个
+ * step 再次触发 → 每个 step 都跑一次摘要,而 `region.ts` 的收缩闸门
+ * (`summary is not smaller than the shadowed content`)在镜像面只剩旧摘要时
+ * 必然拒绝,于是 11 分钟内连打 20+ 次 `compaction/start` → `compaction/end(error)`
+ * (压缩风暴);偶发成功的那几次还会把镜像面替换成摘要,模型随即"重新找方向"
+ * (日志里出现 "Let me re-orient"),界面上也多出一张本不该有的压缩卡。
+ *
+ * 注意 dsh 的 replace **不会隐藏或删除任何历史消息**(UI 照常渲染被遮蔽的消息,
+ * 历史接口也不做过滤)——它改的是 dsh 的 **surface**:上下文压力表,以及插件
+ * 需要重建 CLI 上下文时的素材(`buildPrompt` / 原生 seed)。所以接管要彻底:
+ * 那两条自动路径 + `compactNow` 兜底都不许压 codebuddy 会话。
  *
  * 手动 `/compact` 不受影响:它走 per-agent 命令覆盖(`handleCompactCommand`),
- * 在回合空闲时由用户触发,那里才转发 CLI 并等 maintenance 相位。
- * @param deps - 挂载依赖(命令/参数/会话映射)。
+ * 在回合空闲时由用户触发,那里才转发 CLI 并等 maintenance 相位。`compactNow`
+ * 的接管只是兜底(命令覆盖没挂上时全局命令会走到它),避免那条路压镜像。
+ * @param deps - 挂载依赖(路由名与会话映射)。
  */
 export declare function registerCompactDelegation(deps: CompactCommandDeps): void;
 /**
