@@ -940,11 +940,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       name: model,
       // CodeBuddy 由内置模型驱动,支持文本与图像输入。
       inputModalities: ['text', 'image'],
-      // externallyManaged:CodeBuddy CLI 自己持有会话状态并在内部压缩;dsh 的
-      // surface 只是渲染镜像(实测 1-2K token),压不动 CLI 的上下文(数百 K)。
-      // 声明后 compaction-basic 的自动压缩对该路由直接让位(见其 compactIfNeeded),
-      // 压缩由 CLI 完成、本插件把卡片与容量镜像回 dsh。
-      context: { contextWindow: 1_000_000, externallyManaged: true },
+      context: { contextWindow: 1_000_000 },
       // 推理强度:CLI `--effort` 的档位原样暴露(dsh 选择器/子代理 reasoning_effort
       // 参数据此校验与转发)。不设 defaultEffort:省略时保持 CLI 自身默认。
       reasoning: {
