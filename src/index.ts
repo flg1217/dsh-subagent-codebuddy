@@ -83,6 +83,14 @@ export interface Config {
   /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
   tailCapMinutes?: number
   /**
+   * 「prompt 结果挂起但 CLI 已空闲」的强制收尾预算(秒,默认 30;0 = 关闭)。
+   *
+   * 这条兜底在 prompt **未 settled** 时也会走,而 CLI 回合内部会静默重试
+   * (工具名不存在 → ModelBehaviorError → error-recovery 重新请求模型,首个
+   * 内容块 5-8s 才到)。预算太小会把重试连同进程一起杀掉,对话无声中断。
+   */
+  idleWrapSeconds?: number
+  /**
    * 工具桥接模式(默认 `mcp`)。
    * - `mcp`:dsh 起 HTTP MCP server,CLI 每回合以 `--mcp-config` 连接,
    *   工具以 `mcp__dsh__<工具名>` 一等公民呈现(完整 schema 强约束);
@@ -103,6 +111,7 @@ export const Config: z<Config> = z.object({
   tailQuietSeconds: z.number().default(5),
   tailBgQuietMinutes: z.number().default(10),
   tailCapMinutes: z.number().default(30),
+  idleWrapSeconds: z.number().default(30),
   bridgeMode: z.union([z.const('mcp'), z.const('delegate')]).default('mcp'),
 })
 
@@ -150,6 +159,7 @@ export function apply(ctx: Context, config: Config): void {
       tailQuietMs: (config.tailQuietSeconds ?? 5) * 1_000,
       tailBgQuietMs: (config.tailBgQuietMinutes ?? 10) * 60_000,
       tailCapMs: (config.tailCapMinutes ?? 30) * 60_000,
+      idleWrapMs: (config.idleWrapSeconds ?? 30) * 1_000,
     },
   }))
 

@@ -10,9 +10,15 @@ import {
   BRIDGE_TOOL_PREFIX,
   bridgeTargetTool,
   bridgeToolId,
+  isBridgeEligible,
   listDshBridgeTools,
   runDshBridgeTool,
 } from '../src/dsh-tools-bridge.ts'
+
+/** 本机跑得动的 shell 工具名(与 preset 的 `disabled:` 门同规则)。 */
+const NATIVE_SHELL = process.platform === 'win32' ? 'pwsh' : 'bash'
+/** 本机跑不动的那个 shell 工具名。 */
+const FOREIGN_SHELL = process.platform === 'win32' ? 'bash' : 'pwsh'
 
 /** 假 ctx:agents + tools 两个服务面。 */
 function makeBridgeCtx(options?: {
@@ -50,12 +56,11 @@ function makeBridgeCtx(options?: {
 }
 
 describe('bridgeToolId / bridgeTargetTool:命名与排除', () => {
-  it('dsh_<原名> 往返映射;完全统一后 bash/subagent 也走桥;run_code 与 MCP 不认', () => {
+  it('dsh_<原名> 往返映射;完全统一后 shell/subagent 也走桥;run_code 与 MCP 不认', () => {
     expect(bridgeToolId('grep')).toBe('dsh_grep')
     expect(bridgeTargetTool('dsh_grep')).toBe('grep')
     // 完全统一:执行/委托类也走桥(指向 dsh 原生工具)。
-    expect(bridgeTargetTool('dsh_bash')).toBe('bash')
-    expect(bridgeTargetTool('dsh_pwsh')).toBe('pwsh')
+    expect(bridgeTargetTool(`dsh_${NATIVE_SHELL}`)).toBe(NATIVE_SHELL)
     expect(bridgeTargetTool('dsh_subagent')).toBe('subagent')
     expect(bridgeTargetTool('dsh_send_message')).toBe('send_message')
     // 模型对 toolId 填写不稳定(实测会把展示名 Dsh-read / 变体 dsh-read 当
@@ -63,10 +68,34 @@ describe('bridgeToolId / bridgeTargetTool:命名与排除', () => {
     expect(bridgeTargetTool('Dsh-read')).toBe('read')
     expect(bridgeTargetTool('dsh-read')).toBe('read')
     expect(bridgeTargetTool('read')).toBe('read')
-    // 排除:ptc 保留名;MCP 走 CLI 原生通道;空 id。
+    // 排除:ptc 保留名;MCP 走 CLI 原生通道;空 id;本机跑不动的平台工具。
     expect(bridgeTargetTool('dsh_run_code')).toBeUndefined()
     expect(bridgeTargetTool('dsh_mcp__codegraph__explore')).toBeUndefined()
     expect(bridgeTargetTool('')).toBeUndefined()
+    expect(bridgeTargetTool(`dsh_${FOREIGN_SHELL}`)).toBeUndefined()
+  })
+
+  it('平台专用工具按平台剔除:win32 无 bash、非 win32 无 pwsh(与 preset 同规则)', () => {
+    // 实测(2026-09-14):模型顺着 mcp__dsh__* 命名习惯调 mcp__dsh__bash,
+    // CLI 对不存在的工具直接判 ModelBehaviorError 结束 run。preset 正常已把
+    // 平台不对的 shell 挡在 agent scope 外,桥这层再按平台剔一次,保证下发给
+    // CLI 的工具面只含本机跑得动的工具。
+    const win = process.platform === 'win32'
+    expect(isBridgeEligible('bash')).toBe(!win)
+    expect(isBridgeEligible('pwsh')).toBe(win)
+    // 规则只认这两个 shell 名,其它工具不受影响。
+    expect(isBridgeEligible('read')).toBe(true)
+    expect(isBridgeEligible('subagent')).toBe(true)
+    // 工具面本身:两个 shell 都在 schemas 里时,只有本机那个下发。
+    const { ctx } = makeBridgeCtx({
+      schemas: [
+        { name: 'bash', description: 'Run a command.', parameters: {} },
+        { name: 'pwsh', description: 'Run a command.', parameters: {} },
+        { name: 'read', description: 'Read a file.', parameters: {} },
+      ],
+    })
+    const listed = listDshBridgeTools(ctx, { id: 'parent-1' } as never).map(tool => tool.id)
+    expect(listed).toEqual([`dsh_${NATIVE_SHELL}`, 'dsh_read'])
   })
 })
 
@@ -96,14 +125,14 @@ describe('listDshBridgeTools:注册描述符', () => {
   it('执行类照常桥接并附加后台引导;run_code 与 MCP 排除;缺 schema 用空对象', () => {
     const { ctx } = makeBridgeCtx({
       schemas: [
-        { name: 'bash', description: 'Run a command.', parameters: {} },
+        { name: NATIVE_SHELL, description: 'Run a command.', parameters: {} },
         { name: 'run_code', description: 'x', parameters: {} },
         { name: 'mcp__server__tool', description: 'x', parameters: {} },
         { name: 'write', parameters: undefined },
       ],
     })
     const tools = listDshBridgeTools(ctx, { id: 'parent-1' } as never)
-    expect(tools.map(tool => tool.id)).toEqual(['dsh_bash', 'dsh_write'])
+    expect(tools.map(tool => tool.id)).toEqual([`dsh_${NATIVE_SHELL}`, 'dsh_write'])
     // 执行类附加 run_in_background 强引导;job 语义(面板/通知)写明。
     expect(tools[0]!.description).toContain('run_in_background: true')
     expect(tools[0]!.description).toContain('background-jobs view')

@@ -353,6 +353,10 @@ describe('adapter(ACP):取消与错误', () => {
       tailQuietMs: 5_000,
       tailBgQuietMs: 10 * 60_000,
       tailCapMs: 30 * 60_000,
+      // 「prompt 挂起但 CLI 已空闲」的兜底预算:必须比一次模型往返宽——CLI
+      // 回合内部会静默重试(工具名不存在 → error-recovery 重新请求模型),
+      // 5s 会误杀重试并让对话无声中断。
+      idleWrapMs: 30_000,
     })
   })
 

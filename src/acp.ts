@@ -30,6 +30,7 @@ export const DEFAULT_ACP_RUN_TIMEOUTS = {
   tailQuietMs: 5_000,
   tailBgQuietMs: 10 * 60_000,
   tailCapMs: 30 * 60_000,
+  idleWrapMs: 30_000,
 }
 
 /**
@@ -117,6 +118,18 @@ export interface AcpTimeouts {
   tailBgQuietMs?: number
   /** 尾巴窗口硬顶(毫秒,默认 30 分钟):后台任务最长可拖着回合不闭合的时长。 */
   tailCapMs?: number
+  /**
+   * 「prompt 结果挂起但 CLI 已空闲」的强制收尾预算(毫秒,默认 30s;<=0 关闭)。
+   *
+   * 与 {@link AcpTimeouts.tailQuietMs} 分开的原因:那条路径在 prompt **未
+   * settled** 时也走,而 CLI 回合内部有自己的静默窗口——模型调用了不存在的
+   * 工具时,CLI 判 `ModelBehaviorError` 结束本次 run,随即用 error-recovery
+   * 提示**重新请求模型**(实测:重试的新 run 在错误后 ~100ms 起,首个内容块
+   * 要 5-8s 才到)。沿用 5s 会把重试连同进程一起杀掉,对话在用户看来"莫名
+   * 其妙就结束了"(实测 2026-09-14 16:55 session-cfb0b785,重试被 5s 兜底
+   * 掐死)。误杀代价(丢重试、无错误提示的中断)远大于多等十几秒,故单独放宽。
+   */
+  idleWrapMs?: number
   /**
    * 模型调用边界的静默兜底(毫秒,默认 1000;回合泵用)。
    * 有工具调用来到、但既没有 `tool_executing` 心跳也没有工具结果时,内容静默

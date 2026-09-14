@@ -41,7 +41,9 @@ export declare function bridgeTargetTool(toolId: string): string | undefined;
  * 该 dsh 工具名是否可以暴露给 CLI(桥与 MCP 两条通道共用同一资格判定)。
  *
  * 排除:ptc 保留名(run_code)、MCP 工具(走 CLI 原生 MCP 通道)、CLI 镜像
- * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)。
+ * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)、
+ * 本机跑不动的平台专用工具({@link platformExcluded}:win32 无 bash、非 win32
+ * 无 pwsh)。
  */
 export declare function isBridgeEligible(name: string): boolean;
 /**

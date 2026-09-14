@@ -32,7 +32,7 @@ async function makeHarness(options: { toolsExecuteError?: boolean } = {}): Promi
   const executeCalls: Array<Record<string, unknown>> = []
   const toolsFace = {
     schemas: () => [
-      { name: 'bash', description: 'Run a command.', parameters: { type: 'object', properties: { command: { type: 'string' } } } },
+      { name: 'grep', description: 'Search files.', parameters: { type: 'object', properties: { pattern: { type: 'string' } } } },
       { name: 'cli_read', description: 'mirror noise', parameters: {} },
       { name: 'mcp__x__y', description: 'mcp noise', parameters: {} },
     ],
@@ -134,10 +134,10 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     harness = await makeHarness()
     const { json } = await rpc(harness, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
     const tools = (json?.['result'] as { tools: Array<Record<string, unknown>> }).tools
-    expect(tools.map(tool => tool['name'])).toEqual(['bash'])
+    expect(tools.map(tool => tool['name'])).toEqual(['grep'])
     expect(tools[0]!['inputSchema']).toEqual({
       type: 'object',
-      properties: { command: { type: 'string' } },
+      properties: { pattern: { type: 'string' } },
     })
   })
 
@@ -145,10 +145,10 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     harness = await makeHarness()
     const ok = await rpc(harness, {
       jsonrpc: '2.0', id: 3, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'echo hi' } },
+      params: { name: 'grep', arguments: { pattern: 'needle' } },
     })
     expect(ok.json?.['result']).toEqual({ content: [{ type: 'text', text: 'executed!' }] })
-    expect(harness.executeCalls[0]).toMatchObject({ name: 'bash', arguments: { command: 'echo hi' } })
+    expect(harness.executeCalls[0]).toMatchObject({ name: 'grep', arguments: { pattern: 'needle' } })
 
     const bad = await rpc(harness, {
       jsonrpc: '2.0', id: 4, method: 'tools/call',
@@ -160,7 +160,7 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
   it('tools/call 可见性:命名合法但不在本会话工具面内的工具被拒绝(回归)', async () => {
     harness = await makeHarness()
     // 'write' 命名合法(isBridgeEligible 通过),但 harness 的 schemas 只暴露
-    // 'bash' —— 必须按 tools/list 的口径拒绝,不能只查命名形态(否则持有 key
+    // 'grep' —— 必须按 tools/list 的口径拒绝,不能只查命名形态(否则持有 key
     // 的调用方可绕过 per-agent scope)。
     const denied = await rpc(harness, {
       jsonrpc: '2.0', id: 20, method: 'tools/call',
@@ -177,7 +177,7 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     harness = await makeHarness()
     const denied = await rpc(harness, {
       jsonrpc: '2.0', id: 21, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'x' } },
+      params: { name: 'grep', arguments: { pattern: 'x' } },
     }, `session=sess-missing&key=${harness.key}`)
     const result = denied.json?.['result'] as { isError?: boolean; content?: { text?: string }[] }
     expect(result.isError).toBe(true)
@@ -205,7 +205,7 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     harness = await makeHarness({ toolsExecuteError: true })
     const failed = await rpc(harness, {
       jsonrpc: '2.0', id: 5, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'x' } },
+      params: { name: 'grep', arguments: { pattern: 'x' } },
     })
     expect((failed.json?.['result'] as { isError?: boolean }).isError).toBe(true)
 
@@ -247,10 +247,10 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     })
     const forwarded = await rpc(harness, {
       jsonrpc: '2.0', id: 9, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'echo loop' } },
+      params: { name: 'grep', arguments: { pattern: 'loop' } },
     })
     expect(forwarded.json?.['result']).toEqual({ content: [{ type: 'text', text: 'loop-executed' }] })
-    expect(calls).toEqual(['bash:{"command":"echo loop"}'])
+    expect(calls).toEqual(['grep:{"pattern":"loop"}'])
     // 走了 loop 转发就不落直接执行。
     expect(harness.executeCalls).toHaveLength(0)
     dispose()
@@ -259,7 +259,7 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     const disposeThrow = registerMcpLoopDispatcher('sess-ok', async () => { throw new Error('pump gone') })
     const fallback = await rpc(harness, {
       jsonrpc: '2.0', id: 10, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'x' } },
+      params: { name: 'grep', arguments: { pattern: 'x' } },
     })
     expect(fallback.json?.['result']).toEqual({ content: [{ type: 'text', text: 'executed!' }] })
     disposeThrow()
@@ -269,11 +269,11 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     // 回归:超时后若降级直执,长命令会在 loop 侧与直执各跑一遍(副作用翻倍)。
     harness = await makeHarness()
     const disposeTimeout = registerMcpLoopDispatcher('sess-ok', async () => {
-      throw new McpDispatchTimeoutError('MCP 调用 bash 等待 loop 执行超时(300s)')
+      throw new McpDispatchTimeoutError('MCP 调用 grep 等待 loop 执行超时(300s)')
     })
     const timedOut = await rpc(harness, {
       jsonrpc: '2.0', id: 11, method: 'tools/call',
-      params: { name: 'bash', arguments: { command: 'npm run build' } },
+      params: { name: 'grep', arguments: { pattern: 'build' } },
     })
     const result = timedOut.json?.['result'] as { isError?: boolean; content?: { text?: string }[] }
     expect(result.isError).toBe(true)

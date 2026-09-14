@@ -32,9 +32,13 @@ const FAST = {
   tailQuietMs: 60,
   tailBgQuietMs: 240,
   tailCapMs: 800,
+  idleWrapMs: 60,
   boundaryQuietMs: 20,
   usageGraceMs: 20,
 }
+
+/** 本机跑得动的 shell 工具名(桥按平台剔除 bash,与 preset 的 `disabled:` 同规则)。 */
+const NATIVE_SHELL = process.platform === 'win32' ? 'pwsh' : 'bash'
 
 interface SessionShape {
   /** 假会话是否可查(缺省 true)。 */
@@ -702,7 +706,7 @@ describe('尾巴窗口(后台任务续跑)', () => {
     // session/prompt 的 RPC 结果不回(CLI 内部 turn 判定被后台任务/子代理挂
     // 住)。promptSettled=false 会短路尾巴窗口,看门狗又只咬在途镜像工具——
     // 此前 dsh 永远显示"进行中"。现在:真实活动静默超过空闲预算即强制收尾。
-    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, tailBgQuietMs: 60_000 })
+    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, idleWrapMs: 40, tailBgQuietMs: 60_000 })
     mockTurn((c) => {
       c.p.update(toolCall('call_1', 'Bash', { command: 'npm run dev', run_in_background: true }))
       c.p.update(phase('tool_executing'))
@@ -725,14 +729,35 @@ describe('尾巴窗口(后台任务续跑)', () => {
     expect(Date.now() - started).toBeLessThan(5_000)
   }, 15_000)
 
-  it('dsh_bash 的 run_in_background 不算 CLI 后台任务 → 短预算收尾(不等 10 分钟)', async () => {
-    // 用户反复踩的"跑完仍显示进行中":delegate 调用(dsh_bash)带
+  it('CLI 回合内的静默重试窗口(< idleWrapMs)→ 不强制收尾,重试内容进同一回合', async () => {
+    // 实测回归(2026-09-14 16:55 session-cfb0b785):模型调了不存在的工具
+    // (mcp__dsh__bash),CLI 判 ModelBehaviorError 结束本次 run,随后用
+    // error-recovery 提示**重新请求模型**——重试期间 CLI 报过 idle 且内容静默,
+    // 泵按 5s(tailQuietMs)强制收尾,把重试连同 CLI 进程一起杀了,对话在用户
+    // 看来"莫名其妙就结束了"。idleWrapMs 必须比一次模型往返宽:窗口内只等待。
+    const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, idleWrapMs: 300, tailBgQuietMs: 60_000 })
+    mockTurn((c) => {
+      c.p.update(message('Let me read the ribbon subsystem.'))
+      c.p.update(phase('idle'))
+      // 错误 + 静默重试:200ms 内零内容(> tailQuietMs、< idleWrapMs)。
+      setTimeout(() => {
+        c.p.update(message('重试后的答复'))
+        c.settle()
+      }, 200)
+    })
+    const chunks = await step(h.adapter, makeOptions('s1'))
+    // 若按 tailQuietMs 收尾:重试内容永远不来,断言失败。
+    expect(chunks.some(c => c.includes('重试后的答复'))).toBe(true)
+  }, 15_000)
+
+  it('delegate shell 的 run_in_background 不算 CLI 后台任务 → 短预算收尾(不等 10 分钟)', async () => {
+    // 用户反复踩的"跑完仍显示进行中":delegate 调用(dsh_<shell>)带
     // run_in_background:true 是 **dsh 侧 job**——立即返回、完成由 dsh 唤醒
     // 新回合,与 CLI 本回合收尾无关。此前它把尾巴预算拉到 tailBgQuietMs
     // (10 分钟),任务完成后 UI 一直转。
     const h = makeAdapter({}, { ...FAST, tailQuietMs: 40, tailBgQuietMs: 60_000 })
     mockTurn((c) => {
-      c.p.update(toolCall('call_1', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'npm run dev', run_in_background: true } }))
+      c.p.update(toolCall('call_1', 'DelegateTool', { toolId: `dsh_${NATIVE_SHELL}`, input: { command: 'npm run dev', run_in_background: true } }))
       c.p.update(phase('tool_executing'))
       c.p.update(toolUpdate('call_1', 'completed', 'job started'))
       c.p.update(message('答复'))
@@ -826,13 +851,13 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
       fakeProc = c.p
       settleFn = () => c.settle()
       c.p.update(toolCall('call_bash_2', 'DelegateTool', {
-        toolId: 'dsh_bash',
+        toolId: `dsh_${NATIVE_SHELL}`,
         input: { command: 'false' },
       }))
       c.p.update(phase('tool_executing'))
     })
     const chunks = await step(h.adapter, makeOptions('s1'))
-    expect(chunks.some(c => c.includes('"name":"bash"'))).toBe(true)
+    expect(chunks.some(c => c.includes(`"name":"${NATIVE_SHELL}"`))).toBe(true)
     // loop 很快执行完(结果先于 CLI 请求到达):事件先到 → 结果缓存。
     h.emitSessionEvent({
       type: 'tool/result',
@@ -852,8 +877,8 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
     })
     // 请求此刻才到 → 立刻拿缓存结果(失败 → status:error)。
     const pending = fakeProc!.extRequest('_codebuddy.ai/delegateTool', {
-      toolCallId: 'delegate-dsh_bash-2',
-      toolId: 'dsh_bash',
+      toolCallId: 'delegate-shell-2',
+      toolId: `dsh_${NATIVE_SHELL}`,
       input: { command: 'false' },
       timeout: 30_000,
     })
@@ -907,7 +932,7 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
   }, 15_000)
 
   it('同工具并发调用按参数精确配对(请求/结果乱序也不错配)', async () => {
-    // 两个 dsh_bash 并发:先到的是 bbb 的请求与 bbb 的结果——必须匹配到
+    // 两个 delegate shell 调用并发:先到的是 bbb 的请求与 bbb 的结果——必须匹配到
     // call_b(参数精确),FIFO 会把 call_a 的结果错配给 bbb 的请求。
     const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
     let settleFn: (() => void) | undefined
@@ -916,16 +941,16 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
     mockTurn((c) => {
       fakeProc = c.p
       settleFn = () => c.settle()
-      c.p.update(toolCall('call_a', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'aaa' } }))
-      c.p.update(toolCall('call_b', 'DelegateTool', { toolId: 'dsh_bash', input: { command: 'bbb' } }))
+      c.p.update(toolCall('call_a', 'DelegateTool', { toolId: `dsh_${NATIVE_SHELL}`, input: { command: 'aaa' } }))
+      c.p.update(toolCall('call_b', 'DelegateTool', { toolId: `dsh_${NATIVE_SHELL}`, input: { command: 'bbb' } }))
       c.p.update(phase('tool_executing'))
     })
     const chunks = await step(h.adapter, makeOptions('s1'))
-    expect(chunks.filter(c => c.includes('"name":"bash"')).length).toBe(2)
+    expect(chunks.filter(c => c.includes(`"name":"${NATIVE_SHELL}"`)).length).toBe(2)
     // 乱序:b 的请求先到。
     const pendingB = fakeProc!.extRequest('_codebuddy.ai/delegateTool', {
       toolCallId: 'delegate-b',
-      toolId: 'dsh_bash',
+      toolId: `dsh_${NATIVE_SHELL}`,
       input: { command: 'bbb' },
       timeout: 30_000,
     })
