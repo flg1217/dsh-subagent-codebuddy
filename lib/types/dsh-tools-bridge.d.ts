@@ -38,6 +38,13 @@ export declare function bridgeToolId(name: string): string;
 /** 桥工具 id → dsh 工具名;非桥命名、ptc 保留名、MCP 或 CLI 镜像名时返回 undefined。 */
 export declare function bridgeTargetTool(toolId: string): string | undefined;
 /**
+ * 该 dsh 工具名是否可以暴露给 CLI(桥与 MCP 两条通道共用同一资格判定)。
+ *
+ * 排除:ptc 保留名(run_code)、MCP 工具(走 CLI 原生 MCP 通道)、CLI 镜像
+ * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)。
+ */
+export declare function isBridgeEligible(name: string): boolean;
+/**
  * 列出当前会话可见、应当桥接的全部 dsh 工具(delegate tool 描述符)。
  * 工具集来自 `ctx.tools.schemas(agent)`——dsh 的 per-agent scope 过滤已生效。
  * @param ctx - 插件上下文(tools 服务)。
@@ -45,6 +52,29 @@ export declare function bridgeTargetTool(toolId: string): string | undefined;
  * @returns 桥工具描述符(不含专用委托工具)。
  */
 export declare function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpec[];
+/** 暴露给 MCP 通道的工具描述(MCP tools/list 条目)。 */
+export interface McpToolSpec {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+}
+/**
+ * 列出当前会话可见、应通过 MCP 暴露的全部 dsh 工具。
+ *
+ * 与桥同名同源:工具集来自 `ctx.tools.schemas(agent)`(per-agent scope 过滤
+ * 已生效),过滤规则共用 {@link isBridgeEligible}。与桥的差异:MCP 的工具是
+ * 一等公民(自带完整 inputSchema),所以 name 用**裸原名**(CLI 侧呈现为
+ * `mcp__<server>__<name>`)、description 用原描述 + 执行提示,不注入
+ * "调用形态"提示(结构化 schema 已是强约束)。
+ *
+ * **动态性**:每次 tools/list 都现取 schemas——会话可见工具增删(插件装载、
+ * scope 变化)在下一次 list 即反映;配合 CLI 对 MCP 的周期性 list(实测),
+ * 无需另行缓存或失效逻辑。
+ * @param ctx - 插件上下文(tools 服务)。
+ * @param parent - 会话的 agent(scope 与执行归属)。
+ * @returns MCP 工具条目(每次调用现算)。
+ */
+export declare function listDshMcpTools(ctx: Context, parent: Agent): McpToolSpec[];
 /**
  * 工具结果内容块 → 文本(嵌套 tool-result 递归,图片块降级为提示)。
  * 桥执行与真工具直发路径共用同一文本口径。

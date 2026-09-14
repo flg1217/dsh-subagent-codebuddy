@@ -18,3 +18,7 @@
         toolName: subagent_codebuddy
         # 自定义委派工具默认关闭:统一走 dsh 通用 subagent 工具 + subagent-model-selection
         registerSubagentTools: false
+        # 工具桥:把会话可见的 dsh 工具暴露给 CLI(文件/命令类能力走 dsh 管线)。
+        # 显式写出与 Config schema 默认值一致,便于使用者发现这个开关。
+        # 需要回退旧通道时改 delegate。
+        bridgeMode: mcp

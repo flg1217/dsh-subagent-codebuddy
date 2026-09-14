@@ -21,7 +21,7 @@ export declare const CONTINUE_PROMPT = "\u7EE7\u7EED\u5B8C\u6210\u4E4B\u524D\u67
  * @param system - system prompt 全文。
  * @param updated - 是否是对已发过版本的更新(内容变了才为 true)。
  */
-export declare function systemInstructionsText(system: string, updated?: boolean): string;
+export declare function systemInstructionsText(system: string, updated?: boolean, bridgeMode?: 'mcp' | 'delegate'): string;
 /** 序列化结果:prompt 文本 + ACP 原生图片内容块(base64)。 */
 export interface SerializedPrompt {
     prompt: string;

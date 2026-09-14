@@ -67,6 +67,13 @@ export interface Config {
     tailBgQuietMinutes?: number;
     /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
     tailCapMinutes?: number;
+    /**
+     * 工具桥接模式(默认 `mcp`)。
+     * - `mcp`:dsh 起 HTTP MCP server,CLI 每回合以 `--mcp-config` 连接,
+     *   工具以 `mcp__dsh__<工具名>` 一等公民呈现(完整 schema 强约束);
+     * - `delegate`:旧通道(Dsh-* 委托工具 + DelegateTool 合成),保留作回退。
+     */
+    bridgeMode?: 'mcp' | 'delegate';
 }
 export declare const Config: z<Config>;
 export declare function apply(ctx: Context, config: Config): void;

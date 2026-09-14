@@ -41,6 +41,7 @@ import { buildPrompt, lastUserPrompt, resumeReplayPrompt, systemInstructionsText
 import { TodoListState } from './todo-bridge.js'
 import { AttachmentsSaveFace } from './tool-image.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, isProgressUpdate, usageOfUpdate } from './acp.js'
+import { mcpConfigArgs } from './mcp-server.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import type { CodebuddyFailure } from './failure.js'
@@ -170,6 +171,11 @@ export interface CodebuddyAdapterOptions {
   permissionMode: string
   /** 追加的额外 CodeBuddy 参数。 */
   extraArgs: string[]
+  /**
+   * 工具桥接模式(默认 `mcp`):mcp = spawn 加 `--mcp-config` 连 dsh 的
+   * HTTP MCP server;delegate = 旧 DelegateTool 通道(不加该参数)。
+   */
+  bridgeMode?: 'mcp' | 'delegate'
   /** 动态空闲超时预算(可选,默认见 {@link DEFAULT_ACP_RUN_TIMEOUTS})。 */
   timeouts?: AcpTimeouts
   /** 静默失败自动重试次数(默认 2:首次 + 1 次续跑)。 */
@@ -356,7 +362,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       // system prompt 变了(或这个会话还从未发过):整份补发一次,模型由此拿到
       // 最新的 dsh 侧纪律(优先用 dsh_* 工具等)。
       if (system !== undefined && system.trim().length > 0 && record.systemHash !== systemHash) {
-        const block = systemInstructionsText(system, record.systemHash !== undefined)
+        const block = systemInstructionsText(system, record.systemHash !== undefined, this.options.bridgeMode ?? 'delegate')
         prompt = `${block}\n\n${prompt}`
       }
       resume = { acpId: record.acpId }
@@ -389,6 +395,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       command: this.options.command,
       prefixArgs: this.options.prefixArgs,
       extraArgs: this.options.extraArgs,
+      ...(this.options.bridgeMode === undefined ? {} : { bridgeMode: this.options.bridgeMode }),
       ...options.reasoningEffort === undefined ? {} : { reasoningEffort: String(options.reasoningEffort) },
       ...this.options.timeouts === undefined ? {} : { timeouts: this.options.timeouts },
       ...this.options.maxAttempts === undefined ? {} : { maxAttempts: this.options.maxAttempts },
@@ -469,6 +476,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             },
         // dsh 的 system prompt 作为首条记录进 CLI 历史(对齐 dsh 原生行为)。
         options.system,
+        this.options.bridgeMode ?? 'delegate',
       )
       if (records.length === 0) return undefined
       return { sessionId, file: conversationFilePath(sessionId, cwd, this.options.nativeBaseDir), records }
@@ -735,7 +743,18 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       // 同步一次(dsh 的 MCP 配置 / skills → CLI 原生通道),保证最新。
       syncCliIntegrations({ projectCwd: cwd })
       const conn = new AcpConnection(
-        [command, ...prefixArgs, '--acp', '--model', model, ...effortArgs, '--dangerously-skip-permissions', ...cliToolPolicyArgs(), ...this.options.extraArgs],
+        [
+          command,
+          ...prefixArgs,
+          '--acp',
+          '--model',
+          model,
+          ...effortArgs,
+          '--dangerously-skip-permissions',
+          ...cliToolPolicyArgs(),
+          ...mcpConfigArgs(this.options.bridgeMode, dshSessionId),
+          ...this.options.extraArgs,
+        ],
         cwd,
         onUpdate,
       )

@@ -18,11 +18,22 @@
 | **图片输入** | 图片块读字节后以 **ACP 原生 image 内容块**（base64）随 prompt 发送（`promptCapabilities.image`，不落盘、不受 CodeBuddy Read 工具 256KB 上限约束）；历史种子与子代理转录里的图片经 CodeBuddy blob（内容寻址）双向原生转换，两侧均可预览 |
 | **子代理可视化** | codebuddy 轮里的 `Agent` 委派镜像为 **dsh 子会话**（`parentSession` 血缘 + `subagent/descriptor`），侧边栏可点开完整转录（消息/工具/思考/任务），运行中近实时跟随 |
 | **任务/todo 桥接** | `TaskCreate` / `TaskUpdate` / `todo_write` 折算为 dsh `todo/write` 整表快照事件，主轮与子代理会话都复用 dsh 的 TodoPanel 渲染 |
+| **工具桥（MCP / delegate）** | 把本会话可见的 dsh 工具暴露给 CodeBuddy，使它的文件/命令类能力走 dsh 管线（审批/沙箱/审计/后台面板）。默认 `mcp`：dsh 起 HTTP MCP server，工具以 `mcp__dsh__<名>` 一等公民呈现（完整 JSON Schema 强约束）；`delegate` 为旧通道（`dsh_<名>` 合成 DelegateTool），保留作回退 |
 | **opt-in 工具** | `subagent_codebuddy` + `list_codebuddy_models`（`registerSubagentTools: true` 开启；默认关闭，推荐通用工具） |
 
-**语义说明（主代理轮）**：ACP CLI 自带完整 agent 循环与工具链——该轮由 CodeBuddy 执行自己的
-工具（`--dangerously-skip-permissions`），**dsh 的沙箱/审批/工具不参与**，其步骤以会话事件回传
-dsh（文本/思考/工具卡片实时可见）。
+**语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**文件/命令类原生工具已被
+白名单移除**（spawn 传 `--tools`，见 §三「工具桥」）。因此：
+
+- 需要读写文件、执行命令时，模型**必须**改用 dsh 侧工具（MCP 模式下是 `mcp__dsh__bash`
+  / `mcp__dsh__edit` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）。这些调用**在 dsh 侧
+  执行，受 dsh 的沙箱与审批约束**，并进会话日志、审计与后台任务面板。
+- 仍留在 CLI 侧原生执行的只有白名单里的机制类/只读工具：`Read`（读图片必须走它，
+  结果镜像为图片卡片）、`WebSearch`、`WebFetch`、`Task*`、`Skill`、`ToolSearch`、
+  `DeferExecuteTool`、`DelegateTool`。
+- 文本/思考/工具卡片仍以会话事件实时回传 dsh 界面。
+
+> 历史注记：早期版本确实让 CLI 用自己的工具链、dsh 沙箱不参与；引入工具白名单 +
+> 工具桥后已改变——**安全模型以本节为准**。
 
 ## 二、快速开始
 
@@ -30,6 +41,8 @@ dsh（文本/思考/工具卡片实时可见）。
 
 - dsh `>= 0.1.3-alpha.2`（验证于 0.1.3-alpha.2）
 - CodeBuddy CLI 已安装并登录（子进程继承登录态）
+- 需运行在**带 `webServer` 服务的 profile**（如 `web`）：`bridgeMode: mcp` 依赖它挂
+  MCP 端点；拿不到该服务时端点不注册，`--mcp-config` 不注入（不会报错，但工具桥不可用）
 
 ### 安装插件
 
@@ -46,14 +59,18 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
   config:
     model: <其他模型>          # 默认 deepseek-v4-flash
     registerSubagentTools: true # 需要 opt-in 工具时开启
+    bridgeMode: delegate        # 工具桥回退到旧通道（默认 mcp）
 ```
+
+> 设置面板（设置 → 插件 → CodeBuddy）也可改模型与工具桥开关，**表单值优先于本文件**。
 
 重启 dsh web 后：模型选择器出现 **CodeBuddy** 分组。
 
 ### 主代理使用
 
 新会话 → 模型选择器 → 选中 CodeBuddy 的某个模型（如 `deepseek-v4-flash`）→ 正常对话。
-该轮由 CodeBuddy 驱动（含其自带工具），步骤/文本实时回传 dsh 界面。
+该轮由 CodeBuddy 驱动；它的文件/命令类工具经工具桥回到 dsh 执行（见 §一「语义说明」），
+步骤/文本实时回传 dsh 界面。
 
 ### 子代理委派（通用工具）
 
@@ -84,16 +101,41 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 | `extraArgs` | `[]` | 追加的 CodeBuddy 参数 |
 | `providerName` | `codebuddy` | LLM provider 路由名 |
 | `toolName` | `subagent_codebuddy` | opt-in 工具名 |
-| `registerSubagentTools` | `false` | 是否注册 opt-in 委派工具（推荐用通用 `subagent`） || `longToolCapMinutes` | `30` | 静默长工具硬顶（分钟，`0` = 关闭）：只影响**发起后零事件**的工具段（任何中间进展都会重置计时）；超顶中止本次调用并**自动续跑**——防止 CLI 卡死时进程泄漏、子会话回合悬空 |
+| `registerSubagentTools` | `false` | 是否注册 opt-in 委派工具（推荐用通用 `subagent`） |
+| `bridgeMode` | `mcp` | 工具桥模式：`mcp` = dsh 起 HTTP MCP server、工具以 `mcp__dsh__<名>` 呈现（完整 schema，推荐）；`delegate` = 旧 DelegateTool 通道（`dsh_<名>`，回退用）。设置面板有同名开关，**切换对新回合生效** |
+| `longToolCapMinutes` | `30` | 静默长工具硬顶（分钟，`0` = 关闭）：只影响**发起后零事件**的工具段（任何中间进展都会重置计时）；超顶中止本次调用并**自动续跑**——防止 CLI 卡死时进程泄漏、子会话回合悬空 |
+| `tailQuietSeconds` | `5` | 尾巴窗口静默阈值（秒，`0` = 关闭）：干净收尾后继续抽流，等 CLI 后台任务完成后的自发续跑 |
+| `tailBgQuietMinutes` | `10` | 起了后台任务的回合的静默阈值（分钟） |
+| `tailCapMinutes` | `30` | 尾巴窗口硬顶（分钟）：后台任务最长可拖着回合不闭合的时长 |
 
 ## 三、工作原理
 
 ```
 主代理轮:  会话模型选择器 → codebuddy/<id> → CodebuddyLlmAdapter
-              └─ spawn codebuddy --acp → initialize → session/new|load → session/prompt
+              └─ spawn codebuddy --acp --tools <白名单> [--mcp-config <会话专属配置>]
+                   → initialize → session/new|load → session/prompt
                    └─ session/update(思考/文本/工具)→ 写入调用方已打开的 step
+              └─ 工具调用回流:CLI 调 mcp__dsh__<名> ──HTTP JSON-RPC──▶ dsh MCP 端点
+                    └─ 伪装成工具调用块灌进 dsh loop → 原生执行(审批/沙箱/事件/UI 卡片)
+                         └─ tool/result 回填 MCP 响应 ──▶ CLI 拿到结果继续
                子代理轮:  通用 subagent(provider: spawn) → child agent → 同一 adapter
 ```
+
+### 工具桥（MCP / delegate）
+
+CLI 原生工具经 `--tools` 白名单裁剪后（见 §一「语义说明」），文件/命令类能力必须由 dsh 提供。
+插件把**当前会话可见的 dsh 工具**暴露给 CLI，两条通道：
+
+| | `mcp`（默认） | `delegate`（回退） |
+|---|---|---|
+| 呈现 | `mcp__dsh__bash` / `mcp__dsh__edit` … | `dsh_bash` / `dsh_edit` …（合成 DelegateTool） |
+| 参数约束 | 各工具**完整 JSON Schema**（协议下发，强约束） | 无结构 `input: object`（模型端几乎零约束） |
+| 传输 | dsh 起 HTTP MCP server，CLI 每回合以 `--mcp-config` 连接 | ACP `session/request` 反向调用 |
+| 工具集 | `tools/list` **每次现取**会话可见工具（不缓存） | 回合开始前批量注册 |
+
+MCP 端点的安全约束：**仅 loopback 来源 + URL 携带每进程随机 key**（双重校验），挂在 dsh
+自带 webserver 上（与 Web UI 同端口），不额外开监听；`tools/call` 另按 `tools/list` 的同一份
+工具面校验可见性。会话专属配置写在系统临时目录，权限 `0600`，超龄自动清扫。
 
 - **事件写入**:adapter 检测调用方（agent-loop）已打开的 turn/step，把 ACP 的
   思考/文本/工具事件直写进该 step（tool/call 前先以 assistant/message 广告，
@@ -121,12 +163,23 @@ pnpm test           # vitest 单元测试
 pnpm typecheck      # tsc --noEmit
 ```
 
-提交前检查：`git status` 无遗留文件；`lib/` 与源码同步更新。发布仅 git push
-（不做 npm publish）：
+> **`pnpm install` 目前只能在作者的机器上跑**：`package.json` 的 `devDependencies` 用了
+> `link:D:/Projects/DeepseekHarness/repo/...` 这类**绝对路径**（指向 dsh 源码树，用于本地联调）。
+> 换机器前需把它们改成正常的版本号（如 `>=0.1.3-alpha.2`）或 `workspace:*`。
+> 仅**使用**插件（不构建）的人不受影响——运行时 `lib/` 只依赖相对路径与 peerDependencies。
 
-```bash
-git add -A && git commit -m "feat/fix: ..." && git push origin master
-```
+### 分发与发布
+
+分发走 **git（不做 npm publish）**：使用者把本仓库目录加进 profile 即可，`lib/` 已随仓库提交。
+
+发布前检查：
+
+1. `pnpm typecheck && pnpm test` 全绿；
+2. `pnpm build` 且 **`lib/` 与 `src/` 同步**（`git status` 里 `lib/` 的改动应与 `src/` 一致——
+   否则使用者拿到的是旧产物）；
+3. README 的配置项表/能力表与实际 `Config` 一致；
+4. `git status` 无遗留文件；
+5. `git add -A && git commit -m "..." && git push origin master`。
 
 ## 五、许可证
 

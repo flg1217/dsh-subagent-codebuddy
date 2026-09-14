@@ -100,6 +100,7 @@ export async function messagesToRecords(
   context: NativeSessionContext,
   images?: NativeSessionImages,
   system?: string,
+  bridgeMode: 'mcp' | 'delegate' = 'delegate',
 ): Promise<NativeRecord[]> {
   const records: NativeRecord[] = []
   const toolNames = new Map<string, string>()
@@ -128,7 +129,7 @@ export async function messagesToRecords(
       timestamp: stamp(),
       type: 'message',
       role: 'user',
-      content: [{ type: 'input_text', text: systemInstructionsText(system) }],
+      content: [{ type: 'input_text', text: systemInstructionsText(system, false, bridgeMode) }],
       __codebuddyLocal: { sensitiveUserInputReviewed: true },
       providerData: { agent: 'cli' },
       ...base(),

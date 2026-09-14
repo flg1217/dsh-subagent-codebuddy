@@ -46,6 +46,11 @@ export interface PumpHost {
     command: string;
     prefixArgs: string[];
     extraArgs: string[];
+    /**
+     * 工具桥接模式(默认 `mcp`):mcp = spawn 加 `--mcp-config` 连 dsh 的 HTTP
+     * MCP server、不发 delegate 注册;delegate = 旧 DelegateTool 通道。
+     */
+    bridgeMode?: 'mcp' | 'delegate';
     /** 推理强度(--effort;未选则不传,保持 CLI 默认)。 */
     reasoningEffort?: string;
     timeouts?: AcpTimeouts;
@@ -119,6 +124,39 @@ export declare function resetPumpStateForTests(): void;
  */
 export declare function replayPresentationMeta(value: unknown): Record<string, JsonValue>;
 /**
+ * 尾注里向模型声明的"前台工具调用超时预算"(秒)。
+ *
+ * ⚠️ **这是未经验证的引导值,不是测得的客户端超时。** 代码里不存在任何 30s
+ * 常量(ACP 默认是 firstMs 60s / idleMinMs 150s / idleMaxMs 600s);30s 只是
+ * 为了让模型"长命令一律走 run_in_background"而写进尾注的保守口径。
+ * **只用于尾注文案,不得再拿它推导服务端看门狗**(2026-09-13 曾这样推导过一次,
+ * 见 {@link MCP_CALL_TIMEOUT_MS} 的说明)。
+ */
+export declare const CLI_TOOL_CALL_TIMEOUT_S = 30;
+/**
+ * MCP 通道转发看门狗(毫秒):**"注入未被消费"的异常兜底,不是工具执行时长上限**。
+ *
+ * 正常路径下它不该触发,因为两条腿各有归宿:
+ * - 注入的段一旦被 loop 消费,工具就在 dsh 原生管线里跑——跑多久由工具自己与
+ *   loop 的静默看门狗(guardCapMs,默认 30 分钟)决定。**长命令本来就该慢慢跑完**,
+ *   不该被这一层截断(前台阻塞式长任务同样如此)。
+ * - 回合结束 / 泵释放时,`finish()` / `dispose()` 会立刻 reject 所有等待者,
+ *   不依赖本看门狗。
+ * 所以它唯一覆盖的是"loop 卡死但回合尚未结束"这种异常,取值应当**宽松**。
+ *
+ * **2026-09-13 修正记录(重要)**:本值一度被改成 25s,依据是"CLI 侧 30 秒超时"。
+ * 该 30 秒经查只是尾注里的一句断言({@link CLI_TOOL_CALL_TIMEOUT_S}),代码中并无
+ * 对应常量,属**未经验证的数字**。用未验证的数字反推看门狗会带来实际回归:任何
+ * 前台耗时 >25s 的命令(构建/测试/迁移)都会被误判超时并回 `McpDispatchTimeoutError`,
+ * 而它本来可以正常跑完并把结果交回模型。故恢复宽松兜底。
+ *
+ * 若将来**实测**出 CLI 客户端的真实超时 T_client(手段:mcp-server.ts 的
+ * `clientGoneAt` 日志已带"客户端等待"耗时),再考虑把本值调到略小于 T_client——
+ * 那样能在客户端放弃前,把"勿盲目重试"这句更明确的错误先送到模型手里。届时应同时
+ * 把 {@link CLI_TOOL_CALL_TIMEOUT_S} 的尾注口径对齐到实测值。
+ */
+export declare const MCP_CALL_TIMEOUT_MS = 300000;
+/**
  * dsh 发起的调用的固定尾注(附在每条 prompt 末端)。
  *
  * CodeBuddy CLI 自带子代理体系(Task/Agent 团队)与自带后台任务(bash
@@ -130,6 +168,14 @@ export declare function replayPresentationMeta(value: unknown): Record<string, J
  * 位置固定在末尾——模型对最新一条输入的尾部指令最敏感。
  */
 export declare const DSH_DELEGATION_NOTE: string;
+/**
+ * MCP 模式(dsh HTTP MCP server)下的固定尾注:与 delegate 版同构,工具名
+ * 换成 CLI 呈现的 `mcp__dsh__<工具名>`(参数走各工具的 MCP schema,不再有
+ * toolId 中转),并去掉 DelegateTool 形态专属条款。
+ */
+export declare const MCP_DELEGATION_NOTE: string;
+/** 按桥接模式取 prompt 尾注(dsh 运行环境说明)。 */
+export declare function promptTailFor(bridgeMode: 'mcp' | 'delegate' | undefined): string;
 /** 重启跨 attempt 保留的执行状态(重试是同一任务的延续,已学到的间隔不丢)。 */
 export interface PumpStepState {
     mirroredCalls: Set<string>;
@@ -205,6 +251,10 @@ export declare class TurnPump {
     private firstResultSeen;
     /** steer 轮询。 */
     private lastSteerPoll;
+    /** 每条 prompt 的固定尾注(按桥接模式,dsh 运行环境说明)。 */
+    private readonly promptTail;
+    /** 桥接模式(回放工具的执行语义按它分派,mcp 模式见 ensureReplayTool)。 */
+    private readonly bridgeMode;
     /** 泵构造时刻(回合开始):插入水位线在锚点不可用时的兜底。 */
     private readonly constructedAt;
     /** 子代理镜像 / todo 桥。 */
@@ -229,8 +279,15 @@ export declare class TurnPump {
     private readonly delegateResults;
     /** session/event 订阅解绑句柄。 */
     private disposeEventHook;
+    /** MCP→loop 转发器的注销句柄(泵生命周期内有效)。 */
+    private disposeLoopDispatcher;
     /** steer 在飞防重:同一条消息不等响应完成不重复发起。 */
     private readonly inFlightForwards;
+    /**
+     * MCP 调用等待:callId → 等待者。dispatchMcpCall 把调用伪装成本步的
+     * tool-call 块(独立段)交给 loop 原生执行,tool/result 事件按 callId 回填。
+     */
+    private readonly mcpWaiters;
     /**
      * 增量扫描水位:timeline(events 只 append)已处理到的下标;-1 = 未初始化。
      * 早前每轮从锚点全量重扫,长回合里 markForwarded(256 条上限)把最早的
@@ -292,7 +349,13 @@ export declare class TurnPump {
         blocks: ContentBlock[];
         meta?: unknown;
     }>;
-    /** 为此 agent 注册一个回放工具(同名工具名只注册一次)。 */
+    /**
+     * 为此 agent 注册一个回放工具(同名工具名只注册一次)。
+     * @param name - 镜像工具名(cli_ 前缀或图片别名)。
+     * @param nonBlocking - 立即返回占位而非等待 CLI 的 completed(MCP 模式下
+     *   仅 DeferExecuteTool 需要:它的真实执行走 MCP 通道,等待会形成
+     *   CLI↔MCP↔loop 三方死锁)。
+     */
     private ensureReplayTool;
     /**
      * CLI 发来的方法请求:统一入口——`dsh_<工具名>` 的委托工具执行。
@@ -309,6 +372,29 @@ export declare class TurnPump {
     /** 发射真工具块后,认领可能已挂起的 delegate 请求(请求先到场景)。 */
     private claimDelegateRequest;
     /**
+     * MCP 调用转发进 loop(原生执行)。
+     *
+     * 把外部(MCP 端点)发来的调用伪装成本步的一个工具调用块,**追加进当前打开
+     * 的段**后随该段一并收尾——loop 按真实工具名原生执行(审批/沙箱/事件/UI
+     * 卡片全原生),tool/result 写入会话时间线并由 onSessionEvent 按 callId
+     * 回填 MCP 响应。CLI 模型侧同时从 MCP 通道拿到结果,时间线里的这一步则是
+     * "原生记录"。
+     *
+     * 为什么不能另起独立段(历史竞态,2026-09-13 实测):CLI 的 tools/call(本
+     * 方法)与 ACP tool_call 事件先后不定。若本方法先到、只把"无工具调用的旧
+     * 段"收尾,loop 会判定"模型输出完成(无工具)"直接 turn/end——独立注入段
+     * 永远无人消费(子进程被挂到 300s 超时回落直执),且 CLI 随后的最终答复因
+     * 回合已关而无法镜像,整条回答消失。追加进当前段后,该段必然带真工具调用,
+     * loop 必定继续执行;镜像回放事件后到时只会另开新段,由后续 step 正常消费。
+     * @param name - dsh 真工具名(已由端点做白名单校验)。
+     * @param input - 工具参数。
+     * @returns 工具结果(文本 + isError)。
+     */
+    dispatchMcpCall(name: string, input: Record<string, unknown>): Promise<{
+        output: string;
+        isError: boolean;
+    }>;
+    /**
      * 等一次真工具直发的 delegate 调用结果。
      * 块已发射 → 直接绑 callId;请求先到 → 挂起等块发射认领;
      * 结果先到 → 取缓存。同 toolId 并发调用优先按参数精确配对(乱序不错配),
@@ -317,6 +403,14 @@ export declare class TurnPump {
     private awaitDelegateResult;
     /** 把等待者绑定到某个 callId(含 abort 清理)。 */
     private bindDelegateWaiter;
+    /**
+     * 是否 MCP 桥属调用(其真实卡片由注入 loop 的原生调用呈现,镜像应静默)。
+     *
+     * mcp 模式下两类:CLI 未禁用延迟加载时的 DeferExecuteTool 执行器调用;以及
+     * 工具直接展开后的 mcp__dsh__* 直连调用。delegate 模式不该出现这两类名字,
+     * 保持原有镜像行为不变。
+     */
+    private isSuppressedBridgeCall;
     /** 参数完整的工具调用:注册回放工具 → 段内发射 tool-call 块。 */
     private announceCall;
     /** 取(或建)当前打开的段。 */

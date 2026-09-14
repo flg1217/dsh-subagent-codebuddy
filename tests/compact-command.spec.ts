@@ -4,7 +4,9 @@
  * - 分流(codebuddy 会话转发;其它会话回落 dsh 压缩;带参报 usage);
  * - **压缩跑在 agent 的 maintenance 相位里**:压缩期间发来的消息按原生行为排队,
  *   不会开新回合抢跑(抢跑那一轮会和压缩并发写同一个 CLI 会话、盖掉压缩结果);
- * - 自动压缩委托:转发成功回报 handled,失败回落 next();
+ * - 自动压缩委托:codebuddy 会话**一律回报 handled 且不启动 CLI**——dsh 只是
+ *   渲染层,真实压缩由 CLI 自行完成;dsh 若压,会把镜像消息从 UI 上抹掉且压不动
+ *   真实压力。非 codebuddy 会话原样 next();
  * - per-agent 命令挂载(agent.ctx 上注册 `compact`)。
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
@@ -269,8 +271,11 @@ describe('registerCompactDelegation:自动压缩委托', () => {
     return { ctx, fire: async (request, next) => await captured!(request, next) }
   }
 
-  it('codebuddy 会话 → 转发 CLI 并回报 handled(不触发 next)', async () => {
-    const { prompts } = mockCompactCli()
+  it('codebuddy 会话 → 回报 handled 且不启动 CLI(dsh 不参与压缩)', async () => {
+    // 设计:dsh 只是渲染层,真实上下文与压缩都由 CLI 自己负责。插件在委托点
+    // 只声明"由我方处理",让 compaction-basic 跳过自身压缩;既不做 dsh 压缩,
+    // 也不代 CLI 发起压缩。
+    mockCompactCli()
     const deps = makeDeps()
     deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
     const watcher = makeWatcher()
@@ -281,8 +286,8 @@ describe('registerCompactDelegation:自动压缩委托', () => {
       next,
     )
     expect(result).toEqual({ handled: true })
-    expect(prompts).toEqual(['/compact'])
     expect(next).not.toHaveBeenCalled()
+    expect(mockedSpawn).not.toHaveBeenCalled()
   })
 
   it('非 codebuddy 会话 → 原样下调 next(内置压缩不动)', async () => {
@@ -297,62 +302,46 @@ describe('registerCompactDelegation:自动压缩委托', () => {
     expect(mockedSpawn).not.toHaveBeenCalled()
   })
 
-  it('转发失败(CLI 握手报错)→ 回落 next', async () => {
-    mockedSpawn.mockImplementation(() => {
-      const p = fakeAcpProc()
-      p.onRequest(request => {
-        if (request.method === 'initialize') p.respond(request.id, {})
-        else if (request.method === 'session/load') p.respondError(request.id, { code: -1, message: 'no such session' })
-      })
-      return asSpawnResult(p)
-    })
+  it('回归:自动路径不得回落 next,也不得另开 CLI 连接', async () => {
+    // **本用例是"镜像消息从 UI 消失"的回归防线。** 委托的两个触发点都在回合中
+    // (`agent/pre-step` 的 pressure / `agent/request-error` 的 overflow),而
+    // runMaintenance 只在 phase==='idle' 时可用(agent-loop/src/agent.ts:157)。
+    // 修复前:runMaintenance 抛错 → catch → next() → dsh 内置压缩 → 镜像消息被
+    // 摘要替换、从 UI 上消失,且压不动真实压力、每个 step 反复触发。
+    // 现在:无论 agent 是否提供 runMaintenance、是否抛错,都必须只回报 handled。
+    mockCompactCli()
     const deps = makeDeps()
     deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
     const watcher = makeWatcher()
     registerCompactDelegation({ ...deps, ctx: watcher.ctx })
-    const next = vi.fn().mockResolvedValue({ handled: false })
-    const result = await watcher.fire({ agent: { session: { id: 's-1', header: { cwd: process.cwd() } } }, signal: new AbortController().signal }, next)
-    expect(result).toEqual({ handled: false })
-    expect(next).toHaveBeenCalledTimes(1)
-  }, 15_000)
 
-  it('agent 带 runMaintenance → 转发在 maintenance 相位内执行(与手动 /compact 同语义)', async () => {
-    // TOCTOU 防护:busy 检查通过后若用户消息开了新回合,该轮请求会与压缩
-    // 并发写同一 CLI 会话把结果盖掉——必须进 maintenance 让消息排队。
-    const { prompts } = mockCompactCli()
-    const deps = makeDeps()
-    deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
-    const watcher = makeWatcher()
-    registerCompactDelegation({ ...deps, ctx: watcher.ctx })
+    // ① 回合中(runMaintenance 抛错,模拟真实 pre-step 相位)
+    const busyAgent = {
+      session: { id: 's-1', header: { cwd: process.cwd() } },
+      runMaintenance: async (): Promise<never> => { throw new Error('busy: turn in progress') },
+    }
+    const next1 = vi.fn().mockResolvedValue({ handled: false })
+    expect(await watcher.fire({ agent: busyAgent, signal: new AbortController().signal }, next1))
+      .toEqual({ handled: true })
+    expect(next1).not.toHaveBeenCalled()
+
+    // ② 即便 runMaintenance 可用,委托点也不得用它去压(相位语义上不可达,
+    //    且另开连接会与回合泵冲突)
     let maintenanceUsed = false
-    const agent = {
+    const idleAgent = {
       session: { id: 's-1', header: { cwd: process.cwd() } },
       runMaintenance: async <T>(job: (signal: AbortSignal) => Promise<T>): Promise<T> => {
         maintenanceUsed = true
         return await job(new AbortController().signal)
       },
     }
-    const next = vi.fn().mockResolvedValue({ handled: false })
-    const result = await watcher.fire({ agent, signal: new AbortController().signal }, next)
-    expect(maintenanceUsed).toBe(true)
-    expect(result).toEqual({ handled: true })
-    expect(prompts).toEqual(['/compact'])
-    expect(next).not.toHaveBeenCalled()
-  }, 15_000)
+    const next2 = vi.fn().mockResolvedValue({ handled: false })
+    expect(await watcher.fire({ agent: idleAgent, signal: new AbortController().signal }, next2))
+      .toEqual({ handled: true })
+    expect(maintenanceUsed).toBe(false)
+    expect(next2).not.toHaveBeenCalled()
 
-  it('agent 忙(runMaintenance 抛错)→ 回落 next,不阻塞对话', async () => {
-    mockCompactCli()
-    const deps = makeDeps()
-    deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
-    const watcher = makeWatcher()
-    registerCompactDelegation({ ...deps, ctx: watcher.ctx })
-    const agent = {
-      session: { id: 's-1', header: { cwd: process.cwd() } },
-      runMaintenance: async (): Promise<never> => { throw new Error('busy: turn in progress') },
-    }
-    const next = vi.fn().mockResolvedValue({ handled: false })
-    const result = await watcher.fire({ agent, signal: new AbortController().signal }, next)
-    expect(result).toEqual({ handled: false })
-    expect(next).toHaveBeenCalledTimes(1)
-  }, 15_000)
+    // 两条路径都不得启动 CLI 压缩连接。
+    expect(mockedSpawn).not.toHaveBeenCalled()
+  })
 })

@@ -43,6 +43,8 @@ interface SessionShape {
   openStep?: boolean
   /** 会话 header(缺省:子代理会话)。 */
   header?: Record<string, unknown>
+  /** 桥接模式透传(缺省不传 = 低层按 delegate)。 */
+  bridgeMode?: 'mcp' | 'delegate'
 }
 
 interface Harness {
@@ -129,6 +131,7 @@ function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>
     extraArgs: [],
     store: store ?? new ConversationStore(null),
     steerPollMs: 20,
+    ...(shape.bridgeMode === undefined ? {} : { bridgeMode: shape.bridgeMode }),
     ...(timeouts !== undefined ? { timeouts } : {}),
   })
   return {
@@ -1017,6 +1020,135 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
     await new Promise(resolve => setTimeout(resolve, 300))
     const steers = lastFake()!.requestLog().filter(m => m === 'session/steer')
     expect(steers.length).toBe(1)
+    settleFn?.()
+  }, 15_000)
+
+  it('dispatchMcpCall:调用块追加进段(无开放段则新开),结果经 tool/result 事件回填', async () => {
+    // MCP → loop 转发:调用伪装成 tool-call 块追加进当前段,loop 顺序消费后
+    // 原生执行;结果写 tool/result,泵按 callId 回填 dispatch 的 Promise。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+      c.p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'hi'))
+    })
+    const first = await step(h.adapter, makeOptions('s1'))
+    expect(first.some(c => c.includes('段一'))).toBe(true)
+    const pump = TurnPump.forSession('s1')!
+    const pending = pump.dispatchMcpCall('bash', { command: 'echo mcp' })
+    // 调用块被下一次 step 消费:块名 = 真工具名,callId 带 mcp_ 前缀。
+    const second = await step(h.adapter, makeOptions('s1'))
+    const block = second.find(c => c.includes('"name":"bash"') && c.includes('mcp_'))
+    expect(block).toBeDefined()
+    const callId = (JSON.parse(block!) as { block: { id: string; arguments: string } }).block.id
+    expect((JSON.parse(block!) as { block: { arguments: string } }).block.arguments).toBe('{"command":"echo mcp"}')
+    // loop 执行完毕写 tool/result → 回填。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          source: { kind: 'tool', callId },
+          content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'mcp-executed' }] }],
+        },
+      },
+    })
+    await expect(pending).resolves.toEqual({ output: 'mcp-executed', isError: false })
+    settleFn?.()
+  }, 15_000)
+
+  it('dispatchMcpCall 竞态:调用先到(镜像事件未到)→ 真工具块并入当前开放段,同一 step 立即可见', async () => {
+    // 回归(2026-09-13 现场):CLI 的 tools/call 与 ACP tool_call 事件先后不定。
+    // 旧实现"先收尾无调用的段、另起独立注入段"在此形态下把段收成零调用 →
+    // loop 判定"模型输出完成(无工具)"直接 turn/end,注入段永远无人消费
+    // (子进程挂到 300s 超时回落直执),且最终答复因回合已关无法镜像、整条消失。
+    // 现实现:调用块追加进当前开放段再随段收尾——本测试断言同一 step 内可见。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000, boundaryQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+      // 故意不发 tool_call 事件:模拟竞态里 dispatch 先到。
+    })
+    const firstP = step(h.adapter, makeOptions('s1'))
+    // 等"段一"进入当前段;boundaryQuietMs 已放宽,段保持开放直至 dispatch 收尾。
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const pump = TurnPump.forSession('s1')!
+    const pending = pump.dispatchMcpCall('bash', { command: 'echo mcp' })
+    const first = await firstP
+    expect(first.some(c => c.includes('段一'))).toBe(true)
+    const block = first.find(c => c.includes('"name":"bash"') && c.includes('mcp_'))
+    expect(block).toBeDefined()
+    const callId = (JSON.parse(block!) as { block: { id: string } }).block.id
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          source: { kind: 'tool', callId },
+          content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'mcp-executed' }] }],
+        },
+      },
+    })
+    await expect(pending).resolves.toEqual({ output: 'mcp-executed', isError: false })
+    settleFn?.()
+  }, 15_000)
+
+  it('dispatchMcpCall:回合收尾(pump 消失)后等待者被拒绝,不悬挂', async () => {
+    // 覆盖 mcpWaiters 的 dispose 拒绝路径:CLI 在等一个永不到来的结果时,
+    // 回合收尾必须让 dispatch 立即失败(端点据此回落或报错),不能永久悬挂。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 40 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+    })
+    const firstP = step(h.adapter, makeOptions('s1'))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const pump = TurnPump.forSession('s1')!
+    const pending = pump.dispatchMcpCall('bash', { command: 'slow' })
+    let settled = false
+    pending.then(() => { settled = true }, () => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(settled).toBe(false) // 仍在等 loop 结果
+    settleFn?.() // 干净收尾 → pump dispose
+    await vi.waitFor(() => { expect(TurnPump.forSession('s1')).toBeUndefined() }, { timeout: 3_000 })
+    await expect(pending).rejects.toThrow()
+    await firstP.catch(() => { /* step 流已随收尾结束 */ })
+  }, 15_000)
+
+  it('mcp 模式:桥属调用不落镜像卡片;真实卡片由注入的原生调用呈现', async () => {
+    // 真实卡片由 dispatchMcpCall 注入 loop 的原生调用呈现;镜像只会产生
+    // cli_defer_execute_tool / cli_mcp__dsh__bash 套壳噪音,应静默(但登记
+    // calls,防 tool_call_update 兜底路径重入 announceCall)。
+    // 被抑制的调用不进 segment.calls,含它的段等注入到齐才收尾——真实链路一致。
+    const h = makeAdapter({ bridgeMode: 'mcp' }, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+      c.p.update(toolCall('call_d', 'DeferExecuteTool', { toolName: 'mcp__dsh__bash', params: { command: 'x' } }))
+      c.p.update(toolCall('call_e', 'mcp__dsh__bash', { command: 'x' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_d', 'completed', 'ok'))
+      c.p.update(toolUpdate('call_e', 'completed', 'ok'))
+    })
+    const firstP = step(h.adapter, makeOptions('s1'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const pump = TurnPump.forSession('s1')!
+    pump.dispatchMcpCall('bash', { command: 'real' }).catch(() => { /* 收尾后可能被拒 */ })
+    const chunks = await firstP
+    expect(chunks.some(c => c.includes('段一'))).toBe(true)
+    expect(chunks.some(c => c.includes('cli_defer_execute_tool'))).toBe(false)
+    expect(chunks.some(c => c.includes('cli_mcp__dsh__bash'))).toBe(false)
+    expect(chunks.some(c => c.includes('"name":"bash"'))).toBe(true)
+    expect(h.registeredTools.has('cli_defer_execute_tool')).toBe(false)
+    expect(h.registeredTools.has('cli_mcp__dsh__bash')).toBe(false)
     settleFn?.()
   }, 15_000)
 

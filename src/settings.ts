@@ -25,6 +25,7 @@ export const CodebuddySettingsConfig = z.object({
   model: z.string().default('deepseek-v4-flash').description('子代理使用的默认模型(委派时可传 model 参数覆盖)'),
   permissionMode: z.string().default('bypassPermissions').description('--permission-mode:子代理工具调用自动放行'),
   registerSubagentTools: z.boolean().default(false).description('提供旧版自定义委派工具(subagent_codebuddy / list_codebuddy_models);默认关闭,推荐用通用 subagent 工具 + 模型选择'),
+  bridgeMode: z.union([z.const('mcp'), z.const('delegate')]).default('mcp').description('工具桥接模式:mcp=dsh 提供 HTTP MCP server(完整 schema,推荐);delegate=旧 DelegateTool 通道(回退用)'),
 })
 
 /** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
@@ -33,6 +34,7 @@ export interface EffectiveCodebuddySettings {
   model: string
   permissionMode: string
   registerSubagentTools: boolean
+  bridgeMode: 'mcp' | 'delegate'
 }
 
 /**
@@ -154,7 +156,11 @@ export function registerCodebuddySettings(
         hooks: { setSource?: (source: () => Record<string, unknown> | undefined) => void; onChange?: () => void },
       ) => void
     } | undefined
-    settings?.installSection?.(ctx, CODEBUDDY_SETTINGS_NAMESPACE, CodebuddySettingsConfig, {}, {
+    // entry = settings scope 的 base 层:bridgeMode 用插件行配置作初值,面板
+    // 未显式覆盖时解析值与生效值一致(不再出现"面板显示 MCP、实际走 delegate");
+    // 用户显式 set 后以用户层为准(表单优先)。
+    settings?.installSection?.(ctx, CODEBUDDY_SETTINGS_NAMESPACE, CodebuddySettingsConfig,
+      { bridgeMode: config.bridgeMode ?? 'mcp' }, {
       setSource: (source) => {
         current = (() => source() ?? {}) as () => Record<string, unknown>
       },
@@ -171,6 +177,7 @@ export function registerCodebuddySettings(
       model: filled(s.model) ?? filled(config.model) ?? 'deepseek-v4-flash',
       permissionMode: s.permissionMode ?? config.permissionMode ?? 'bypassPermissions',
       registerSubagentTools: s.registerSubagentTools ?? config.registerSubagentTools ?? false,
+      bridgeMode: s.bridgeMode === 'mcp' || s.bridgeMode === 'delegate' ? s.bridgeMode : (config.bridgeMode ?? 'mcp'),
     }
   }
 

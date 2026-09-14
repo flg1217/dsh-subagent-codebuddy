@@ -17,11 +17,13 @@ export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<{
     model: z<string, string>;
     permissionMode: z<string, string>;
     registerSubagentTools: z<boolean, boolean>;
+    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate">;
 }>, Schemastery.ObjectT<{
     command: z<string, string>;
     model: z<string, string>;
     permissionMode: z<string, string>;
     registerSubagentTools: z<boolean, boolean>;
+    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate">;
 }>>;
 /** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
 export interface EffectiveCodebuddySettings {
@@ -29,6 +31,7 @@ export interface EffectiveCodebuddySettings {
     model: string;
     permissionMode: string;
     registerSubagentTools: boolean;
+    bridgeMode: 'mcp' | 'delegate';
 }
 /**
  * Windows 下把 `codebuddy` 命令解析为 node 可直接 spawn 的形式。

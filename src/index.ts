@@ -26,6 +26,7 @@ import { syncCliIntegrations } from './cli-integrations.js'
 import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
 import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.js'
+import { registerDshMcpServer } from './mcp-server.js'
 import type {} from '@deepseek-ai/dsh-settings'
 
 export const name = 'subagent-codebuddy'
@@ -80,6 +81,13 @@ export interface Config {
   tailBgQuietMinutes?: number
   /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
   tailCapMinutes?: number
+  /**
+   * 工具桥接模式(默认 `mcp`)。
+   * - `mcp`:dsh 起 HTTP MCP server,CLI 每回合以 `--mcp-config` 连接,
+   *   工具以 `mcp__dsh__<工具名>` 一等公民呈现(完整 schema 强约束);
+   * - `delegate`:旧通道(Dsh-* 委托工具 + DelegateTool 合成),保留作回退。
+   */
+  bridgeMode?: 'mcp' | 'delegate'
 }
 
 export const Config: z<Config> = z.object({
@@ -94,6 +102,7 @@ export const Config: z<Config> = z.object({
   tailQuietSeconds: z.number().default(5),
   tailBgQuietMinutes: z.number().default(10),
   tailCapMinutes: z.number().default(30),
+  bridgeMode: z.union([z.const('mcp'), z.const('delegate')]).default('mcp'),
 })
 
 export function apply(ctx: Context, config: Config): void {
@@ -103,6 +112,13 @@ export function apply(ctx: Context, config: Config): void {
   // 装载时先同步一次 dsh→CodeBuddy 的原生接入(MCP 配置 / skills 目录);
   // 每个 CodeBuddy 进程启动前(pump/adapter)还会再同步,保证读到最新。
   syncCliIntegrations()
+
+  // dsh MCP server:把会话可见的 dsh 工具以 MCP 暴露给 CLI(bridgeMode=mcp 时
+  // spawn 以 --mcp-config 连接;动态注册/发现见 mcp-server.ts 模块头)。
+  // 用 ctx.effect 接管释放函数:插件卸载/热重载时摘掉路由并作废端点 key。
+  // (registerDshMcpServer 内部还会把路由 disposer 挂到自己的 inject 子 fiber,
+  // 这里是显式兜底——不接的话路由会一直挂在 webserver 上。)
+  ctx.effect(() => registerDshMcpServer(ctx))
 
   // opt-in 工具的注册状态:设置面板开关实时同步(开 → 注册,关 → 注销)。
   let toolCtx: Context | undefined
@@ -123,6 +139,7 @@ export function apply(ctx: Context, config: Config): void {
     modelOf: () => settingsOf().model,
     permissionMode: eff.permissionMode,
     extraArgs: config.extraArgs ?? [],
+    bridgeMode: eff.bridgeMode,
     store: conversations,
     // 静默长工具硬顶(分钟 → 毫秒;0 = 关闭)。看门狗超顶时 cancel+强杀,走
     // stall 重试自动续跑——防止 CLI 卡死时进程泄漏、子会话回合悬空。

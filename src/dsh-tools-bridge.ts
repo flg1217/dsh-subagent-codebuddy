@@ -102,12 +102,23 @@ function canonicalBridgeName(toolId: string): string {
 /** 桥工具 id → dsh 工具名;非桥命名、ptc 保留名、MCP 或 CLI 镜像名时返回 undefined。 */
 export function bridgeTargetTool(toolId: string): string | undefined {
   const name = canonicalBridgeName(toolId)
-  if (name.length === 0 || BRIDGE_EXCLUDED.has(name) || name.startsWith(MCP_TOOL_PREFIX)) return undefined
-  // CLI 镜像代理不暴露、也不受理(它只在会话 scope 里承接 CLI 原生调用)。
-  if (name.startsWith(CLI_MIRROR_TOOL_PREFIX)) return undefined
-  // 被镜像占名的 dsh 工具:调了只会打到镜像上,不认。
-  if (BRIDGE_MIRROR_OWNED.has(name)) return undefined
+  if (!isBridgeEligible(name)) return undefined
   return name
+}
+
+/**
+ * 该 dsh 工具名是否可以暴露给 CLI(桥与 MCP 两条通道共用同一资格判定)。
+ *
+ * 排除:ptc 保留名(run_code)、MCP 工具(走 CLI 原生 MCP 通道)、CLI 镜像
+ * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)。
+ */
+export function isBridgeEligible(name: string): boolean {
+  if (name.length === 0) return false
+  if (BRIDGE_EXCLUDED.has(name)) return false
+  if (name.startsWith(MCP_TOOL_PREFIX)) return false
+  if (name.startsWith(CLI_MIRROR_TOOL_PREFIX)) return false
+  if (BRIDGE_MIRROR_OWNED.has(name)) return false
+  return true
 }
 
 /** CLI 展示名:唯一、可读(`dsh_grep` → `Dsh-grep`)。 */
@@ -154,19 +165,16 @@ export function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpe
   let schemas: readonly DshToolSchemaFace[]
   try {
     schemas = tools?.schemas?.(parent) ?? []
-  } catch {
+  } catch (error: unknown) {
+    // 不静默:空表会让 CLI 侧所有 dsh_* 调用都报 not found——必须能区分
+    // "schemas 抛错"与"确实无工具",否则现场无从定位。
+    console.error('[codebuddy-bridge] listDshBridgeTools: tools.schemas() 抛错,本次返回空工具表:'
+      + (error instanceof Error ? error.message : String(error)))
     return []
   }
   const specs: DelegateToolSpec[] = []
   for (const schema of schemas) {
-    if (typeof schema?.name !== 'string' || schema.name.length === 0) continue
-    if (BRIDGE_EXCLUDED.has(schema.name)) continue
-    // MCP 工具走 CLI 原生 MCP 通道,不经桥。
-    if (schema.name.startsWith(MCP_TOOL_PREFIX)) continue
-    // CLI 镜像代理不是真工具,别暴露给 CLI(它的 schema/描述对模型是噪音)。
-    if (schema.name.startsWith(CLI_MIRROR_TOOL_PREFIX)) continue
-    // 被镜像占名的工具不桥接(见 BRIDGE_MIRROR_OWNED)。
-    if (BRIDGE_MIRROR_OWNED.has(schema.name)) continue
+    if (typeof schema?.name !== 'string' || !isBridgeEligible(schema.name)) continue
     const inputSchema = (schema.parameters !== null && typeof schema.parameters === 'object'
       ? schema.parameters
       : { type: 'object', properties: {} }) as Record<string, unknown>
@@ -177,6 +185,61 @@ export function listDshBridgeTools(ctx: Context, parent: Agent): DelegateToolSpe
     specs.push({
       id: bridgeToolId(schema.name),
       name: bridgeToolName(schema.name),
+      description: EXECUTION_TOOLS.has(schema.name) ? base + EXECUTION_HINT : base,
+      inputSchema,
+    })
+  }
+  return specs
+}
+
+/** 暴露给 MCP 通道的工具描述(MCP tools/list 条目)。 */
+export interface McpToolSpec {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
+/**
+ * 列出当前会话可见、应通过 MCP 暴露的全部 dsh 工具。
+ *
+ * 与桥同名同源:工具集来自 `ctx.tools.schemas(agent)`(per-agent scope 过滤
+ * 已生效),过滤规则共用 {@link isBridgeEligible}。与桥的差异:MCP 的工具是
+ * 一等公民(自带完整 inputSchema),所以 name 用**裸原名**(CLI 侧呈现为
+ * `mcp__<server>__<name>`)、description 用原描述 + 执行提示,不注入
+ * "调用形态"提示(结构化 schema 已是强约束)。
+ *
+ * **动态性**:每次 tools/list 都现取 schemas——会话可见工具增删(插件装载、
+ * scope 变化)在下一次 list 即反映;配合 CLI 对 MCP 的周期性 list(实测),
+ * 无需另行缓存或失效逻辑。
+ * @param ctx - 插件上下文(tools 服务)。
+ * @param parent - 会话的 agent(scope 与执行归属)。
+ * @returns MCP 工具条目(每次调用现算)。
+ */
+export function listDshMcpTools(ctx: Context, parent: Agent): McpToolSpec[] {
+  const tools = (ctx as unknown as { get?: (key: string) => unknown }).get?.('tools') as
+    | { schemas?: (scope?: unknown) => readonly DshToolSchemaFace[] }
+    | undefined
+  let schemas: readonly DshToolSchemaFace[]
+  try {
+    schemas = tools?.schemas?.(parent) ?? []
+  } catch (error: unknown) {
+    // 不静默:空表会让 tools/list 返回"零工具",CLI 侧表现为所有
+    // mcp__dsh__* 调用都报 not found——必须能区分"schemas 抛错"与"确实无工具"。
+    console.error('[codebuddy-bridge] listDshMcpTools: tools.schemas() 抛错,本次返回空工具表:'
+      + (error instanceof Error ? error.message : String(error)))
+    return []
+  }
+  const specs: McpToolSpec[] = []
+  for (const schema of schemas) {
+    if (typeof schema?.name !== 'string' || !isBridgeEligible(schema.name)) continue
+    const inputSchema = (schema.parameters !== null && typeof schema.parameters === 'object'
+      ? schema.parameters
+      : { type: 'object', properties: {} }) as Record<string, unknown>
+    const base = typeof schema.description === 'string' && schema.description.trim().length > 0
+      ? schema.description.trim()
+      : `(the dsh-side tool "${schema.name}")`
+    specs.push({
+      name: schema.name,
       description: EXECUTION_TOOLS.has(schema.name) ? base + EXECUTION_HINT : base,
       inputSchema,
     })
