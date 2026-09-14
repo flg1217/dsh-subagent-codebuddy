@@ -518,6 +518,26 @@ describe('registerCompactDelegation:压缩接管', () => {
     expect(warns.filter(message => message.includes('agentPresets')).length).toBe(1)
   })
 
+  it('rosterless 部署(没有 preset 名册):退回宿主平面的 compaction', async () => {
+    // 没有 preset 的部署里,模型面插件直接挂在宿主组合里,compaction 就在宿主平面
+    // (插件 ctx 自己看得到)。这条路不能丢:否则这类部署照样压缩风暴。
+    const deps = makeDeps()
+    const engine = new FakeEngine()
+    const created: Array<(payload: unknown) => void> = []
+    const ctx = {
+      get: (key: string) => (key === 'compaction' ? engine : undefined),
+      effect: () => {},
+      on: (event: string, listener: (payload: unknown) => void) => {
+        if (event === 'agent/created') created.push(listener)
+        return () => {}
+      },
+    } as unknown as Context
+    registerCompactDelegation({ ...deps, ctx })
+    for (const listener of created) listener({ agent: agentOf('codebuddy') })
+    expect(await engine.compactIfNeeded(agentOf('codebuddy'), 'pressure', signal())).toBeNull()
+    expect(engine.calls).toBe(0)
+  })
+
   it('preset 未挂 compaction(serviceFor 返回 undefined)→ 不炸,也不算"失效"', () => {
     // 没有 compaction 服务的 preset 本来就压不动,不存在压缩风暴:这种情况不该报
     // "接管未生效"级别的告警(否则日志里全是假警报)。
