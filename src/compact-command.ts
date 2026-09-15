@@ -37,6 +37,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ConversationStore } from './conversations.js'
 import { TurnPump } from './pump.js'
+import { markSelfInitiatedCompaction } from './self-compaction.js'
 
 /** 命令结果(与 dsh commands 服务的形状一致)。 */
 export type CompactCommandResult =
@@ -136,6 +137,9 @@ export async function forwardCompactToCli(
   }
   const conn = new AcpConnection(argv, cwd, onUpdate)
   const to = DEFAULT_ACP_RUN_TIMEOUTS
+  // 发起时刻取在转发**之前**:CLI 可能在转发期间就给摘要打上时间戳,用结束时刻
+  // 会把它误判成"本次之前漏看的那条"(见 self-compaction.ts 的判定说明)。
+  const requestedAt = Date.now()
   try {
     await conn.request('initialize', {
       protocolVersion: 1,
@@ -148,6 +152,9 @@ export async function forwardCompactToCli(
       sessionId: record.acpId,
       prompt: [{ type: 'text', text: '/compact' }],
     }, COMPACT_TIMEOUT_MS)
+    // 命令回执已经报了这次压缩;标记一下,让镜像层别再把 CLI 随之写出的摘要
+    // 渲染成第二张压缩卡(见 self-compaction.ts)。
+    markSelfInitiatedCompaction(sessionId, requestedAt)
     const before = contextBefore === undefined
       ? ''
       : `压缩前上下文 ≈ ${Math.round(contextBefore / 1000)}K tokens;`

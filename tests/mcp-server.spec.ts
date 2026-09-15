@@ -24,12 +24,17 @@ interface McpTestHarness {
   baseUrl: string
   key: string
   executeCalls: Array<Record<string, unknown>>
+  /** 客户端断连后才完成的结果,补投进会话的记录。 */
+  deliveries: Array<{ kind: 'inject' | 'followup'; message: unknown }>
   close: () => Promise<void>
 }
 
 /** 起一个真 HTTP server,把 MCP handler 挂上(绕过 webserver 服务)。 */
-async function makeHarness(options: { toolsExecuteError?: boolean } = {}): Promise<McpTestHarness> {
+async function makeHarness(
+  options: { toolsExecuteError?: boolean; toolDelayMs?: number; agentStatus?: string } = {},
+): Promise<McpTestHarness> {
   const executeCalls: Array<Record<string, unknown>> = []
+  const deliveries: Array<{ kind: 'inject' | 'followup'; message: unknown }> = []
   const toolsFace = {
     schemas: () => [
       { name: 'grep', description: 'Search files.', parameters: { type: 'object', properties: { pattern: { type: 'string' } } } },
@@ -38,11 +43,21 @@ async function makeHarness(options: { toolsExecuteError?: boolean } = {}): Promi
     ],
     execute: async (call: Record<string, unknown>) => {
       executeCalls.push(call)
+      // 交互式工具(等用户作答)会长时间不返回;这里用它制造"客户端先放弃"的窗口。
+      if (options.toolDelayMs !== undefined) {
+        await new Promise(resolve => setTimeout(resolve, options.toolDelayMs))
+      }
       if (options.toolsExecuteError === true) throw new Error('sandbox denied')
       return { isError: false, content: [{ type: 'text', text: 'executed!' }] }
     },
   }
-  const agentsFace = { get: (id: string) => (id === 'sess-ok' ? { id } : undefined) }
+  const agentFace = {
+    id: 'sess-ok',
+    status: options.agentStatus ?? 'idle',
+    inject: (message: unknown) => { deliveries.push({ kind: 'inject', message }) },
+    followup: (message: unknown) => { deliveries.push({ kind: 'followup', message }) },
+  }
+  const agentsFace = { get: (id: string) => (id === 'sess-ok' ? agentFace : undefined) }
   let routeHandler: ((req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void | Promise<void>) | undefined
   const ctx = {
     get: (key: string): unknown => {
@@ -86,8 +101,26 @@ async function makeHarness(options: { toolsExecuteError?: boolean } = {}): Promi
     baseUrl: `http://127.0.0.1:${port}${DSH_MCP_ENDPOINT_PATH}`,
     key,
     executeCalls,
+    deliveries,
     close: async () => { await new Promise<void>(resolve => server.close(() => resolve())) },
   }
+}
+
+/**
+ * 发一个请求,并在 handler 已进入、工具仍在跑时断连。
+ * `res.on('close')` 看到 `writableFinished === false` 才会记下 `clientGoneAt`。
+ */
+async function rpcThenAbort(h: McpTestHarness, body: unknown, abortAfterMs = 60): Promise<void> {
+  const controller = new AbortController()
+  const pending = fetch(`${h.baseUrl}?session=sess-ok&key=${h.key}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).catch(() => undefined)
+  await new Promise(resolve => setTimeout(resolve, abortAfterMs))
+  controller.abort()
+  await pending
 }
 
 let harness: McpTestHarness | undefined
@@ -313,5 +346,46 @@ describe('MCP 转发看门狗取值约束(回归)', () => {
     //       ②不得等于/小于尾注声明的预算。
     expect(MCP_CALL_TIMEOUT_MS).toBeGreaterThan(CLI_TOOL_CALL_TIMEOUT_S * 1_000)
     expect(MCP_CALL_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000)
+  })
+})
+
+describe('客户端断连后才完成的调用:结果必须补投进会话', () => {
+  const call = {
+    jsonrpc: '2.0', id: 9, method: 'tools/call',
+    params: { name: 'grep', arguments: { pattern: 'x' } },
+  }
+
+  it('工具在客户端放弃后才返回 → 会话空闲时唤起一轮', async () => {
+    harness = await makeHarness({ toolDelayMs: 250 })
+
+    await rpcThenAbort(harness, call)
+    await new Promise(resolve => setTimeout(resolve, 350))
+
+    // 交互式工具(ask_user_question / exit_plan_mode)全靠这条投递才有人接着走:
+    // CLI 已经放弃这次调用,它的模型永远看不到结果,界面上就是"提问结束就完了"。
+    expect(harness.deliveries.map(entry => entry.kind)).toEqual(['followup'])
+    const text = JSON.stringify(harness.deliveries[0]?.message ?? {})
+    expect(text).toContain('grep')
+    expect(text).toContain('executed!')
+    expect(text).toContain('codebuddy-bridge')
+  })
+
+  it('会话忙时排队等下一步,而不是抢开一轮', async () => {
+    harness = await makeHarness({ toolDelayMs: 250, agentStatus: 'running' })
+
+    await rpcThenAbort(harness, call)
+    await new Promise(resolve => setTimeout(resolve, 350))
+
+    expect(harness.deliveries.map(entry => entry.kind)).toEqual(['inject'])
+  })
+
+  it('客户端没断连时不补投(CLI 已经拿到响应,补投就是重复上报)', async () => {
+    harness = await makeHarness({ toolDelayMs: 10 })
+
+    const { status } = await rpc(harness, call)
+    await new Promise(resolve => setTimeout(resolve, 120))
+
+    expect(status).toBe(200)
+    expect(harness.deliveries).toEqual([])
   })
 })

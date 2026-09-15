@@ -22,6 +22,10 @@ import {
   resetTakeoverStateForTests,
 } from '../src/compact-command.ts'
 import type { CompactCommandDeps, CompactInvocation } from '../src/compact-command.ts'
+import {
+  isSelfInitiatedCompaction,
+  resetSelfInitiatedCompactionsForTests,
+} from '../src/self-compaction.ts'
 import { asSpawnResult, autoHandshake, fakeAcpProc, usage } from './fake-acp.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -33,6 +37,7 @@ const mockedSpawn = vi.mocked(spawn)
 beforeEach(() => {
   mockedSpawn.mockReset()
   resetTakeoverStateForTests()
+  resetSelfInitiatedCompactionsForTests()
 })
 
 /** 内存态会话映射(不落盘)。 */
@@ -142,6 +147,29 @@ describe('forwardCompactToCli:转发 /compact', () => {
     const result = await forwardCompactToCli(deps, 's-1', process.cwd(), new AbortController().signal)
     expect(result.kind).toBe('success')
     if (result.kind === 'success') expect(result.text).toContain('611K')
+  })
+
+  it('成功转发后标记该会话(镜像层据此不再重复渲染同一次压缩)', async () => {
+    mockCompactCli()
+    const deps = makeDeps()
+    deps.store.set('s-1', { acpId: 'cb-session-9', sentCount: 1 })
+
+    const result = await forwardCompactToCli(deps, 's-1', process.cwd(), new AbortController().signal)
+
+    expect(result.kind).toBe('success')
+    // 本次压缩自己的摘要(CLI 可能在转发期间就打好时间戳)→ 认领并清除标记。
+    const now = Date.now()
+    expect(isSelfInitiatedCompaction('s-1', now, now)).toBe(true)
+    expect(isSelfInitiatedCompaction('s-1', now, now)).toBe(false)
+  })
+
+  it('转发失败不标记(没有产出,不该静音镜像)', async () => {
+    const deps = makeDeps()
+
+    const result = await forwardCompactToCli(deps, 's-none', process.cwd(), new AbortController().signal)
+
+    expect(result.kind).toBe('error')
+    expect(isSelfInitiatedCompaction('s-none', Date.now(), Date.now())).toBe(false)
   })
 })
 

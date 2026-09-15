@@ -26,10 +26,18 @@
  * (实测;`source` 还有 `initial-user-message`,那是种子首条,不算压缩)。本模块按
  * 字节偏移量 tail 该文件,只认新增的 `periodic` 记录。
  *
+ * ## 只镜像 CLI 自己触发的那次
+ * 手动 `/compact` 是 dsh 转发给 CLI 的,命令自己的回执已经报过它;CLI 随之写出的
+ * 摘要若也镜像,同一次压缩就出现两条消息。所以 dsh 发起过的压缩由
+ * {@link isSelfInitiatedCompaction} 认领并跳过(判定按时间线,见该模块)。
+ *
  * ## 触发时机与安全
- * 跑在 `agent/pre-step`(回合进行中、step 之间)——与 dsh 自己的压缩同一个相位,
- * 所以事务的 `turn` 归属天然正确,也不会跨 `turn/end`。整组事件同步追加完,
- * 中途不 yield。
+ * 挂在两个回合内的相位上,都在 `turn/end` 之前,所以事务的 `turn` 归属天然正确、
+ * 也不会跨回合;整组事件同步追加完,中途不 yield:
+ * - `agent/pre-step`:CLI 在 step 之间压的;
+ * - `agent/turn-stopping`:CLI 在回合收尾压的——**最常见的一种**(实测 CLI
+ *   07:59:40 写摘要、回合 07:59:44 结束)。只挂 pre-step 的话这一轮再没有下一个
+ *   step,卡片与上下文容量都要等到下一个大轮才出现。
  * @module subagent-codebuddy/compact-mirror
  */
 import type { Context } from '@deepseek-ai/cordis';
@@ -49,3 +57,8 @@ export interface CompactMirrorDeps {
  * @param deps - 挂载依赖。
  */
 export declare function registerCompactMirror(deps: CompactMirrorDeps): void;
+/**
+ * 测试用:清掉按会话的读取游标。游标是模块级的(按 dsh 会话 id 记忆),同一
+ * 测试文件里各用例的会话 id 相同,不清就会继承上一条用例的偏移量。
+ */
+export declare function resetCompactMirrorStateForTests(): void;

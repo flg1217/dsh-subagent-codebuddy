@@ -7,7 +7,7 @@
 
 ## 一、这是什么
 
-`codebuddy` 是一位**完整的模型供应商**（对齐 dsh-llm-agy 的架构）：
+`codebuddy` 是一位**完整的模型供应商**：
 
 | 能力 | 说明 |
 | --- | --- |
@@ -138,6 +138,22 @@ MCP 端点的安全约束：**仅 loopback 来源 + URL 携带每进程随机 ke
 自带 webserver 上（与 Web UI 同端口），不额外开监听；`tools/call` 另按 `tools/list` 的同一份
 工具面校验可见性。会话专属配置写在系统临时目录，权限 `0600`，超龄自动清扫。
 
+**客户端放弃后的结果补投（交互式工具的关键路径）**：CLI 侧一旦按超时/断连放弃一次
+`tools/call`，它的模型就永远看不到结果，而 dsh 侧**不会**因此中止已经注入 loop 的调用。
+对**交互式**工具这是致命的：用户在 `ask_user_question` /
+`exit_plan_mode` 上作答之后，回答送达的是一个已经消失的调用——界面上"提问结束就完了"，
+不会有任何后续。所以端点把这类结果**补投进会话**：客户端确实断连过（响应未写完就
+close）且调用最终完成时，把结果作为一条 notice 投进会话；会话空闲就唤起一轮（CLI 被
+重新 prompt，模型据此继续），忙则排队等下一步。只在客户端确实断连时才投递——那时 CLI
+一定没收到响应，所以这不是重复上报。同理，转发兜底超时那句"不要盲目重跑同一命令"
+也会补投：它正是防止同一副作用跑两遍的关键，丢在一个已经消失的响应里等于没说。
+
+**诊断落盘**：桥的关键诊断（客户端等待时长、兜底超时、回落直执、补投失败）除
+`console.error` 外还会追加到 `~/.dsh/codebuddy/mcp-bridge.log`。控制台日志会随终端滚掉，
+而"CLI 到底有没有放弃这次调用"必须可事后核对——其中打印的**客户端等待**时长就是
+CLI 侧工具超时 T_client。`pump.ts` 的 `MCP_CALL_TIMEOUT_MS` 若要收紧必须以这个值为据，
+**不要**拿尾注里那句未经验证的 30s 反推（曾这样推成 25s 并造成回归，有回归用例钉住）。
+
 - **事件写入**:adapter 检测调用方（agent-loop）已打开的 turn/step，把 ACP 的
   思考/文本/工具事件直写进该 step（tool/call 前先以 assistant/message 广告，
   严格满足 dsh 会话格式 v2 关系校验）；辅助调用（压缩/标题，带 `purpose`）
@@ -161,7 +177,7 @@ MCP 端点的安全约束：**仅 loopback 来源 + URL 携带每进程随机 ke
 真实上下文在 CLI 自己的会话文件里；而 dsh 的压力测量以 CLI 上报的 usage 为基线，它唯一能压的
 却是 dsh 侧的镜像消息面 —— 压完压力不降 → 下一个 step 再触发；`compaction-basic` 的收缩闸门
 （`summary is not smaller than the shadowed content`）在镜像面只剩旧摘要时必然拒绝，于是变成
-**压缩风暴**（实测：11 分钟内 20+ 次 `compaction/start` → `compaction/end(error)`），
+**压缩风暴**（短时间内连打 20+ 次 `compaction/start` → `compaction/end(error)`），
 偶发成功的那几次还会把镜像面替换成摘要、把模型带偏。
 
 实现方式（**零 dsh 源码改动**）：
@@ -172,6 +188,17 @@ MCP 端点的安全约束：**仅 loopback 来源 + URL 携带每进程随机 ke
 | 手动 `/compact` | per-agent 命令覆盖 → 转发给 CLI（跑在 `runMaintenance` 相位里，压缩期间消息按原生行为排队） |
 | `compactNow` 兜底 | per-agent 覆盖没挂上时全局命令会走到它 → 同样接管，不压镜像 |
 | **CLI 自己压完之后** | `compact-mirror` 把这次压缩镜像成 dsh 的一次压缩事务 → 界面出现标准压缩卡。**零 token**：照抄 CLI 的摘要原文，不调用任何模型，只有本地文件读取 + 日志写入 |
+
+镜像的两个时机与一条去重规则：
+
+- **时机**：挂在 `agent/pre-step`（CLI 在 step 之间压的）**和** `agent/turn-stopping`（CLI 在
+  回合收尾压的，**最常见**）。只挂前者的话，回合收尾那一次本轮再没有下一个 step，压缩卡与
+  上下文容量都要等到**下一个大轮**才出现。两个时机都在 `turn/end` 之前，`turn` 归属天然正确。
+- **去重**：dsh 自己发起的那次压缩（手动 `/compact` 转发）**不再镜像**——命令回执已经报过它，
+  再补一张压缩卡就是同一次压缩的两条消息。判定按**时间线**而不是"第几条摘要"：CLI 的摘要是
+  惰性落盘的（手动压缩的摘要可能十几分钟后才写出），期间镜像层会先看到一条更早的、与本次
+  无关的摘要，而它恰恰会落在手动压缩回执的旁边——用户看到的两条正是这一对。30 分钟 TTL 兜底，
+  转发没有产出时不会永久静音镜像。
 
 判据是**会话最新一次请求的路由 provider**（不是持久化的会话映射）——把 codebuddy 会话切回别的
 provider 后，dsh 会恢复正常压缩。
@@ -194,8 +221,8 @@ pnpm test           # vitest 单元测试
 pnpm typecheck      # tsc --noEmit
 ```
 
-> **`pnpm install` 目前只能在作者的机器上跑**：`package.json` 的 `devDependencies` 用了
-> `link:D:/Projects/DeepseekHarness/repo/...` 这类**绝对路径**（指向 dsh 源码树，用于本地联调）。
+> **本仓库的 `pnpm install` 只在开发机上可用**：`package.json` 的 `devDependencies` 用了
+> `link:<绝对路径>` 形式指向 dsh 源码树（本地联调需要）。
 > 换机器前需把它们改成正常的版本号（如 `>=0.1.3-alpha.2`）或 `workspace:*`。
 > 仅**使用**插件（不构建）的人不受影响——运行时 `lib/` 只依赖相对路径与 peerDependencies。
 

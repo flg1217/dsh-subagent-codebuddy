@@ -12,8 +12,14 @@ import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { ConversationStore } from '../src/conversations.ts'
-import { registerCompactMirror } from '../src/compact-mirror.ts'
+import { registerCompactMirror, resetCompactMirrorStateForTests } from '../src/compact-mirror.ts'
 import { projectSlug } from '../src/native-session.ts'
+import {
+  isSelfInitiatedCompaction,
+  markSelfInitiatedCompaction,
+  resetSelfInitiatedCompactionsForTests,
+  SELF_INITIATED_TTL_MS,
+} from '../src/self-compaction.ts'
 
 const CWD = 'D:\\Web\\demo'
 const SESSION_ID = 'session-mirror-1'
@@ -25,7 +31,12 @@ let summaryFile = ''
 beforeEach(() => {
   baseDir = mkdtempSync(join(tmpdir(), 'cb-mirror-'))
   summaryFile = join(baseDir, projectSlug(CWD), `${ACP_ID}.jsonl`)
+  resetSelfInitiatedCompactionsForTests()
+  resetCompactMirrorStateForTests()
 })
+
+/** 一次镜像事务的四个事件类型(镜像成功时的固定形状)。 */
+const MIRRORED = ['compaction/start', 'compaction/summary', 'user/message', 'compaction/end']
 
 interface Appended {
   type: string
@@ -47,7 +58,10 @@ interface Harness {
   appended: Appended[]
   infos: string[]
   warns: string[]
+  /** 触发一次 `agent/pre-step`(回合中途的检查点)。 */
   fire: (turn?: number) => Promise<unknown>
+  /** 触发一次 `agent/turn-stopping`(回合收尾的检查点)。 */
+  stopTurn: (turn?: number) => Promise<unknown>
 }
 
 interface HarnessOptions {
@@ -83,6 +97,7 @@ function makeHarness(options: HarnessOptions): Harness {
   const warns: string[] = []
   const bySeq = new Map(options.events.map(event => [event.seq, event]))
   let handler: ((payload: unknown, next: () => Promise<unknown>) => Promise<unknown>) | undefined
+  let turnStopping: ((payload: unknown) => Promise<unknown>) | undefined
 
   const session = {
     id: SESSION_ID,
@@ -103,6 +118,7 @@ function makeHarness(options: HarnessOptions): Harness {
   const ctx = {
     on: (event: string, cb: typeof handler) => {
       if (event === 'agent/pre-step') handler = cb
+      if (event === 'agent/turn-stopping') turnStopping = cb as unknown as typeof turnStopping
     },
     get: (key: string) => (key === 'tokenMeter'
       ? {
@@ -129,6 +145,7 @@ function makeHarness(options: HarnessOptions): Harness {
     infos,
     warns,
     fire: async (turn = 7) => await handler!({ agent: { session }, turn }, async () => 'NEXT'),
+    stopTurn: async (turn = 7) => await turnStopping!({ agent: { session }, turn, signal: new AbortController().signal }),
   }
 }
 
@@ -141,8 +158,8 @@ function writeRecord(record: unknown, options: { append?: boolean } = {}): void 
 }
 
 /** 一条 CLI 自己压出来的摘要记录。 */
-function periodicSummary(text: string): unknown {
-  return { id: 's-1', timestamp: 1, type: 'summary', summary: text, providerData: { source: 'periodic' } }
+function periodicSummary(text: string, timestamp = 1): unknown {
+  return { id: 's-1', timestamp, type: 'summary', summary: text, providerData: { source: 'periodic' } }
 }
 
 /** 最小可镜像 surface(3 个节点 → 够选出一段头部区间)。 */
@@ -284,5 +301,80 @@ describe('registerCompactMirror:把 CLI 的压缩镜像成 dsh 压缩事务', ()
     expect(await harness.fire()).toBe('NEXT')
     expect(harness.appended).toEqual([])
     expect(harness.warns.some(message => message.includes('镜像 CLI 压缩失败'))).toBe(true)
+  })
+})
+
+describe('registerCompactMirror:回合收尾也要镜像(不等下一个大轮)', () => {
+  it('turn-stopping 上镜像 CLI 在回合收尾压的那一次', async () => {
+    const harness = makeHarness(MINIMAL)
+    await harness.fire()
+    // CLI 在回合收尾压缩:实测 07:59:40 写摘要、回合 07:59:44 结束。只挂 pre-step
+    // 的话这一轮再没有下一个 step,卡片要等到下一个大轮才补出来。
+    writeRecord(periodicSummary('CLI 收尾时压的'))
+
+    await harness.stopTurn()
+
+    expect(harness.appended.map(item => item.type)).toEqual(MIRRORED)
+  })
+
+  it('turn-stopping 上的失败只记日志,不让回合以错误收场', async () => {
+    const store = new ConversationStore(null)
+    store.set(SESSION_ID, { acpId: ACP_ID, sentCount: 1 })
+    Object.defineProperty(store, 'get', { value: () => { throw new Error('boom') } })
+    const harness = makeHarness({ ...MINIMAL, store })
+    writeRecord(periodicSummary('s'))
+
+    // 该事件上抛错会结束整个回合(agent-loop 契约),所以这里必须不抛。
+    await expect(harness.stopTurn()).resolves.toBeUndefined()
+    expect(harness.warns.some(message => message.includes('镜像 CLI 压缩失败'))).toBe(true)
+  })
+})
+
+describe('registerCompactMirror:不重复渲染 dsh 自己发起的压缩', () => {
+  it('跳过属于手动 /compact 的摘要(命令回执已经报过)', async () => {
+    const harness = makeHarness(MINIMAL)
+    await harness.fire()
+    const requestedAt = Date.now()
+    markSelfInitiatedCompaction(SESSION_ID, requestedAt)
+    // CLI 惰性落盘:这条摘要的时刻在发起之后 → 就是这次转发的产出。
+    writeRecord(periodicSummary('手动压缩的摘要', requestedAt + 1))
+
+    await harness.fire()
+
+    expect(harness.appended).toEqual([])
+    expect(harness.infos.some(message => message.includes('跳过一条 CLI 摘要'))).toBe(true)
+  })
+
+  it('跳过发起之前漏看的旧摘要,并保留标记等本次转发的摘要', async () => {
+    const harness = makeHarness(MINIMAL)
+    await harness.fire()
+    const requestedAt = Date.now()
+    markSelfInitiatedCompaction(SESSION_ID, requestedAt)
+    // 一条更早的自动压缩摘要:手动压缩那一轮才被看到,不能渲染成"第二条消息"。
+    writeRecord(periodicSummary('更早的自动压缩', requestedAt - 60_000))
+    await harness.fire()
+    expect(harness.appended).toEqual([])
+
+    // 本次转发自己的摘要随后到达:仍然不渲染,并清掉标记。
+    writeRecord(periodicSummary('手动压缩的摘要', requestedAt + 1), { append: true })
+    await harness.fire()
+    expect(harness.appended).toEqual([])
+    expect(isSelfInitiatedCompaction(SESSION_ID, Date.now(), Date.now())).toBe(false)
+
+    // 标记已清 → CLI 之后自己的压缩恢复镜像。
+    writeRecord(periodicSummary('之后的自动压缩', Date.now() + 1), { append: true })
+    await harness.fire()
+    expect(harness.appended.map(item => item.type)).toEqual(MIRRORED)
+  })
+
+  it('标记过期后恢复镜像(转发没有产出时不会永久静音)', async () => {
+    const harness = makeHarness(MINIMAL)
+    await harness.fire()
+    markSelfInitiatedCompaction(SESSION_ID, Date.now() - SELF_INITIATED_TTL_MS - 1)
+    writeRecord(periodicSummary('CLI 自己的压缩'))
+
+    await harness.fire()
+
+    expect(harness.appended.map(item => item.type)).toEqual(MIRRORED)
   })
 })
