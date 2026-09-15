@@ -203,6 +203,20 @@ CLI 侧工具超时 T_client。`pump.ts` 的 `MCP_CALL_TIMEOUT_MS` 若要收紧�
 判据是**会话最新一次请求的路由 provider**（不是持久化的会话映射）——把 codebuddy 会话切回别的
 provider 后，dsh 会恢复正常压缩。
 
+### 已知限制：镜像时机与容量刷新
+
+- **压缩卡必然出现在一轮对话的尾部**。ACP 协议不报压缩事件（`session/update` 只有
+  `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `usage_update` 等类型，
+  没有 `compact` 或 `summary`）。CLI 的压缩发生在 ACP run **内部**（收到 prompt → 检查压力 →
+  压缩 → 落盘 → 处理 → 流式返回），对 dsh 完全不可见。镜像层只能 tail CLI 的会话文件
+  （`~/.codebuddy/projects/<slug>/<acpId>.jsonl` 里的 `{"type":"summary","providerData":{"source":"periodic"}}`
+  记录），而该记录的落盘是惰性的。所以卡片最早只能在 `turn-stopping`（turn 收尾）弹出——
+  这是 dsh 能读到新摘要的最早时机。除非 CLI 在 ACP 协议里增加压缩通知，否则无法更早。
+- **上下文容量环（ContextMeter）不会在压缩时立即下降**。容量环显示的是
+  `contextPressure` 投影的 `projectedTokens`，而 `pressureTokens` 只在 CLI 上报 `usage` chunk
+  时更新。压缩镜像是纯逻辑写（零模型调用、零 usage 事件），不产生 `usage` → 容量环停在
+  最后一次请求的值，直到**下一轮请求**上报 usage 才降到新值。这是设计后果，不是 bug。
+
 > 压缩卡**不会隐藏或删除任何历史消息**：被遮蔽的消息照常渲染，dsh 的历史接口不做过滤。
 > 压缩改的是 dsh 的 **surface**（上下文压力表，以及插件需要重建 CLI 上下文时的素材
 > `buildPrompt` / 原生 seed）。
