@@ -157,6 +157,16 @@ export declare const CLI_TOOL_CALL_TIMEOUT_S = 30;
  */
 export declare const MCP_CALL_TIMEOUT_MS = 300000;
 /**
+ * 交互式工具(等真人作答)的转发兜底窗口。
+ *
+ * 300s 对 `ask_user_question` / `exit_plan_mode` 这类工具天然不够:loop 完全健康
+ * (工具正在执行、就等用户点提交),超时杀掉的不是"卡死的注入"而是"还没作答的人"。
+ * 实测(2026-09-16):用户在 300s 后提交 → 分发已拒绝、结果无处投递 → CLI 永远收不到
+ * 答案、只能重问同一题;用户每次提交都落进这个循环。这里放宽到 30 分钟(仍留上限
+ * 防 waiter 泄漏);更慢的作答由 dispatchMcpCall 的迟到结果通道兜底补投。
+ */
+export declare const INTERACTIVE_MCP_CALL_TIMEOUT_MS: number;
+/**
  * dsh 发起的调用的固定尾注(附在每条 prompt 末端)。
  *
  * CodeBuddy CLI 自带子代理体系(Task/Agent 团队)与自带后台任务(bash
@@ -289,6 +299,14 @@ export declare class TurnPump {
      */
     private readonly mcpWaiters;
     /**
+     * 转发超时后仍可能迟到的调用:callId → { 工具名, 迟到投递口 }。
+     *
+     * 超时不该让结果永久丢失:分发拒绝后 CLI 收到的是超时错误,工具(尤其
+     * ask_user_question 这类等真人作答的)稍后完成时,tool/result 到达这里经
+     * 投递口补投回会话,CLI 的模型才有机会看到真实结果。
+     */
+    private readonly lateMcpCalls;
+    /**
      * 增量扫描水位:timeline(events 只 append)已处理到的下标;-1 = 未初始化。
      * 早前每轮从锚点全量重扫,长回合里 markForwarded(256 条上限)把最早的
      * 已投 id 挤出后会重复投递旧消息;增量扫描同时解决性能与重投。
@@ -390,7 +408,7 @@ export declare class TurnPump {
      * @param input - 工具参数。
      * @returns 工具结果(文本 + isError)。
      */
-    dispatchMcpCall(name: string, input: Record<string, unknown>): Promise<{
+    dispatchMcpCall(name: string, input: Record<string, unknown>, lateSink?: (toolName: string, text: string) => void): Promise<{
         output: string;
         isError: boolean;
     }>;

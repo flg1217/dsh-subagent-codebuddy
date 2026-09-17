@@ -84,6 +84,16 @@ export interface AcpTimeouts {
   idleFactor?: number
   idleWarmupLines?: number
   /**
+   * MCP→loop 转发兜底超时(毫秒,默认 300s;<=0 用默认)。
+   * 非交互工具用;交互式工具见 {@link AcpTimeouts.interactiveMcpCallTimeoutMs}。
+   */
+  mcpCallTimeoutMs?: number
+  /**
+   * 交互式工具(等真人作答,如 ask_user_question)的转发兜底超时(毫秒,
+   * 默认 30 分钟;<=0 用默认)。宽松的原因见 pump.ts 常量处的说明。
+   */
+  interactiveMcpCallTimeoutMs?: number
+  /**
    * 在途工具期间的空闲硬顶(毫秒,默认 30 分钟;<=0 关闭)。
    * 正常长工具无心跳,空闲计时在工具在途时整体暂停;但工具**永不返回**
    * (CLI 卡死)+ 消费方被回收时,没有这层硬顶就会永久泄漏进程、

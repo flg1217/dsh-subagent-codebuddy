@@ -1086,6 +1086,53 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
     settleFn?.()
   }, 15_000)
 
+  it('dispatchMcpCall 超时后结果迟到:经投递口补投(交互式工具答案不丢)', async () => {
+    // 现场(2026-09-16):ask_user_question 等真人作答超过转发兜底窗口 → 分发拒绝、
+    // CLI 收到超时错误并重问同一题;用户后来提交的答案没有通道可投,永久丢失
+    // (用户侧表现:点提交,codebuddy 收不到回答)。修复:交互式工具用宽松窗口
+    // (此处以 40ms 注入验证),且超时后记录 callId → 迟到投递口;tool/result
+    // 稍后到达时经投递口把真实结果送回(端点负责补投进会话)。
+    const h = makeAdapter({}, {
+      ...FAST, maxAttempts: 1, tailQuietMs: 5_000, boundaryQuietMs: 5_000, interactiveMcpCallTimeoutMs: 40,
+    })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+    })
+    const firstP = step(h.adapter, makeOptions('s1'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const pump = TurnPump.forSession('s1')!
+    const late: Array<{ tool: string; text: string }> = []
+    const pending = pump.dispatchMcpCall('ask_user_question', { questions: [] }, (tool, text) => {
+      late.push({ tool, text })
+    })
+    // 超时:拒绝(McpDispatchTimeoutError),尚未补投。
+    await expect(pending).rejects.toThrow(/ask_user_question/)
+    expect(late).toEqual([])
+    const first = await firstP
+    const block = first.find(c => c.includes('"name":"ask_user_question"') && c.includes('mcp_'))
+    expect(block).toBeDefined()
+    const callId = (JSON.parse(block!) as { block: { id: string } }).block.id
+    // 用户此刻才提交答案 → tool/result 迟到 → 投递口收到(工具名+答案文本)。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          source: { kind: 'tool', callId },
+          content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: '{"answers":[{"id":"q1","selected":["红色"]}]}' }] }],
+        },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(late).toEqual([
+      { tool: 'ask_user_question', text: '{"answers":[{"id":"q1","selected":["红色"]}]}' },
+    ])
+    settleFn?.()
+  }, 15_000)
+
   it('dispatchMcpCall 竞态:调用先到(镜像事件未到)→ 真工具块并入当前开放段,同一 step 立即可见', async () => {
     // 回归(2026-09-13 现场):CLI 的 tools/call 与 ACP tool_call 事件先后不定。
     // 旧实现"先收尾无调用的段、另起独立注入段"在此形态下把段收成零调用 →

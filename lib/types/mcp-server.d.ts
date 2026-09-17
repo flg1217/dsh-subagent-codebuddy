@@ -54,7 +54,13 @@ export declare class McpDispatchTimeoutError extends Error {
     constructor(message: string);
 }
 /** MCP → loop 转发器(由回合泵在生命周期内注册)。 */
-export type McpLoopDispatcher = (sessionId: string, name: string, input: Record<string, unknown>) => Promise<{
+export type McpLoopDispatcher = (sessionId: string, name: string, input: Record<string, unknown>, 
+/**
+ * 转发超时后结果迟到时的投递口(泵在 tool/result 到达时调用)。
+ * 交互式工具(ask_user_question 等)用户作答慢于转发超时窗口时,CLI 收到的
+ * 是超时错误而不是答案;没有这个口子,答案就永久丢失(CLI 只能重问)。
+ */
+lateSink?: (toolName: string, text: string) => void) => Promise<{
     output: string;
     isError: boolean;
 }>;

@@ -388,4 +388,30 @@ describe('客户端断连后才完成的调用:结果必须补投进会话', () 
     expect(status).toBe(200)
     expect(harness.deliveries).toEqual([])
   })
+
+  it('转发超时后工具才完成:迟到投递口把真实结果补投进会话', async () => {
+    // 现场(2026-09-16):ask_user_question 等真人作答超过兜底窗口,CLI 收到超时
+    // 错误并重问同一题;用户后来提交的答案没有通道可投,永久丢失。修复:端点把
+    // 迟到投递口交给泵,泵在 tool/result 迟到时调用它 → 结果补投进会话。
+    harness = await makeHarness()
+    let sink: ((toolName: string, text: string) => void) | undefined
+    const dispose = registerMcpLoopDispatcher('sess-ok', async (_sessionId, _name, _input, lateSink) => {
+      sink = lateSink
+      throw new McpDispatchTimeoutError('MCP 调用 ask_user_question 注入后 1800s 内未被 loop 消费')
+    })
+    const timedOut = await rpc(harness, call)
+    const result = timedOut.json?.['result'] as { isError?: boolean }
+    expect(result.isError).toBe(true)
+    expect(typeof sink).toBe('function')
+
+    // 用户此刻才点提交 → 泵观察到 tool/result 迟到 → 经投递口补投。
+    sink?.('ask_user_question', '{"answers":[{"id":"q1","selected":["红色"]}]}')
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    expect(harness.deliveries.map(entry => entry.kind)).toEqual(['followup'])
+    const text = JSON.stringify(harness.deliveries[0]?.message ?? {})
+    expect(text).toContain('红色')
+    expect(text).toContain('超时')
+    dispose()
+  })
 })
