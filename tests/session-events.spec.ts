@@ -56,6 +56,8 @@ function makeAdapter(): Harness {
       registeredTools.set(String(definition['name']), definition)
       return () => {}
     },
+    // 注册表查询:ensureReplayTool 以此判重(不再用进程内 Set 记账)。
+    schemas: () => [...registeredTools.keys()].map(name => ({ name })),
   }
   const ctx = {
     get: (key: string) => {

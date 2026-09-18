@@ -24,7 +24,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-tools'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { DelegateToolResult, DelegateToolSpec } from './delegate.js'
+import type { DelegateToolSpec } from './delegate.js'
 
 /** 桥工具 id 前缀。 */
 export const BRIDGE_TOOL_PREFIX = 'dsh_'
@@ -55,17 +55,6 @@ const BRIDGE_EXCLUDED = new Set(['run_code'])
 
 /** MCP 工具名前缀(dsh 与 CLI 同名约定)。 */
 const MCP_TOOL_PREFIX = 'mcp__'
-
-/**
- * 被 CLI 镜像工具占用的 dsh 工具名:不桥接、不受理。
- *
- * `read_image`:CLI 原生 Read 读图时,泵把这次调用以镜像工具 `read_image` 记进
- * dsh 会话——**名字必须与真工具一致**:dsh Web UI 的图片卡片按
- * `call.name === 'read_image'` 才出预览(image-card-model 硬编码),改名就退化成
- * 普通文本行(实测)。真工具因此被镜像遮蔽,桥便不再暴露 `dsh_read_image`
- * (调了也会打到镜像上):CLI 自带 Read 读图已覆盖该能力,且结果同样进 dsh。
- */
-const BRIDGE_MIRROR_OWNED = new Set(['read_image'])
 
 /**
  * 平台专用工具:本机跑不动就不进桥(与 preset 的 `disabled:` 门同一套规则)。
@@ -128,9 +117,12 @@ export function bridgeTargetTool(toolId: string): string | undefined {
  * 该 dsh 工具名是否可以暴露给 CLI(桥与 MCP 两条通道共用同一资格判定)。
  *
  * 排除:ptc 保留名(run_code)、MCP 工具(走 CLI 原生 MCP 通道)、CLI 镜像
- * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)、
- * 本机跑不动的平台专用工具({@link platformExcluded}:win32 无 bash、非 win32
- * 无 pwsh)。
+ * 代理(cli_*,只在会话 scope 里承接原生调用)、本机跑不动的平台专用工具
+ * ({@link platformExcluded}:win32 无 bash、非 win32 无 pwsh)。
+ *
+ * `read_image` **不再排除**(曾经被裸名镜像占名):CLI 内置工具已全部禁用,
+ * 读图改走 dsh 真工具,结果经 MCP 响应以 image 内容块回传
+ * ({@link blocksToMcpContent})。
  */
 export function isBridgeEligible(name: string): boolean {
   if (name.length === 0) return false
@@ -138,7 +130,6 @@ export function isBridgeEligible(name: string): boolean {
   if (platformExcluded(name)) return false
   if (name.startsWith(MCP_TOOL_PREFIX)) return false
   if (name.startsWith(CLI_MIRROR_TOOL_PREFIX)) return false
-  if (BRIDGE_MIRROR_OWNED.has(name)) return false
   return true
 }
 
@@ -269,8 +260,88 @@ export function listDshMcpTools(ctx: Context, parent: Agent): McpToolSpec[] {
 }
 
 /**
+ * 桥工具执行结果。
+ *
+ * `output` = 协议回灌文本(delegate 通道只认它);`content` = 工具原始内容块,
+ * 供 MCP 通道承载图片({@link blocksToMcpContent});delegate 协议没有图片通道,
+ * 该字段在那里被忽略。
+ */
+export interface DshToolRunResult {
+  output: string
+  isError: boolean
+  content?: readonly unknown[]
+}
+
+/** dsh `ctx.attachments` 的读图面(与原生 read_image 同法的单图取字节)。 */
+export interface AttachmentsReadFace {
+  readImage(ref: unknown): Promise<{ data: Uint8Array; ref: { mediaType: string } }>
+}
+
+/** MCP `content` 数组的元素(本实现只产出 text 与 image 两种)。 */
+export type McpContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
+
+/**
+ * 工具结果内容块 → MCP content parts(图片经 attachments 读字节转 base64)。
+ *
+ * 只在**确有图片且字节可读**时返回完整 parts(文本 + image);其余情况返回
+ * undefined,调用方沿用纯文本单块响应。为什么必须走 MCP 的 image 内容类型:
+ * CLI 的 `executeMcpTool → convertMcpResult` 遇到 `{type:'image',data}` 会把
+ * 整个内容数组序列化成带 `image_url` 的 JSON 交给它自己的模型(与 CLI 原生
+ * Read 读图的落点完全相同);纯文本路径下图片只能退化成占位符。
+ * @param attachments - dsh attachments 服务面(缺失即放弃转换)。
+ * @param content - 工具结果内容块(tool/result 事件的 content)。
+ * @returns MCP content parts,或 undefined(无图片/有图但读不出——整体回退)。
+ */
+export async function blocksToMcpContent(
+  attachments: AttachmentsReadFace | undefined,
+  content: readonly unknown[],
+): Promise<McpContentPart[] | undefined> {
+  if (attachments === undefined) return undefined
+  const parts: McpContentPart[] = []
+  let images = 0
+  let failed = false
+  const walk = async (blocks: readonly unknown[]): Promise<void> => {
+    for (const block of blocks) {
+      if (failed) return
+      if (block === null || typeof block !== 'object') continue
+      const typed = block as { type?: unknown; text?: unknown; content?: unknown; attachment?: unknown }
+      if (typed.type === 'text' && typeof typed.text === 'string') {
+        parts.push({ type: 'text', text: typed.text })
+        continue
+      }
+      if (typed.type === 'tool-result' && Array.isArray(typed.content)) {
+        await walk(typed.content as readonly unknown[])
+        continue
+      }
+      if (typed.type === 'image') {
+        try {
+          const stored = await attachments.readImage(typed.attachment)
+          parts.push({
+            type: 'image',
+            data: Buffer.from(stored.data).toString('base64'),
+            mimeType: stored.ref.mediaType,
+          })
+          images += 1
+        } catch {
+          // 有图读不出:整体回退(不半转换,避免模型看到"缺了图"的结果)。
+          failed = true
+        }
+        continue
+      }
+      try {
+        parts.push({ type: 'text', text: JSON.stringify(block) })
+      } catch { /* 不可序列化块跳过 */ }
+    }
+  }
+  await walk(content)
+  return !failed && images > 0 ? parts : undefined
+}
+
+/**
  * 工具结果内容块 → 文本(嵌套 tool-result 递归,图片块降级为提示)。
- * 桥执行与真工具直发路径共用同一文本口径。
+ * 桥执行与真工具直发路径共用同一文本口径(delegate 通道的图片回退文案在此)。
  */
 export function blocksToText(content: readonly unknown[]): string {
   const parts: string[] = []
@@ -314,19 +385,20 @@ export interface DelegatedDshToolOptions {
  * 执行一次桥接的 dsh 工具调用。
  * @param ctx - 插件上下文(agents / tools 服务)。
  * @param options - 调用参数。
- * @returns CLI 侧 DelegateTool 的响应对象(永不抛错——错误按协议回 status:'error')。
+ * @returns 执行结果(永不抛错——错误按 isError 回;`content` 供 MCP 通道回传
+ *   图片,delegate 通道只读 `output`)。
  */
 export async function runDshBridgeTool(
   ctx: Context,
   options: DelegatedDshToolOptions,
-): Promise<DelegateToolResult> {
+): Promise<DshToolRunResult> {
   const parent = ctx.get('agents')?.get(options.parentSessionId as SessionId)
   if (parent === undefined) {
-    return { status: 'error', error: { message: `dsh tool "${options.toolName}": parent agent "${options.parentSessionId}" is not live` } }
+    return { output: `dsh tool "${options.toolName}": parent agent "${options.parentSessionId}" is not live`, isError: true }
   }
   const tools = ctx.get('tools')
   if (tools === undefined) {
-    return { status: 'error', error: { message: `dsh tool "${options.toolName}": the tools service is unavailable` } }
+    return { output: `dsh tool "${options.toolName}": the tools service is unavailable`, isError: true }
   }
   try {
     const result = await tools.execute({
@@ -336,12 +408,13 @@ export async function runDshBridgeTool(
       agent: parent,
       signal: options.signal ?? new AbortController().signal,
     })
-    const text = blocksToText(result.content as readonly unknown[])
+    const content = result.content as readonly unknown[]
+    const text = blocksToText(content)
     return result.isError
-      ? { status: 'error', error: { message: text } }
-      : { status: 'success', output: text }
+      ? { output: text, isError: true }
+      : { output: text, isError: false, content }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
-    return { status: 'error', error: { message: `dsh tool "${options.toolName}" failed: ${message}` } }
+    return { output: `dsh tool "${options.toolName}" failed: ${message}`, isError: true }
   }
 }

@@ -18,18 +18,18 @@ export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推�
 /**
  * 工具路由说明(附在 system instructions 末尾)。
  *
- * 与 spawn 的 --tools 白名单(acp.ts CLI_ALLOWED_TOOLS)配套:告诉模型
- * 哪些原生工具不可用、对等的 dsh_* 名字、Read 为何保留。放在 system 位置
+ * 与 spawn 的 --tools 策略(acp.ts cliToolPolicyArgs:内置工具全禁)配套:
+ * 告诉模型原生工具一律不可用、对等能力走哪套 dsh 名字。放在 system 位置
  * (权威)而不是只靠每条 prompt 尾注——CLI 内置提示词在 user 位置的指令
  * 面前占优,实测尾注拦不住模型直调原生 Bash/Edit。
  */
 function toolRoutingNote(bridgeMode: 'mcp' | 'delegate'): string {
   const target = bridgeMode === 'mcp'
-    ? '对等能力一律用 MCP 工具(mcp__dsh__bash、mcp__dsh__pwsh、mcp__dsh__edit、mcp__dsh__write、mcp__dsh__glob、mcp__dsh__grep)'
-    : '对等能力一律用 dsh 前缀版本(dsh_bash、dsh_pwsh、dsh_edit、dsh_write、dsh_glob、dsh_grep)'
+    ? '对等能力一律用 MCP 工具(mcp__dsh__bash、mcp__dsh__pwsh、mcp__dsh__read、mcp__dsh__read_image、mcp__dsh__edit、mcp__dsh__write、mcp__dsh__glob、mcp__dsh__grep)'
+    : '对等能力一律用 dsh 前缀版本(dsh_bash、dsh_pwsh、dsh_read、dsh_read_image、dsh_edit、dsh_write、dsh_glob、dsh_grep)'
   return [
     '[工具路由(本环境强制)]',
-    `CLI 原生的 Bash/PowerShell/Edit/Write/NotebookEdit/Glob/Grep 不可用(工具白名单已移除):${target}——它们在 dsh 侧执行,受审批/沙箱约束,进会话日志与后台任务面板;被移除工具的调用会失败,不要换别的方式绕过。Read 保留:读图片必须用 Read(结果以图片卡片呈现给用户)。`,
+    `CLI 原生工具(含 Bash/PowerShell/Read/Edit/Write/NotebookEdit/Glob/Grep)已**全部禁用**:${target}——它们在 dsh 侧执行,受审批/沙箱约束,进会话日志与后台任务面板;调用不存在的原生工具会失败,不要换别的方式绕过。读图片用 read_image:结果以图片卡片呈现给用户,并作为图片进入你的上下文。`,
   ].join('\n')
 }
 

@@ -37,6 +37,7 @@
  * @module subagent-codebuddy/mcp-server
  */
 import type { Context } from '@deepseek-ai/cordis';
+import type { DshToolRunResult } from './dsh-tools-bridge.js';
 /** 端点路径(exact 路由,挂 dsh webserver)。 */
 export declare const DSH_MCP_ENDPOINT_PATH = "/api/dsh-mcp";
 /** MCP server 名(CLI 侧工具呈现为 `mcp__dsh__<工具名>`)。 */
@@ -60,10 +61,7 @@ export type McpLoopDispatcher = (sessionId: string, name: string, input: Record<
  * 交互式工具(ask_user_question 等)用户作答慢于转发超时窗口时,CLI 收到的
  * 是超时错误而不是答案;没有这个口子,答案就永久丢失(CLI 只能重问)。
  */
-lateSink?: (toolName: string, text: string) => void) => Promise<{
-    output: string;
-    isError: boolean;
-}>;
+lateSink?: (toolName: string, text: string) => void) => Promise<DshToolRunResult>;
 /**
  * 注册/注销会话的 MCP→loop 转发器(回合泵构造/释放时调用;幂等注销)。
  * @param sessionId - dsh 会话 id。

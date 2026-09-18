@@ -15,26 +15,29 @@
 | **子代理 provider** | 通用 dsh `subagent` 工具可传 `provider: codebuddy` 委派（配合 `subagent-model-selection` 设置）；进程内 child agent、可并行、`send_message` 续聊 |
 | **模型目录** | adapter 实现 `listModels()`（带缓存、永不抛错），主选择器与 `list_subagent_models` 共用 |
 | **推理强度** | CLI `--effort` 档位（low / medium / high / xhigh / max / ultracode）暴露到 dsh 模型选择器；子代理可用 `reasoning_effort` 参数指定 |
-| **图片输入** | 图片块读字节后以 **ACP 原生 image 内容块**（base64）随 prompt 发送（`promptCapabilities.image`，不落盘、不受 CodeBuddy Read 工具 256KB 上限约束）；历史种子与子代理转录里的图片经 CodeBuddy blob（内容寻址）双向原生转换，两侧均可预览 |
+| **图片输入/读取** | 输入：图片块读字节后以 **ACP 原生 image 内容块**（base64）随 prompt 发送（`promptCapabilities.image`，不落盘）；读取：模型用 dsh 的 `read_image`，图片以 **MCP image 内容块**回到 CLI 侧模型、同时进 dsh 会话出图片卡片；历史种子与子代理转录里的图片经 CodeBuddy blob（内容寻址）双向原生转换，两侧均可预览 |
 | **子代理可视化** | codebuddy 轮里的 `Agent` 委派镜像为 **dsh 子会话**（`parentSession` 血缘 + `subagent/descriptor`），侧边栏可点开完整转录（消息/工具/思考/任务），运行中近实时跟随 |
-| **任务/todo 桥接** | `TaskCreate` / `TaskUpdate` / `todo_write` 折算为 dsh `todo/write` 整表快照事件，主轮与子代理会话都复用 dsh 的 TodoPanel 渲染 |
+| **任务/todo** | 走 dsh 原生 `todo_write`（工具桥一等公民，主轮与子代理会话都复用 dsh 的 TodoPanel 渲染）；CLI 侧 `TaskCreate`/`TaskUpdate` 已随内置工具禁用，`todo-bridge` 保留作旧会话重放兼容 |
 | **工具桥（MCP / delegate）** | 把本会话可见的 dsh 工具暴露给 CodeBuddy，使它的文件/命令类能力走 dsh 管线（审批/沙箱/审计/后台面板）。默认 `mcp`：dsh 起 HTTP MCP server，工具以 `mcp__dsh__<名>` 一等公民呈现（完整 JSON Schema 强约束）；`delegate` 为旧通道（`dsh_<名>` 合成 DelegateTool），保留作回退 |
 | **opt-in 工具** | `subagent_codebuddy` + `list_codebuddy_models`（`registerSubagentTools: true` 开启；默认关闭，推荐通用工具） |
 | **压缩归属** | codebuddy 会话的压缩由 **CLI 负责**（dsh 的自动压缩被插件接管，不压镜像）；CLI 压完之后镜像成 dsh 的标准压缩卡，**零 token**（见 §三「压缩归属」） |
 
-**语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**文件/命令类原生工具已被
-白名单移除**（spawn 传 `--tools`，见 §三「工具桥」）。因此：
+**语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**内置工具已全部禁用**
+（spawn 传 `--tools ""`；delegate 模式只放行委托工具合成器 `DelegateTool`，见 §三「工具桥」）。
+因此：
 
-- 需要读写文件、执行命令时，模型**必须**改用 dsh 侧工具（MCP 模式下是 `mcp__dsh__bash`
-  / `mcp__dsh__edit` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）。这些调用**在 dsh 侧
-  执行，受 dsh 的沙箱与审批约束**，并进会话日志、审计与后台任务面板。
-- 仍留在 CLI 侧原生执行的只有白名单里的机制类/只读工具：`Read`（读图片必须走它，
-  结果镜像为图片卡片）、`WebSearch`、`WebFetch`、`Task*`、`Skill`、`ToolSearch`、
-  `DeferExecuteTool`、`DelegateTool`。
+- 模型的全部工具面 = dsh 侧工具（MCP 模式下是 `mcp__dsh__bash` / `mcp__dsh__edit`
+  / `mcp__dsh__read_image` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）。这些调用
+  **在 dsh 侧执行，受 dsh 的沙箱与审批约束**，并进会话日志、审计与后台任务面板。
+- 读图片走 dsh 的 `read_image`：图片既作为图片进入 CLI 侧模型的上下文（MCP image 内容块），
+  也进 dsh 会话出图片卡片（`read_image` 是 dsh 原生工具名，UI 按名字渲染图片卡）。
 - 文本/思考/工具卡片仍以会话事件实时回传 dsh 界面。
 
-> 历史注记：早期版本确实让 CLI 用自己的工具链、dsh 沙箱不参与；引入工具白名单 +
-> 工具桥后已改变——**安全模型以本节为准**。
+> 为什么全禁而不是白名单（2026-09-18）：CLI 原生工具要进 dsh 会话，必须在会话 scope 注册
+> 「回放镜像」承接；镜像注册一旦丢失，该会话的原生调用就永久报 `unknown tool "cli_read"`
+> （偶发、不可复现）。全禁后这条路径不再被触发。
+> 逃生口：`extraArgs` 排在 `--tools` 之后，可用 `extraArgs: ['--tools', 'Read']` 覆盖本策略。
+> 历史注记：更早的版本让 CLI 用自己的工具链、dsh 沙箱不参与——**安全模型以本节为准**。
 
 ## 二、快速开始
 
@@ -113,7 +116,7 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 
 ```
 主代理轮:  会话模型选择器 → codebuddy/<id> → CodebuddyLlmAdapter
-              └─ spawn codebuddy --acp --tools <白名单> [--mcp-config <会话专属配置>]
+              └─ spawn codebuddy --acp --tools "" [--mcp-config <会话专属配置>]
                    → initialize → session/new|load → session/prompt
                    └─ session/update(思考/文本/工具)→ 写入调用方已打开的 step
               └─ 工具调用回流:CLI 调 mcp__dsh__<名> ──HTTP JSON-RPC──▶ dsh MCP 端点
@@ -124,7 +127,7 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 
 ### 工具桥（MCP / delegate）
 
-CLI 原生工具经 `--tools` 白名单裁剪后（见 §一「语义说明」），文件/命令类能力必须由 dsh 提供。
+CLI 内置工具已全部禁用（`--tools ""`，见 §一「语义说明」），模型的一切能力必须由 dsh 提供。
 插件把**当前会话可见的 dsh 工具**暴露给 CLI，两条通道：
 
 | | `mcp`（默认） | `delegate`（回退） |

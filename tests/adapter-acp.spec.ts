@@ -360,20 +360,13 @@ describe('adapter(ACP):取消与错误', () => {
     })
   })
 
-  it('spawn 工具策略:--tools 白名单(实测 ACP 下 --disallowedTools 无效)', () => {
-    // 白名单必须:保留 Read(读图链路)与 DelegateTool(委托工具合成器,
-    // 漏掉它全部 dsh_* 桥工具不可见);排除 Bash/Edit/Write/Glob/Grep/
-    // PowerShell/NotebookEdit/EnterPlanMode 等(走 dsh_* 或不被支持)。
-    const args = cliToolPolicyArgs()
-    expect(args[0]).toBe('--tools')
-    const allowed = args[1]!.split(',')
-    expect(allowed).toContain('Read')
-    expect(allowed).toContain('DelegateTool')
-    expect(allowed).toContain('WebSearch')
-    expect(allowed).toContain('TaskUpdate')
-    for (const banned of ['Bash', 'Edit', 'Write', 'Glob', 'Grep', 'PowerShell', 'NotebookEdit', 'EnterPlanMode', 'ExitPlanMode']) {
-      expect(allowed).not.toContain(banned)
-    }
+  it('spawn 工具策略:内置工具全禁(实测 ACP 下 --disallowedTools 无效)', () => {
+    // mcp 模式:空列表 = 禁用全部内置工具,工具面只剩 MCP 通道的 dsh 工具。
+    expect(cliToolPolicyArgs()).toEqual(['--tools', ''])
+    expect(cliToolPolicyArgs('mcp')).toEqual(['--tools', ''])
+    // delegate 模式:必须放行委托工具合成器(白名单会连它一起过滤,
+    // 漏掉它 = 全部 dsh_* 委托工具不可见)。
+    expect(cliToolPolicyArgs('delegate')).toEqual(['--tools', 'DelegateTool'])
   })
 })
 

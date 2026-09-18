@@ -19,7 +19,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { DelegateToolResult, DelegateToolSpec } from './delegate.js';
+import type { DelegateToolSpec } from './delegate.js';
 /** 桥工具 id 前缀。 */
 export declare const BRIDGE_TOOL_PREFIX = "dsh_";
 /**
@@ -41,9 +41,12 @@ export declare function bridgeTargetTool(toolId: string): string | undefined;
  * 该 dsh 工具名是否可以暴露给 CLI(桥与 MCP 两条通道共用同一资格判定)。
  *
  * 排除:ptc 保留名(run_code)、MCP 工具(走 CLI 原生 MCP 通道)、CLI 镜像
- * 代理(cli_*,只在会话 scope 里承接原生调用)、被镜像占名的工具(read_image)、
- * 本机跑不动的平台专用工具({@link platformExcluded}:win32 无 bash、非 win32
- * 无 pwsh)。
+ * 代理(cli_*,只在会话 scope 里承接原生调用)、本机跑不动的平台专用工具
+ * ({@link platformExcluded}:win32 无 bash、非 win32 无 pwsh)。
+ *
+ * `read_image` **不再排除**(曾经被裸名镜像占名):CLI 内置工具已全部禁用,
+ * 读图改走 dsh 真工具,结果经 MCP 响应以 image 内容块回传
+ * ({@link blocksToMcpContent})。
  */
 export declare function isBridgeEligible(name: string): boolean;
 /**
@@ -78,8 +81,51 @@ export interface McpToolSpec {
  */
 export declare function listDshMcpTools(ctx: Context, parent: Agent): McpToolSpec[];
 /**
+ * 桥工具执行结果。
+ *
+ * `output` = 协议回灌文本(delegate 通道只认它);`content` = 工具原始内容块,
+ * 供 MCP 通道承载图片({@link blocksToMcpContent});delegate 协议没有图片通道,
+ * 该字段在那里被忽略。
+ */
+export interface DshToolRunResult {
+    output: string;
+    isError: boolean;
+    content?: readonly unknown[];
+}
+/** dsh `ctx.attachments` 的读图面(与原生 read_image 同法的单图取字节)。 */
+export interface AttachmentsReadFace {
+    readImage(ref: unknown): Promise<{
+        data: Uint8Array;
+        ref: {
+            mediaType: string;
+        };
+    }>;
+}
+/** MCP `content` 数组的元素(本实现只产出 text 与 image 两种)。 */
+export type McpContentPart = {
+    type: 'text';
+    text: string;
+} | {
+    type: 'image';
+    data: string;
+    mimeType: string;
+};
+/**
+ * 工具结果内容块 → MCP content parts(图片经 attachments 读字节转 base64)。
+ *
+ * 只在**确有图片且字节可读**时返回完整 parts(文本 + image);其余情况返回
+ * undefined,调用方沿用纯文本单块响应。为什么必须走 MCP 的 image 内容类型:
+ * CLI 的 `executeMcpTool → convertMcpResult` 遇到 `{type:'image',data}` 会把
+ * 整个内容数组序列化成带 `image_url` 的 JSON 交给它自己的模型(与 CLI 原生
+ * Read 读图的落点完全相同);纯文本路径下图片只能退化成占位符。
+ * @param attachments - dsh attachments 服务面(缺失即放弃转换)。
+ * @param content - 工具结果内容块(tool/result 事件的 content)。
+ * @returns MCP content parts,或 undefined(无图片/有图但读不出——整体回退)。
+ */
+export declare function blocksToMcpContent(attachments: AttachmentsReadFace | undefined, content: readonly unknown[]): Promise<McpContentPart[] | undefined>;
+/**
  * 工具结果内容块 → 文本(嵌套 tool-result 递归,图片块降级为提示)。
- * 桥执行与真工具直发路径共用同一文本口径。
+ * 桥执行与真工具直发路径共用同一文本口径(delegate 通道的图片回退文案在此)。
  */
 export declare function blocksToText(content: readonly unknown[]): string;
 /** 执行一次桥工具调用:走 dsh 的完整工具管线,结果转文本回 CLI。 */
@@ -97,6 +143,7 @@ export interface DelegatedDshToolOptions {
  * 执行一次桥接的 dsh 工具调用。
  * @param ctx - 插件上下文(agents / tools 服务)。
  * @param options - 调用参数。
- * @returns CLI 侧 DelegateTool 的响应对象(永不抛错——错误按协议回 status:'error')。
+ * @returns 执行结果(永不抛错——错误按 isError 回;`content` 供 MCP 通道回传
+ *   图片,delegate 通道只读 `output`)。
  */
-export declare function runDshBridgeTool(ctx: Context, options: DelegatedDshToolOptions): Promise<DelegateToolResult>;
+export declare function runDshBridgeTool(ctx: Context, options: DelegatedDshToolOptions): Promise<DshToolRunResult>;

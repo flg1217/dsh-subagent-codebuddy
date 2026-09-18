@@ -31,13 +31,20 @@ interface McpTestHarness {
 
 /** 起一个真 HTTP server,把 MCP handler 挂上(绕过 webserver 服务)。 */
 async function makeHarness(
-  options: { toolsExecuteError?: boolean; toolDelayMs?: number; agentStatus?: string } = {},
+  options: {
+    toolsExecuteError?: boolean
+    toolDelayMs?: number
+    agentStatus?: string
+    /** attachments 服务面(图片回传用;缺省 = 无服务,图片降级为纯文本)。 */
+    attachments?: { readImage: (ref: unknown) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> }
+  } = {},
 ): Promise<McpTestHarness> {
   const executeCalls: Array<Record<string, unknown>> = []
   const deliveries: Array<{ kind: 'inject' | 'followup'; message: unknown }> = []
   const toolsFace = {
     schemas: () => [
       { name: 'grep', description: 'Search files.', parameters: { type: 'object', properties: { pattern: { type: 'string' } } } },
+      { name: 'read_image', description: 'Read an image.', parameters: { type: 'object', properties: {} } },
       { name: 'cli_read', description: 'mirror noise', parameters: {} },
       { name: 'mcp__x__y', description: 'mcp noise', parameters: {} },
     ],
@@ -63,6 +70,7 @@ async function makeHarness(
     get: (key: string): unknown => {
       if (key === 'tools') return toolsFace
       if (key === 'agents') return agentsFace
+      if (key === 'attachments') return options.attachments
       return undefined
     },
     // 模拟 cordis 的 inject:同步调用回调,并把回调**返回值**当作 disposer
@@ -167,7 +175,7 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
     harness = await makeHarness()
     const { json } = await rpc(harness, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
     const tools = (json?.['result'] as { tools: Array<Record<string, unknown>> }).tools
-    expect(tools.map(tool => tool['name'])).toEqual(['grep'])
+    expect(tools.map(tool => tool['name'])).toEqual(['grep', 'read_image'])
     expect(tools[0]!['inputSchema']).toEqual({
       type: 'object',
       properties: { pattern: { type: 'string' } },
@@ -188,6 +196,54 @@ describe('dsh MCP server:JSON-RPC over HTTP', () => {
       params: { name: 'cli_read', arguments: {} },
     })
     expect((bad.json?.['result'] as { isError?: boolean }).isError).toBe(true)
+  })
+
+  it('tools/call 结果含图片 → MCP content 带 image 块(base64;CLI 侧转 image_url 给模型)', async () => {
+    harness = await makeHarness({
+      attachments: {
+        readImage: async (ref: unknown) => ({
+          data: Uint8Array.of(1, 2, 3),
+          ref: { mediaType: (ref as { mediaType: string }).mediaType },
+        }),
+      },
+    })
+    const dispose = registerMcpLoopDispatcher('sess-ok', async () => ({
+      output: 'head',
+      isError: false,
+      content: [
+        { type: 'text', text: 'head' },
+        { type: 'image', attachment: { mediaType: 'image/png' } },
+      ],
+    }))
+    const res = await rpc(harness, {
+      jsonrpc: '2.0', id: 30, method: 'tools/call',
+      params: { name: 'read_image', arguments: { file_path: 'a.png' } },
+    })
+    expect(res.json?.['result']).toEqual({
+      content: [
+        { type: 'text', text: 'head' },
+        { type: 'image', data: 'AQID', mimeType: 'image/png' },
+      ],
+    })
+    dispose()
+  })
+
+  it('无 attachments 服务(或图读不出)→ 图片降级为纯文本单块(与历史行为一致)', async () => {
+    harness = await makeHarness()
+    const dispose = registerMcpLoopDispatcher('sess-ok', async () => ({
+      output: 'head',
+      isError: false,
+      content: [
+        { type: 'text', text: 'head' },
+        { type: 'image', attachment: { mediaType: 'image/png' } },
+      ],
+    }))
+    const res = await rpc(harness, {
+      jsonrpc: '2.0', id: 31, method: 'tools/call',
+      params: { name: 'read_image', arguments: { file_path: 'a.png' } },
+    })
+    expect(res.json?.['result']).toEqual({ content: [{ type: 'text', text: 'head' }] })
+    dispose()
   })
 
   it('tools/call 可见性:命名合法但不在本会话工具面内的工具被拒绝(回归)', async () => {

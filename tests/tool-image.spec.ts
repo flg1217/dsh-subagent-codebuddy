@@ -5,7 +5,7 @@
  * - 未知块/入库失败/无服务面 → undefined(整体回退原文)。
  */
 import { describe, expect, it, vi } from 'vitest'
-import { imageReadAlias, parseImageDataUrl, toolResultBlocksFromText } from '../src/tool-image.ts'
+import { parseImageDataUrl, toolResultBlocksFromText } from '../src/tool-image.ts'
 
 /** 一段合法的 1x1 PNG base64(PNG 魔数开头)。 */
 const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
@@ -53,15 +53,6 @@ describe('tool-image:工具输出转换', () => {
     expect(face.calls).toEqual([{ mediaType: 'image/png', bytes: PNG_BYTES }])
   })
 
-  it('带 path 时产出原生同形信封(UI 图片卡片正则匹配)', async () => {
-    const face = makeFace()
-    const text = JSON.stringify([{ type: 'image_url', image_url: { url: `data:image/png;base64,${PNG_B64}` } }])
-    const blocks = await toolResultBlocksFromText(face, text, 'D:/x/a.png')
-    const envelope = String(blocks![0]!['text'])
-    expect(envelope).toMatch(/^<path>[^\n]*<\/path>\n<type>image<\/type>\n<content>\n[\s\S]*\n<\/content>$/u)
-    expect(envelope).toContain('<path>D:/x/a.png</path>')
-  })
-
   it('混排文本 + 图片:顺序保留', async () => {
     const face = makeFace()
     const text = JSON.stringify([
@@ -95,17 +86,3 @@ describe('tool-image:工具输出转换', () => {
   })
 })
 
-describe('tool-image:read 别名', () => {
-  it('图片路径的 Read → read_image + path(对象或 JSON 字符串)', () => {
-    expect(imageReadAlias('Read', '{"file_path":"a.png"}')).toEqual({ name: 'read_image', path: 'a.png' })
-    expect(imageReadAlias('read', { file_path: 'D:/x/design-system.JPEG' })).toEqual({ name: 'read_image', path: 'D:/x/design-system.JPEG' })
-    expect(imageReadAlias('Read', '{"path":"/tmp/shot.webp"}')).toEqual({ name: 'read_image', path: '/tmp/shot.webp' })
-  })
-
-  it('非图片/非 Read/参数畸形 → undefined(保持原名)', () => {
-    expect(imageReadAlias('Read', '{"file_path":"a.ts"}')).toBeUndefined()
-    expect(imageReadAlias('Bash', '{"file_path":"a.png"}')).toBeUndefined()
-    expect(imageReadAlias('Read', 'not json')).toBeUndefined()
-    expect(imageReadAlias('Read', '{}')).toBeUndefined()
-  })
-})
