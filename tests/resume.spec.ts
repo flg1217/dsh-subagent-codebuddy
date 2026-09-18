@@ -319,16 +319,18 @@ describe('跨重启恢复', () => {
     expect(prompt).toContain('问题二')
   })
 
-  it('锚点被压缩移除(历史收缩)时整体重建 surface,不再只发最后一条', async () => {
+  it('锚点被压缩移除(历史收缩):只发最后一条用户输入兜底,不整体重发', async () => {
     const store = new ConversationStore(null)
     const { adapter, prompts } = makeHarness(store)
     await drain(adapter, options([msg('u1', 'user', '很长的问题一'), msg('a1', 'assistant', '答一'), msg('u2', 'user', '问题二')]))
-    // 下一次:历史被压缩收缩(锚点消息已被移除)→ 当前 surface 整体重建。
+    // 下一次:历史被压缩收缩(锚点消息已被移除)——CLI 有自己的持久上下文,
+    // 不能整体重建(重发已知内容会膨胀且会被当作新任务从头重跑),只发
+    // 最后一条用户输入兜底。
     await drain(adapter, options([msg('u3', 'user', '压缩后的新问题')]))
     const prompt = prompts.at(-1)!
-    // 重建走全序列过滤:带 `User: ` 标签,而不是只发最后一条裸文本。
     expect(prompt).toContain('压缩后的新问题')
-    expect(prompt).toContain('User: 压缩后的新问题')
+    expect(prompt).not.toContain('很长的问题一')
+    expect(prompt).not.toContain('问题二')
     expect(prompt.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
   })
 })
