@@ -54,15 +54,24 @@ function makeHarness(
   sessionId = 's1',
   failLoad = false,
   nativeBaseDir?: string,
+  failPrompt = false,
+  closedStep = false,
 ): Harness {
   const prompts: string[] = []
   const session = {
     header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent' },
     append: () => ({ seq: 0 }),
-    ownEvents: () => [
-      { type: 'turn/start', data: { turn: 1 } },
-      { type: 'step/start', data: { turn: 1, step: 1 } },
-    ],
+    ownEvents: () => closedStep
+      ? [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'step/start', data: { turn: 1, step: 1 } },
+          { type: 'step/end', data: { turn: 1, step: 1 } },
+          { type: 'turn/end', data: { turn: 1 } },
+        ]
+      : [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'step/start', data: { turn: 1, step: 1 } },
+        ],
   }
   const ctx = {
     get: (key: string) => (key === 'sessions' ? { get: () => session } : undefined),
@@ -74,6 +83,7 @@ function makeHarness(
     permissionMode: 'bypassPermissions',
     extraArgs: [],
     store,
+    maxAttempts: 1,
     ...(nativeBaseDir !== undefined ? { nativeBaseDir } : {}),
   })
   mockedSpawn.mockImplementation(() => {
@@ -87,6 +97,10 @@ function makeHarness(
         if (failLoad) p.respondError(request.id, { code: -1, message: 'session not found' })
         else p.respond(request.id, {})
       } else if (request.method === 'session/prompt') {
+        if (failPrompt) {
+          p.respondError(request.id, { code: -1, message: 'prompt rejected' })
+          return
+        }
         const prompt = (request.params['prompt'] as Array<{ text: string }>)[0]
         prompts.push(prompt?.text ?? '')
         setTimeout(() => p.respond(request.id, { stopReason: 'end_turn' }), 5)
@@ -312,9 +326,40 @@ describe('跨重启恢复', () => {
     // 下一次:历史被压缩收缩(锚点消息已被移除)→ 当前 surface 整体重建。
     await drain(adapter, options([msg('u3', 'user', '压缩后的新问题')]))
     const prompt = prompts.at(-1)!
-    // 重建走 serializeMessages:带 `User: ` 标签,而不是只发最后一条裸文本。
+    // 重建走全序列过滤:带 `User: ` 标签,而不是只发最后一条裸文本。
     expect(prompt).toContain('压缩后的新问题')
     expect(prompt).toContain('User: 压缩后的新问题')
     expect(prompt.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
+  })
+})
+
+describe('续接锚点的写入时机与字段完整性', () => {
+  it('prompt 请求失败:锚点不写(下轮补发重发该输入,而不是静默丢失)', async () => {
+    const store = new ConversationStore(null)
+    const { adapter, requests } = makeHarness(store, 's1', false, undefined, true)
+    await drain(adapter, options([msg('u1', 'user', '第一问')]))
+    // 会话已建立(new),但 prompt 被拒:此刻绝不能记锚点——记了就把
+    // "从未发出的输入"标记为已发,下轮补发会静默吞掉它。
+    expect(requests()).toContain('session/new')
+    expect(store.get('s1')).toBeUndefined()
+  })
+
+  it('旁路路径(oneShot)写锚点:主锚与 system 哈希不丢(不覆盖回数量锚)', async () => {
+    const store = new ConversationStore(null)
+    // 泵路径先写一条带主锚的记录(模拟上一轮)。
+    store.set('s1', { acpId: 'cb-0', sentCount: 2, lastSentMessageId: 'a1', systemHash: 'hash-a' })
+    const baseDir = mkdtempSync(join(tmpdir(), 'cb-oneshot-'))
+    try {
+      // closedStep:无打开 step → 适配器走一次性旁路会话(oneShot)。
+      const { adapter } = makeHarness(store, 's1', false, baseDir, false, true)
+      await drain(adapter, options([msg('u1', 'user', '问题一'), msg('a1', 'assistant', '答一'), msg('u2', 'user', '问题二')]))
+      const record = store.get('s1')
+      expect(record).toBeDefined()
+      // set 是整体替换:主锚必须随写,否则压缩/编辑后数量锚错位丢上下文。
+      expect(record?.lastSentMessageId).toBe('u2')
+      expect(record?.sentCount).toBe(3)
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true })
+    }
   })
 })

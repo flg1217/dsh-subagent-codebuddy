@@ -69,12 +69,16 @@ export interface SerializedPrompt {
   lastMessageId?: string
 }
 
-/** 一条消息的可读文本(text 块 + tool-result 内嵌文本;图片走内容块)。 */
+/** 一条消息的可读文本(text + tool-call + tool-result 内嵌文本;图片走内容块)。 */
 function messageText(message: Message): string {
   const parts: string[] = []
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'tool-result') {
+    else if (block.type === 'tool-call') {
+      // 其他模型轮次的工具调用必须可见:不落文本的话纯工具调用的 assistant
+      // 消息文本为空、整条被跳过,CLI 只见结果不见调用(实测丢失)。
+      parts.push(`[tool call: ${block.name} ${block.arguments}]`)
+    } else if (block.type === 'tool-result') {
       for (const inner of block.content) {
         if (inner.type === 'text') parts.push(inner.text)
       }
@@ -157,24 +161,44 @@ export async function resumeReplayPrompt(
     const at = messages.findIndex(message => String(message.id) === lastSentMessageId)
     if (at >= 0) return await replayFrom(ctx, messages, at + 1, skipIds, latestId(), ownProvider)
     // 锚点已被压缩移除:CLI 缺的是当前 surface 全部——整体重建(压缩后的
-    // surface 已是精简视图,尺寸可控)。
-    if (messages.length === 0) return { prompt: CONTINUE_PROMPT, images: [] }
-    const rebuilt = await serializeMessages(ctx, messages)
-    const id = latestId()
-    return { ...rebuilt, ...(id === undefined ? {} : { lastMessageId: id }) }
+    // surface 已是精简视图;CodeBuddy 自己的轮次与已投递插话仍要跳过,
+    // 它们已在 CLI 历史里,重发只会膨胀上下文)。
+    return await replayFrom(ctx, messages, 0, skipIds, latestId(), ownProvider)
   }
   if (sentCount === undefined) return await lastUserPrompt(ctx, messages)
-  if (sentCount > messages.length) {
-    // 旧数量锚越界(历史被压缩收缩):整体重建,不再退化成"只发最后一条"。
-    if (messages.length === 0) return { prompt: CONTINUE_PROMPT, images: [] }
-    const rebuilt = await serializeMessages(ctx, messages)
-    const id = latestId()
-    return { ...rebuilt, ...(id === undefined ? {} : { lastMessageId: id }) }
+  // 数量锚在两种历史收缩下不可信,都整体重建:
+  // - 越界(大幅压缩):索引必然错位;
+  // - 前 sentCount 条里出现压缩 checkpoint(遮蔽段落在已发区内的小幅压缩):
+  //   折叠把后续消息拉进"已发"区,未发送的消息会被数量锚静默吞掉。
+  if (sentCount > messages.length || hasCompactionCheckpoint(messages, sentCount)) {
+    return await replayFrom(ctx, messages, 0, skipIds, latestId(), ownProvider)
   }
   return await replayFrom(ctx, messages, sentCount, skipIds, latestId(), ownProvider)
 }
 
-/** 从 start 起补发(跳过 CodeBuddy 自己的 assistant/tool 与已转发),带回覆盖到的最后消息 id。 */
+/**
+ * 前 limit 条里是否有压缩 checkpoint(dsh 原生与镜像压缩的 replace 消息,
+ * source 同形:`{ kind:'plugin', plugin:'compact' }`)。数量锚遇到它即不可信。
+ */
+function hasCompactionCheckpoint(messages: readonly Message[], limit: number): boolean {
+  for (let index = 0; index < Math.min(limit, messages.length); index += 1) {
+    const source = messages[index]!.source as { kind?: unknown; plugin?: unknown } | undefined
+    if (source?.kind === 'plugin' && source.plugin === 'compact') return true
+  }
+  return false
+}
+
+/**
+ * 从 start 起补发:对**整个尾段**逐条过滤,而不是只找第一个新消息。
+ *
+ * 跳过(它们的接收方 CLI 已有):CodeBuddy 自己的 assistant 回答及其跟随的
+ * 工具结果(含 start 之后的——切换其他模型再切回时,期间穿插的 own 轮同样
+ * 已在 CLI 历史里,重发只会膨胀上下文)、已中途转发的插入消息(`skipIds`)。
+ *
+ * 跟踪"当前这一轮是谁跑的"贯穿全序列:其他模型的回答/工具结果必须补发,
+ * 否则切回后模型看不到那段上下文(实测:补发把 assistant 一律当"自己的"
+ * 跳过,期间内容全丢)。
+ */
 async function replayFrom(
   ctx: Context,
   messages: readonly Message[],
@@ -183,45 +207,29 @@ async function replayFrom(
   lastMessageId: string | undefined,
   ownProvider: string,
 ): Promise<SerializedPrompt> {
-  let index = start
   let skippedForwarded = false
-  // 跟踪"当前这一轮是谁跑的":CodeBuddy 自己的回答(及其跟随的工具结果)CLI
-  // 已有;**切换其他模型期间**产生的回答/工具结果必须补发——否则切回后模型
-  // 看不到那段上下文(实测:补发把 assistant 一律当"自己的"跳过,期间内容全丢)。
   let ownTurn = true
-  while (index < messages.length) {
+  const selected: Message[] = []
+  for (let index = start; index < messages.length; index += 1) {
     const message = messages[index]!
-    const forwarded = skipIds !== undefined && skipIds.has(String(message.id))
+    if (skipIds !== undefined && skipIds.has(String(message.id))) {
+      skippedForwarded = true
+      continue
+    }
     if (message.role === 'assistant') {
       const source = message.source as { kind?: unknown; provider?: unknown } | undefined
       ownTurn = source?.kind === 'model' && source.provider === ownProvider
-      if (ownTurn || forwarded) {
-        if (forwarded) skippedForwarded = true
-        index += 1
-        continue
-      }
-      break
-    }
-    if (message.source.kind === 'tool') {
-      if (ownTurn || forwarded) {
-        if (forwarded) skippedForwarded = true
-        index += 1
-        continue
-      }
-      break
-    }
-    if (forwarded) {
-      skippedForwarded = true
-      index += 1
+      if (ownTurn) continue
+    } else if (message.source.kind === 'tool' && ownTurn) {
       continue
     }
-    break
+    selected.push(message)
   }
   // 全部跳过:没有可补发的新内容。若跳过的是**我们已插话投递过的**消息,
   // 说明这一步只是 dsh 在回合边界把那条插话 claim 成了新 step——模型在运行中
   // 已经处理过它。此时绝不能再发"继续完成之前未完成的任务":实测这句会把模型
   // 从插话上拽回旧任务(用户视角:插队没生效)。调用方据 skippedForwarded 空跑收尾。
-  if (index >= messages.length) {
+  if (selected.length === 0) {
     return {
       prompt: CONTINUE_PROMPT,
       images: [],
@@ -229,16 +237,8 @@ async function replayFrom(
       ...(lastMessageId === undefined ? {} : { lastMessageId }),
     }
   }
-  const serialized = await serializeMessages(ctx, messages.slice(index))
+  const serialized = await serializeParts(ctx, [], selected)
   return { ...serialized, ...(lastMessageId === undefined ? {} : { lastMessageId }) }
-}
-
-/** 把一组消息序列化为 prompt(无系统提示);图片走原生内容块。 */
-export async function serializeMessages(
-  ctx: Context,
-  messages: readonly Message[],
-): Promise<SerializedPrompt> {
-  return serializeParts(ctx, [], messages)
 }
 
 /** 把 harness 消息序列化为 CodeBuddy 单轮 prompt;图片走原生内容块。 */

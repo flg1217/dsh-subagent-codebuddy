@@ -243,3 +243,120 @@ describe('resumeReplayPrompt:只有已插话投递的消息可跳过', () => {
     expect(replay.prompt).not.toContain('插句话')
   })
 })
+
+describe('resumeReplayPrompt:补发完整性(tool-call / 压缩 / own 过滤)', () => {
+  /** 消息构造(带 id 与来源,便于 own/forwarded/checkpoint 判定)。 */
+  function userMessage(id: string, text: string): Message {
+    return { id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } } as unknown as Message
+  }
+
+  function ownAssistant(id: string, text: string): Message {
+    return {
+      id,
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      source: { kind: 'model', provider: 'codebuddy', model: 'glm-5.3' },
+    } as unknown as Message
+  }
+
+  function otherAssistant(id: string, text: string): Message {
+    return {
+      id,
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      source: { kind: 'model', provider: 'sensenova', model: 'kimi-k3' },
+    } as unknown as Message
+  }
+
+  function toolCallMessage(id: string, name: string, args: string): Message {
+    return {
+      id,
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: 'c1', name, arguments: args }],
+      source: { kind: 'model', provider: 'sensenova', model: 'kimi-k3' },
+    } as unknown as Message
+  }
+
+  function toolResultMessage(id: string, text: string): Message {
+    return {
+      id,
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text }] }],
+      source: { kind: 'tool', callId: 'c1' },
+    } as unknown as Message
+  }
+
+  /** 压缩 checkpoint(与 dsh 原生/镜像压缩同形:plugin:'compact')。 */
+  function checkpoint(id: string, text: string): Message {
+    return {
+      id,
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'compact', compactionId: 'cp-1' },
+    } as unknown as Message
+  }
+
+  it('其他模型的工具调用被补发:纯 tool-call 消息不再整条丢失', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('u1', '第一问'),
+      ownAssistant('a1', 'own 的回答'),
+      toolCallMessage('a2', 'Bash', '{"command":"ls"}'),
+      toolResultMessage('t1', 'ls 的输出'),
+      userMessage('u2', '新问题'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 2)
+    expect(replay.prompt).toContain('[tool call: Bash')
+    expect(replay.prompt).toContain('ls 的输出')
+    expect(replay.prompt).toContain('新问题')
+    expect(replay.prompt).not.toContain('own 的回答')
+  })
+
+  it('数量锚遇到压缩 checkpoint 时整体重建:未发送消息不被静默吞掉', async () => {
+    const { ctx } = makeCtx()
+    // 前 4 条"已发"(sentCount=4),但其中混入了压缩 checkpoint——遮蔽段落在
+    // 已发区内,索引已错位:u3 实际从未发送,数量锚会把它当作已发跳过。
+    const messages = [
+      userMessage('u1', '第一问'),
+      checkpoint('cp1', '压缩摘要内容'),
+      ownAssistant('a1', 'own 的回答'),
+      userMessage('u3', '从未发送的中间消息'),
+      userMessage('u4', '新问题'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 4)
+    expect(replay.prompt).toContain('从未发送的中间消息')
+    expect(replay.prompt).toContain('新问题')
+    expect(replay.prompt).not.toContain('own 的回答') // own 轮 CLI 已有,重建也跳过
+  })
+
+  it('锚点被压缩移除:重建跳过 CodeBuddy 自己的轮次与已转发插话(不重复膨胀)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      checkpoint('cp1', '压缩摘要内容'),
+      ownAssistant('a1', 'own 的尾部回答'),
+      userMessage('f1', '已转发的插话'),
+      userMessage('u2', '新问题'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 3, new Set(['f1']), 'a-gone')
+    expect(replay.prompt).toContain('压缩摘要内容')
+    expect(replay.prompt).toContain('新问题')
+    expect(replay.prompt).not.toContain('own 的尾部回答')
+    expect(replay.prompt).not.toContain('已转发的插话')
+  })
+
+  it('正常补发:起点之后穿插的 own 轮不重发(CLI 已有)', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('u1', '旧输入'),
+      ownAssistant('a1', 'own 的回答'),
+      otherAssistant('a2', '别的模型的回答'),
+      ownAssistant('a3', '期间穿插的 own 回答'),
+      userMessage('u2', '新问题'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 2)
+    expect(replay.prompt).toContain('别的模型的回答')
+    expect(replay.prompt).toContain('新问题')
+    expect(replay.prompt).not.toContain('own 的回答')
+    expect(replay.prompt).not.toContain('期间穿插的 own 回答')
+  })
+})

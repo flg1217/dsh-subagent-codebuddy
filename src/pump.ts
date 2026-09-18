@@ -651,12 +651,11 @@ export class TurnPump {
         const created = await conn.request<{ sessionId: string }>('session/new', { cwd: this.deps.acpCwd, mcpServers: [] }, this.to.firstMs)
         this.acpSessionId = created.sessionId
       }
-      this.deps.rememberConversation(
-        this.acpSessionId,
-        this.deps.sentCount,
-        this.deps.sentLastMessageId,
-        this.deps.systemHash,
-      )
+      // 锚点必须在 prompt 请求真正发车后才记:早于此进程死掉的话,"从未发出
+      // 的输入"会被标记为已发,下轮补发静默丢失(宁可不记:下轮重发只是重复,
+      // 不丢内容)。request 已写入连接即视为发出;请求层失败(resolve false,
+      // 含 restart 作废旧代次)不记,留给重试/下轮补发。
+      const sentAcpId = this.acpSessionId
       // 统一委托面:当前会话可见的全部 dsh 工具以 `dsh_<原名>` 注册为
       // CodeBuddy 的 delegate tools(含 bash/subagent——原生本就是后台任务
       // 与可续用子代理);调用经 dsh 官方工具管线执行(审批/沙箱/事件一致)。
@@ -699,7 +698,16 @@ export class TurnPump {
         throw new Error(`CodeBuddy delegate 工具注册失败(${failedBatches.length}/${Math.ceil(bridgeTools.length / BRIDGE_BATCH)} 批):模型将无法调用 dsh 工具,需重启回合重试`)
       }
       this.capturing = false
-      void this.sendPrompt(this.deps.prompt, this.deps.images)
+      void this.sendPrompt(this.deps.prompt, this.deps.images).then(ok => {
+        if (ok && sentAcpId !== '') {
+          this.deps.rememberConversation(
+            sentAcpId,
+            this.deps.sentCount,
+            this.deps.sentLastMessageId,
+            this.deps.systemHash,
+          )
+        }
+      })
       this.armProgress()
     } catch (error) {
       if (this.aborted || this.disposed) return

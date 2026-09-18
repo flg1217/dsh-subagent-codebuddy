@@ -817,8 +817,18 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           acpSessionId = created.sessionId
         }
         // 记录/刷新续接锚点:sentCount = 本次实际发送时的 dsh 消息总数。
+        // 主锚与 system 哈希必须一并落:set 是整体替换,缺字段会把泵路径写的
+        // 记录覆盖回数量锚(压缩/编辑后不可靠,切换期间的上下文被静默丢弃)。
         if (dshSessionId !== undefined && !purposeCall) {
-          this.conversations.set(dshSessionId, { acpId: acpSessionId, sentCount: options.messages.length })
+          const hash = systemHashOf(options.system)
+          this.conversations.set(dshSessionId, {
+            acpId: acpSessionId,
+            sentCount: options.messages.length,
+            ...(options.messages.length === 0
+              ? {}
+              : { lastSentMessageId: String(options.messages[options.messages.length - 1]!.id) }),
+            ...(hash === undefined ? {} : { systemHash: hash }),
+          })
         }
         capturing = false
 
