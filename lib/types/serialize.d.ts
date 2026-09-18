@@ -67,7 +67,5 @@ export declare function lastUserPrompt(ctx: Context, messages: readonly Message[
  * @returns 序列化结果(prompt + 原生图片块 + 本次覆盖到的最后消息 id)。
  */
 export declare function resumeReplayPrompt(ctx: Context, messages: readonly Message[], sentCount: number | undefined, skipIds?: ReadonlySet<string>, lastSentMessageId?: string, ownProvider?: string): Promise<SerializedPrompt>;
-/** 把一组消息序列化为 prompt(无系统提示);图片走原生内容块。 */
-export declare function serializeMessages(ctx: Context, messages: readonly Message[]): Promise<SerializedPrompt>;
 /** 把 harness 消息序列化为 CodeBuddy 单轮 prompt;图片走原生内容块。 */
 export declare function buildPrompt(ctx: Context, options: GenerateOptions): Promise<SerializedPrompt>;
