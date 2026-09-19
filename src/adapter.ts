@@ -42,6 +42,7 @@ import { TodoListState } from './todo-bridge.js'
 import { AttachmentsSaveFace } from './tool-image.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, isProgressUpdate, usageOfUpdate } from './acp.js'
 import { mcpConfigArgs } from './mcp-config.js'
+import { registerDshMcpServer } from '@flg1217/dsh-mcp'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import type { CodebuddyFailure } from './failure.js'
@@ -742,6 +743,9 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
       // CLI 进程将在启动时读取 ~/.codebuddy/mcp.json 与 skills 目录:启动前
       // 同步一次(dsh 的 MCP 配置 / skills → CLI 原生通道),保证最新。
       syncCliIntegrations({ projectCwd: cwd })
+      // 端点可能因 owner(先 apply 的插件)被卸载而消失:幂等补注册再生成配置,
+      // 否则 CLI 以"内置工具全禁 + 无 --mcp-config"启动,该回合零工具且静默。
+      if (this.options.bridgeMode === 'mcp') registerDshMcpServer(this.ctx)
       const conn = new AcpConnection(
         [
           command,
