@@ -112,5 +112,13 @@ export function mcpConfigArgs(
   // MCP、提示词与注册却按 delegate"的混合态。
   if (bridgeMode !== 'mcp' || dshSessionId === undefined) return []
   const path = writeDshMcpConfigFile(dshSessionId)
-  return path === undefined ? [] : ['--mcp-config', path]
+  if (path === undefined) {
+    // 端点未就绪(webserver 未起)或已被卸载(owner 插件被禁用):CLI 将以
+    // "内置工具全禁 + 无 --mcp-config"启动,该回合零工具——显式告警,
+    // 不要把这种状态留给现场猜(此前完全静默)。
+    console.error('[codebuddy-bridge] mcp 模式拿不到 dsh 端点 URL:跳过 --mcp-config,'
+      + '该 CLI 回合将以零工具启动(检查 dsh-mcp 端点是否被卸载/服务未就绪)')
+    return []
+  }
+  return ['--mcp-config', path]
 }
