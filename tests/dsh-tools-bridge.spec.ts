@@ -2,11 +2,13 @@
  * dsh 工具通用桥的协议面测试:
  * - 列工具:schemas(agent) → `dsh_<原名>` 描述符(排除表/描述引导/inputSchema);
  * - 命名:bridgeToolId / bridgeTargetTool 的映射与排除;
- * - 执行:tools.execute 官方管线转发、内容块转文本、错误按协议回落。
+ * - 执行:tools.execute 官方管线转发、内容块转文本、错误按协议回落;
+ * - MCP 图片回传:blocksToMcpContent 的 text/image 转换与整体回退。
  */
 import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import {
+  blocksToMcpContent,
   BRIDGE_TOOL_PREFIX,
   bridgeTargetTool,
   bridgeToolId,
@@ -158,7 +160,7 @@ describe('listDshBridgeTools:注册描述符', () => {
     expect(bridgeTargetTool('dsh_read')).toBe('read')
   })
 
-  it('被镜像占名的 read_image 不桥接(CLI 原生 Read 读图 + dsh 图片卡片覆盖)', () => {
+  it('read_image 桥接(CLI 内置工具全禁后,读图走 dsh 真工具)', () => {
     const { ctx } = makeBridgeCtx({
       schemas: [
         { name: 'read_image', description: 'Read an image.', parameters: { type: 'object', properties: {} } },
@@ -166,8 +168,8 @@ describe('listDshBridgeTools:注册描述符', () => {
       ],
     })
     const tools = listDshBridgeTools(ctx, { id: 'parent-1' } as never)
-    expect(tools.map(tool => tool.id)).toEqual(['dsh_read'])
-    expect(bridgeTargetTool('dsh_read_image')).toBeUndefined()
+    expect(tools.map(tool => tool.id)).toEqual(['dsh_read_image', 'dsh_read'])
+    expect(bridgeTargetTool('dsh_read_image')).toBe('read_image')
   })
 
   it('schemas 抛错或 tools 服务缺失 → 空列表(桥不拖垮注册)', () => {
@@ -190,7 +192,10 @@ describe('runDshBridgeTool:执行转发', () => {
       input: { pattern: 'x' },
       signal,
     })
-    expect(result).toEqual({ status: 'success', output: 'hello bridge' })
+    expect(result.output).toBe('hello bridge')
+    expect(result.isError).toBe(false)
+    // 原始内容块随结果回传:MCP 端点据此回传图片(delegate 通道只读 output)。
+    expect(result.content).toEqual([{ type: 'text', text: 'hello bridge' }])
     expect(execCalls).toHaveLength(1)
     expect(execCalls[0]!['name']).toBe('grep')
     expect(execCalls[0]!['arguments']).toEqual({ pattern: 'x' })
@@ -211,37 +216,79 @@ describe('runDshBridgeTool:执行转发', () => {
       }),
     })
     const result = await runDshBridgeTool(ctx, { parentSessionId: 'parent-1', toolName: 'read_image', input: {} })
-    expect(result.status).toBe('success')
-    if (result.status === 'success') {
-      expect(result.output).toContain('head')
-      expect(result.output).toContain('inner')
-      expect(result.output).toContain('[image result')
-    }
+    expect(result.isError).toBe(false)
+    expect(result.output).toContain('head')
+    expect(result.output).toContain('inner')
+    expect(result.output).toContain('[image result')
+    // 文本口径不变,但原始块(含 image)也一并回传(MCP 端点用)。
+    expect(result.content).toHaveLength(3)
   })
 
-  it('工具失败(isError)与 execute 抛错 → 按协议回 status:error', async () => {
+  it('工具失败(isError)与 execute 抛错 → isError 回传(错误文本进 output)', async () => {
     const failed = makeBridgeCtx({
       execute: async () => ({ isError: true, content: [{ type: 'text', text: 'boom: not found' }] }),
     })
     const failedResult = await runDshBridgeTool(failed.ctx, { parentSessionId: 'parent-1', toolName: 'read', input: {} })
-    expect(failedResult.status).toBe('error')
-    if (failedResult.status === 'error') expect(failedResult.error.message).toContain('boom: not found')
+    expect(failedResult.isError).toBe(true)
+    expect(failedResult.output).toContain('boom: not found')
 
     const throwing = makeBridgeCtx({ execute: async () => { throw new Error('pipeline crash') } })
     const thrownResult = await runDshBridgeTool(throwing.ctx, { parentSessionId: 'parent-1', toolName: 'read', input: {} })
-    expect(thrownResult.status).toBe('error')
-    if (thrownResult.status === 'error') expect(thrownResult.error.message).toContain('pipeline crash')
+    expect(thrownResult.isError).toBe(true)
+    expect(thrownResult.output).toContain('pipeline crash')
   })
 
   it('parent 或 tools 缺失 → 明确错误,不执行', async () => {
     const noParent = makeBridgeCtx({ noParent: true })
     const missingParent = await runDshBridgeTool(noParent.ctx, { parentSessionId: 'parent-1', toolName: 'read', input: {} })
-    expect(missingParent.status).toBe('error')
-    if (missingParent.status === 'error') expect(missingParent.error.message).toContain('is not live')
+    expect(missingParent.isError).toBe(true)
+    expect(missingParent.output).toContain('is not live')
 
     const noTools = makeBridgeCtx({ noTools: true })
     const missingTools = await runDshBridgeTool(noTools.ctx, { parentSessionId: 'parent-1', toolName: 'read', input: {} })
-    expect(missingTools.status).toBe('error')
-    if (missingTools.status === 'error') expect(missingTools.error.message).toContain('tools service is unavailable')
+    expect(missingTools.isError).toBe(true)
+    expect(missingTools.output).toContain('tools service is unavailable')
+  })
+})
+
+describe('blocksToMcpContent:图片经 MCP content 回传', () => {
+  /** 假 attachments 读图面:按 ref 里的字节返回。 */
+  const face = (options?: { fail?: boolean }) => ({
+    readImage: async (ref: unknown) => {
+      if (options?.fail === true) throw new Error('attachment unreadable')
+      return { data: Uint8Array.of(1, 2, 3), ref: { mediaType: (ref as { mediaType?: string }).mediaType ?? 'image/png' } }
+    },
+  })
+
+  it('无图片/无服务面 → undefined(调用方沿用纯文本单块)', async () => {
+    expect(await blocksToMcpContent(undefined, [{ type: 'text', text: 'x' }])).toBeUndefined()
+    expect(await blocksToMcpContent(face(), [{ type: 'text', text: 'x' }])).toBeUndefined()
+    expect(await blocksToMcpContent(face(), [])).toBeUndefined()
+  })
+
+  it('文本 + 图片 → text 与 image 块(base64 + mediaType)', async () => {
+    const parts = await blocksToMcpContent(face(), [
+      { type: 'text', text: 'head' },
+      { type: 'image', attachment: { mediaType: 'image/png' } },
+    ])
+    expect(parts).toEqual([
+      { type: 'text', text: 'head' },
+      { type: 'image', data: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' },
+    ])
+  })
+
+  it('嵌套 tool-result 里的图片同样展开', async () => {
+    const parts = await blocksToMcpContent(face(), [
+      { type: 'tool-result', content: [{ type: 'image', attachment: { mediaType: 'image/jpeg' } }] },
+    ])
+    expect(parts).toEqual([{ type: 'image', data: 'AQID', mimeType: 'image/jpeg' }])
+  })
+
+  it('有图但读不出 → undefined(整体回退,不半转换)', async () => {
+    const parts = await blocksToMcpContent(face({ fail: true }), [
+      { type: 'text', text: 'head' },
+      { type: 'image', attachment: { mediaType: 'image/png' } },
+    ])
+    expect(parts).toBeUndefined()
   })
 })

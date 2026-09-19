@@ -45,7 +45,8 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { isBridgeEligible, listDshMcpTools, runDshBridgeTool } from './dsh-tools-bridge.js'
+import { blocksToMcpContent, isBridgeEligible, listDshMcpTools, runDshBridgeTool } from './dsh-tools-bridge.js'
+import type { AttachmentsReadFace, DshToolRunResult, McpContentPart } from './dsh-tools-bridge.js'
 
 /** 端点路径(exact 路由,挂 dsh webserver)。 */
 export const DSH_MCP_ENDPOINT_PATH = '/api/dsh-mcp'
@@ -91,7 +92,7 @@ export type McpLoopDispatcher = (
    * 是超时错误而不是答案;没有这个口子,答案就永久丢失(CLI 只能重问)。
    */
   lateSink?: (toolName: string, text: string) => void,
-) => Promise<{ output: string; isError: boolean }>
+) => Promise<DshToolRunResult>
 
 /**
  * 会话 → 转发器。回合泵活着时注册:tools/call 交给泵伪装成工具调用块灌进
@@ -525,6 +526,22 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
   const toolError = (text: string): void => {
     respond({ content: [{ type: 'text', text }], isError: true })
   }
+  /** dsh attachments 服务面(图片回传用;缺失即回退纯文本)。 */
+  const attachmentsOf = (): AttachmentsReadFace | undefined =>
+    (ctx as unknown as { get: (key: string) => unknown }).get('attachments') as AttachmentsReadFace | undefined
+  /**
+   * 工具结果 → MCP `content` 数组。
+   *
+   * 含图片且字节可读 → 带 image 块(CLI 侧 `convertMcpResult` 转 `image_url`
+   * 交给它自己的模型,与走原生 Read 读图的落点相同);否则回退纯文本单块
+   * ——纯文本响应与历史行为逐字一致。
+   */
+  const contentOf = async (result: DshToolRunResult, text: string): Promise<McpContentPart[]> => {
+    const parts = result.content === undefined
+      ? undefined
+      : await blocksToMcpContent(attachmentsOf(), result.content)
+    return parts ?? [{ type: 'text', text }]
+  }
   const agentOf = (): Agent | undefined => {
     if (sessionId.length === 0) return undefined
     const agents = (ctx as unknown as { get: (key: string) => unknown }).get('agents') as AgentsFace | undefined
@@ -589,6 +606,8 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
         try {
           // 迟到投递口:转发超时后 CLI 收到的是超时错误;工具稍后完成时,
           // 泵经此把真实结果补投回会话(交互式工具全靠它,否则答案永久丢失)。
+          // 只投文本:CLI 已按超时放弃,图片块没有可回灌的通道(补投是会话内
+          // 记录,不是 MCP 响应)。
           const result = await dispatcher(sessionId, name, input, (lateTool, lateText) => {
             const line = `[codebuddy-bridge] MCP 转发超时后结果补投:session=${sessionId}`
               + ` tool=${lateTool} 工具总耗时=${Date.now() - requestedAt}ms`
@@ -612,7 +631,7 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
             deliverAfterClientGone(ctx, sessionId, name, result.output)
           }
           if (result.isError) return toolError(result.output)
-          respond({ content: [{ type: 'text', text: result.output }] })
+          respond({ content: await contentOf(result, result.output) })
           return
         } catch (error) {
           if (error instanceof McpDispatchTimeoutError) {
@@ -649,11 +668,10 @@ async function handleMcpRequest(ctx: Context, req: IncomingMessage, res: ServerR
           + ` 客户端等待=${clientGoneAt - requestedAt}ms 工具总耗时=${Date.now() - requestedAt}ms`
         console.error(line)
         bridgeLog(line)
-        deliverAfterClientGone(ctx, sessionId, name,
-          result.status === 'error' ? result.error.message : result.output)
+        deliverAfterClientGone(ctx, sessionId, name, result.output)
       }
-      if (result.status === 'error') return toolError(result.error.message)
-      respond({ content: [{ type: 'text', text: result.output }] })
+      if (result.isError) return toolError(result.output)
+      respond({ content: await contentOf(result, result.output) })
       return
     }
     default:

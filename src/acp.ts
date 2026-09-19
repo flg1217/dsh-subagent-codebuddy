@@ -34,46 +34,40 @@ export const DEFAULT_ACP_RUN_TIMEOUTS = {
 }
 
 /**
- * CLI 内置工具的**白名单**(spawn 时以 `--tools` 传入)。
+ * CLI 内置工具的 spawn 策略:**全部禁用**,工具面只剩 dsh 桥(MCP 通道的
+ * `mcp__dsh__*`;delegate 模式为 `dsh_*` 委托工具)。
  *
- * 为什么必须用白名单而不是 `--disallowedTools`:实测(2026-09-13,ACP 对照
+ * 为什么全禁(2026-09-18,替代此前的白名单方案):
+ * - CLI 原生工具要进 dsh 会话,必须在会话 scope 注册「回放镜像」承接;镜像
+ *   注册一旦丢失,该会话的原生调用就永久报 `unknown tool "cli_read"`(偶发、
+ *   难复现)。禁掉内置工具 = 镜像路径不再被触发,这一失败面整体消失;
+ * - 原白名单里的 Read/ToolSearch/Skill/WebSearch 与 dsh 侧能力重复:走 dsh
+ *   才有审批/沙箱/会话审计/后台面板;
+ * - 图片改走 dsh 原生 `read_image`(经 MCP 通道回传 image 内容块,CLI 侧
+ *   `convertMcpResult` 转 `image_url` 喂给它自己的模型——与走原生 Read 时
+ *   看图的模型完全相同)。
+ *
+ * 为什么用 `--tools` 而不是 `--disallowedTools`:实测(2026-09-13,ACP 对照
  * 实验)`--disallowedTools` 在 `--acp` 模式下**完全不生效**——模型仍报
  * "Edit=有 Bash=有 Write=有",会话记录里 cli_edit 在禁用后成功执行 11 次
  * (与 `--append-system-prompt` 同类的"ACP 忽略交互模式参数"现象)。
- * `--tools` 白名单在 ACP 下生效(同实验:禁项全"没有",保留项"有")。
+ * `--tools` 在 ACP 下生效(同实验:禁项全"没有",保留项"有")。
  *
- * **`DelegateTool` 必须在白名单里**(实测:白名单会连同"委托工具合成器"一起
- * 过滤——漏掉它模型只剩只读原生工具、全部 dsh_* 桥工具不可见,模型自称
- * "只有只读权限";只加这一个名字即可放行全部 Dsh-* 委托工具,无需逐个枚举)。
+ * `''` = 禁用全部内置工具(CLI 帮助原文 `Use "" to disable all`;bundle 内
+ * `createIsEnabledChecker` 对空列表逐工具判 disabled,不抛错)。**不影响 MCP
+ * 工具**:MCP 走独立的 `mcpServers`/`--mcp-config` 通道、不经该过滤器(反证:
+ * 白名单时代列表里没有任何 `mcp__dsh__*`,而模型一直调用成功)。
  *
- * 白名单 = CLI 独有/机制类工具 + **Read**(读图片只能走 CLI 原生 Read,结果
- * 镜像为 read_image 卡片;桥接回传 blocksToText 会丢图片块)+ DelegateTool。
- * 被排除的:Bash/PowerShell/Edit/Write/NotebookEdit/Glob/Grep(dsh 侧有完整
- * 对等工具,走 dsh 才有审批/沙箱/会话审计/后台面板)、EnterPlanMode/
- * ExitPlanMode(CLI 的 plan 模式是 CLI 内部状态,dsh 不知情,该模式下 CLI
- * 对 delegate 判权失败并中断整个回合;规划走 dsh 原生 plan 工作流)。
- * 版本升级若新增内置工具:默认不可见(比"漏禁"安全),按需加入白名单。
+ * **delegate 模式必须放行 `DelegateTool`**:白名单会连同"委托工具合成器"一起
+ * 过滤——漏掉它模型只剩只读原生工具、全部 dsh_* 桥工具不可见(实测:模型自称
+ * "只有只读权限";只加这一个名字即可放行全部 Dsh-* 委托工具)。mcp 模式不注册
+ * 委托工具,故留空。
+ *
+ * 版本升级若新增内置工具:默认不可见(比"漏禁"安全),不再逐个维护白名单。
+ * 逃生口:用户 `extraArgs` 排在 `--tools` 之后,可用 `--tools Read` 覆盖本策略。
  */
-export const CLI_ALLOWED_TOOLS = [
-  'Read',
-  'WebSearch',
-  'WebFetch',
-  'Task',
-  'TaskCreate',
-  'TaskUpdate',
-  'TaskList',
-  'TaskOutput',
-  'TaskStop',
-  'Skill',
-  'ToolSearch',
-  'DeferExecuteTool',
-  // 委托工具合成器:漏掉它 = 全部 dsh_* 桥工具不可见(模型只剩只读)。
-  'DelegateTool',
-] as const
-
-/** spawn 参数:白名单放行 CLI 独有工具,主力工具全部走 dsh_* 桥接。 */
-export function cliToolPolicyArgs(): string[] {
-  return ['--tools', CLI_ALLOWED_TOOLS.join(',')]
+export function cliToolPolicyArgs(bridgeMode: 'mcp' | 'delegate' | undefined = 'mcp'): string[] {
+  return ['--tools', bridgeMode === 'delegate' ? 'DelegateTool' : '']
 }
 
 /** 动态空闲超时预算(测试注入小值压缩时间)。 */

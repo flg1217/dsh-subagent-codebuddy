@@ -68,7 +68,13 @@ interface Harness {
   emitSessionEvent: (event: { type: string; data: unknown }) => void
 }
 
-function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>, store?: ConversationStore): Harness {
+function makeAdapter(
+  shape: SessionShape = {},
+  timeouts?: Record<string, number>,
+  store?: ConversationStore,
+  /** 回放工具注册面的注入口(注册失败重试的回归用)。 */
+  toolsHooks?: { registerThrowsOnce?: boolean },
+): Harness {
   const appended: Array<{ type: string; data: unknown; opts?: unknown }> = []
   const events: Array<{ type: string; data?: unknown }> = [
     { type: 'turn/start', data: { turn: 1 } },
@@ -99,11 +105,18 @@ function makeAdapter(shape: SessionShape = {}, timeouts?: Record<string, number>
       }
     },
   }
+  let registerThrew = false
   const toolsFace = {
     register: (definition: Record<string, unknown>): (() => void) => {
+      if (toolsHooks?.registerThrowsOnce === true && !registerThrew) {
+        registerThrew = true
+        throw new Error('agent scope not ready')
+      }
       registeredTools.set(String(definition['name']), definition)
       return () => { registeredTools.delete(String(definition['name'])) }
     },
+    // 注册表查询:ensureReplayTool 以此判重(不再用进程内 Set 记账)。
+    schemas: () => [...registeredTools.keys()].map(name => ({ name })),
   }
   const agentFace = { ctx: { get: (key: string) => (key === 'tools' ? toolsFace : undefined) } }
   const ctx = {
@@ -381,7 +394,7 @@ describe('回合泵:一个 CodeBuddy 回合 = 多个原生 step', () => {
 })
 
 describe('回放工具:结果与别名', () => {
-  it('图片 Read → read_image 别名 + 结果转 image 块(带 meta.path)', async () => {
+  it('CLI 原生 Read(图片)→ cli_read 镜像 + 结果转 image 块', async () => {
     const h = makeAdapter({}, FAST)
     const imageOutput = JSON.stringify([{ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } }])
     mockTurn((c) => {
@@ -391,16 +404,33 @@ describe('回放工具:结果与别名', () => {
       setTimeout(() => { c.p.update(message('看到了')); c.settle() }, 60)
     })
     const first = await step(h.adapter, makeOptions('s1'))
-    // 图片别名的镜像名保持 `read_image`(不加 cli_ 前缀):dsh Web UI 的图片卡片
-    // 按 call.name === 'read_image' 出预览,改名就没有预览(实测)。
-    expect(first.some(c => c.includes('read_image'))).toBe(true)
-    expect(h.registeredTools.has('read_image')).toBe(true)
-    const value = await (h.registeredTools.get('read_image')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
+    // 镜像名一律 `cli_` 前缀(裸名 `read_image` 会遮蔽 dsh 真工具,已删除)。
+    expect(first.some(c => c.includes('cli_read'))).toBe(true)
+    expect(h.registeredTools.has('cli_read')).toBe(true)
+    const value = await (h.registeredTools.get('cli_read')!['execute'] as (args: unknown, exec: unknown) => Promise<unknown>)(
       {}, { callId: 'call_img' },
-    ) as { blocks: Array<Record<string, unknown>>; meta?: { path?: string } }
+    ) as { blocks: Array<Record<string, unknown>> }
+    // CLI 交付的图片 JSON 仍转成 dsh image 块(读图链路即使经原生工具也不丢图)。
     expect(value.blocks.some(block => block['type'] === 'image')).toBe(true)
-    expect(value.meta?.path).toBe('C:\\tmp\\shot.png')
     expect(h.savedImages.length).toBe(1)
+  }, 15_000)
+
+  it('回放工具注册失败 → 下次调用重试注册(不再一次失败即永久失效)', async () => {
+    // 2026-09-18 修的 bug:注册前就记账 + 失败静默 → 该会话的原生工具调用
+    // 永久报 `unknown tool "cli_read"`。现在以注册表为准,失败可自愈。
+    const h = makeAdapter({}, FAST, undefined, { registerThrowsOnce: true })
+    mockTurn((c) => {
+      c.p.update(toolCall('call_a', 'Read', { file_path: 'a.ts' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_a', 'completed', 'text-a'))
+      // 第二次原生调用:注册表里仍没有 cli_read(第一次抛错未记账)→ 补注册。
+      c.p.update(toolCall('call_b', 'Read', { file_path: 'b.ts' }))
+      c.p.update(toolUpdate('call_b', 'completed', 'text-b'))
+      c.settle()
+    })
+    await step(h.adapter, makeOptions('s1'))
+    // 第一次注册抛错被吞(不记账),第二次调用补注册成功。
+    expect(h.registeredTools.has('cli_read')).toBe(true)
   }, 15_000)
 
   it('空 DelegateTool 调用(无 toolId)→ 回放工具立即以错误收尾,不等 CLI 更新', async () => {
@@ -1082,7 +1112,11 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
         },
       },
     })
-    await expect(pending).resolves.toEqual({ output: 'mcp-executed', isError: false })
+    await expect(pending).resolves.toEqual({
+      output: 'mcp-executed',
+      isError: false,
+      content: [{ type: 'text', text: 'mcp-executed' }],
+    })
     settleFn?.()
   }, 15_000)
 
@@ -1167,7 +1201,11 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
         },
       },
     })
-    await expect(pending).resolves.toEqual({ output: 'mcp-executed', isError: false })
+    await expect(pending).resolves.toEqual({
+      output: 'mcp-executed',
+      isError: false,
+      content: [{ type: 'text', text: 'mcp-executed' }],
+    })
     settleFn?.()
   }, 15_000)
 

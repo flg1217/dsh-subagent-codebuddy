@@ -32,6 +32,7 @@ import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { AcpTimeouts } from './acp.js';
 import type { TodoListState } from './todo-bridge.js';
 import type { AttachmentsSaveFace } from './tool-image.js';
+import type { DshToolRunResult } from './dsh-tools-bridge.js';
 /** 会话面(todo 折叠/插话轮询需要 ownEvents;todo 快照写入需要 append)。 */
 export interface PumpSessionFace {
     ownEvents?: () => readonly {
@@ -110,7 +111,7 @@ export interface PumpHost {
     /** 撤销投递标记(prompt 回退发送失败时回滚,留给补发路径)。 */
     unmarkForwarded?: (id: string) => void;
 }
-/** 仅供测试:清空模块级注册表并释放残留的泵(跨用例隔离)。 */
+/** 仅供测试:释放残留的泵(跨用例隔离)。 */
 export declare function resetPumpStateForTests(): void;
 /**
  * 回放工具的 presentationMeta 投影:只透传显式 meta(无损 JSON 对象),
@@ -368,8 +369,14 @@ export declare class TurnPump {
         meta?: unknown;
     }>;
     /**
-     * 为此 agent 注册一个回放工具(同名工具名只注册一次)。
-     * @param name - 镜像工具名(cli_ 前缀或图片别名)。
+     * 为此 agent 注册一个回放工具(以**工具注册表**为准判重)。
+     *
+     * 为什么不用进程内 Set 记账(2026-09-18 修):Set 在生产路径从不失效——
+     * 一次注册失败(服务未就绪/抛错)或 agent scope 回收重建后工具已不在,而
+     * Set 仍说"已注册"→ 该会话的原生工具调用永久报 `unknown tool "cli_read"`
+     * (实测:偶发、不可恢复)。直接查注册表则每次都自愈:缺了就补注册,注册
+     * 失败下次调用自然重试。
+     * @param name - 镜像工具名(cli_ 前缀)。
      * @param nonBlocking - 立即返回占位而非等待 CLI 的 completed(MCP 模式下
      *   仅 DeferExecuteTool 需要:它的真实执行走 MCP 通道,等待会形成
      *   CLI↔MCP↔loop 三方死锁)。
@@ -406,12 +413,9 @@ export declare class TurnPump {
      * loop 必定继续执行;镜像回放事件后到时只会另开新段,由后续 step 正常消费。
      * @param name - dsh 真工具名(已由端点做白名单校验)。
      * @param input - 工具参数。
-     * @returns 工具结果(文本 + isError)。
+     * @returns 工具结果(文本 + isError + 原始内容块;端点用 content 回传图片)。
      */
-    dispatchMcpCall(name: string, input: Record<string, unknown>, lateSink?: (toolName: string, text: string) => void): Promise<{
-        output: string;
-        isError: boolean;
-    }>;
+    dispatchMcpCall(name: string, input: Record<string, unknown>, lateSink?: (toolName: string, text: string) => void): Promise<DshToolRunResult>;
     /**
      * 等一次真工具直发的 delegate 调用结果。
      * 块已发射 → 直接绑 callId;请求先到 → 挂起等块发射认领;

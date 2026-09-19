@@ -308,8 +308,8 @@ describe('SubagentMirror:工具结果图片', () => {
       expect(JSON.stringify(blocks).includes('data:image')).toBe(false)
       expect(saved).toEqual([{ mediaType: 'image/png', bytes: Buffer.from(png, 'base64').byteLength }])
       const call = events.find(e => e.type === 'tool/call')!
-      expect((call.data as { name: string }).name).toBe('read_image')
-      expect((result!.data as { meta?: { path?: string } }).meta).toEqual({ path: 'a.png' })
+      // 工具名原样镜像(裸名 read_image 别名已删除:它会遮蔽 dsh 真工具)。
+      expect((call.data as { name: string }).name).toBe('Read')
       validate(events)
     } finally {
       tree.cleanup()
