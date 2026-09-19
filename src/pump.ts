@@ -60,6 +60,57 @@ import { syncCliIntegrations } from './cli-integrations.js'
 import { mcpConfigArgs } from './mcp-config.js'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
+/**
+ * 泵释放后继续盯一条迟到结果(独立于泵的一次性订阅)。
+ *
+ * MCP 调用转发超时/回合收尾时,工具可能仍在 loop 侧执行;其结果到达时泵已
+ * 释放、事件订阅已被摘除——若不接管,"真实结果"永远不会进会话(CLI 收到的
+ * 只有超时错误,交互式工具的回答更是无人接续)。这里用一次性 session/event
+ * 订阅盯到该 callId 的 tool/result 即补投,10 分钟无果自动摘除(防泄漏)。
+ * @param ctx - 插件上下文(事件面)。
+ * @param sessionId - 目标 dsh 会话。
+ * @param callId - 等待中的调用 id。
+ * @param toolName - 工具名(补投文案)。
+ * @param sink - 补投口(经会话注入把结果交给模型)。
+ */
+function watchLateMcpResult(
+  ctx: Context,
+  sessionId: string,
+  callId: string,
+  toolName: string,
+  sink?: (toolName: string, text: string) => void,
+): void {
+  const on = (ctx as unknown as {
+    on?: (name: string, handler: (...args: unknown[]) => void) => (() => void) | void
+  }).on
+  if (on === undefined) return
+  let done = false
+  const off = on('session/event', (...args: unknown[]): void => {
+    if (done) return
+    const session = args[0] as { id?: unknown; header?: { id?: unknown } } | undefined
+    const event = args[1] as { type?: unknown; data?: unknown } | undefined
+    if (event?.type !== 'tool/result') return
+    const sid = typeof session?.header?.id === 'string' ? session.header.id : session?.id
+    if (sid !== sessionId) return
+    const message = (event.data as {
+      message?: {
+        source?: { callId?: unknown }
+        content?: readonly { toolCallId?: unknown; content?: readonly unknown[] }[]
+      }
+    } | undefined)?.message
+    const block = message?.content?.[0]
+    const cid = typeof block?.toolCallId === 'string'
+      ? block.toolCallId
+      : (typeof message?.source?.callId === 'string' ? message.source.callId : undefined)
+    if (cid !== callId) return
+    done = true
+    off?.()
+    sink?.(toolName, blocksToText(Array.isArray(block?.content) ? block.content as readonly unknown[] : []))
+  })
+  const timer = setTimeout(() => { done = true; off?.() }, 10 * 60_000)
+  timer.unref?.()
+}
+
 /** 工具结果(ACP 报来的原始形态)。 */
 interface ToolOutcome {
   text: string
@@ -911,7 +962,11 @@ export class TurnPump {
       waiter.reject(new McpDispatchAbortedError('CodeBuddy 回合已收尾,该调用结果未能回填'))
     }
     this.mcpWaiters.clear()
-    // 回合结束:尚未迟到的补投通道随之失效(结果不再有 CLI 去向)。
+    // 迟到补投不再随泵消亡:未决的 MCP 调用(超时/收尾)若之后完成,真实结果
+    // 仍要进会话(CLI 当时只收到超时错误)——交给独立的一次性订阅继续盯。
+    for (const [callId, late] of this.lateMcpCalls) {
+      watchLateMcpResult(this.deps.ctx, this.deps.dshSessionId, callId, late.name, late.sink)
+    }
     this.lateMcpCalls.clear()
     this.disposeEventHook?.()
     this.disposeEventHook = undefined
