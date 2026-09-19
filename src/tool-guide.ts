@@ -56,6 +56,25 @@ function guideText(from: string | undefined, to: string): string | undefined {
 }
 
 /**
+ * 两个会话级 Map 的容量上限(FIFO 淘汰最早条目)。
+ *
+ * lastRoute/pending 按会话 id 记状态,正常随会话使用自然覆盖;但会话结束
+ * 不会回调本插件,长期运行的宿主里死会话条目只增不减(缓慢泄漏)。
+ * 上限远大于同时活跃的会话数,淘汰只可能发生在早已闲置的会话上——代价是
+ * 该会话的下一次切换可能少一条说明,可接受。
+ */
+const MAX_TRACKED_SESSIONS = 512
+
+/** 超限时按插入顺序淘汰最老条目(Map 迭代序 = 插入序)。 */
+function trimToCap<K, V>(map: Map<K, V>): void {
+  while (map.size > MAX_TRACKED_SESSIONS) {
+    const oldest = map.keys().next().value as K | undefined
+    if (oldest === undefined) return
+    map.delete(oldest)
+  }
+}
+
+/**
  * 安装"路由切换 → 工具面说明"注入。
  * @param ctx - 插件上下文(session/event 与 agent/pre-step 两个事件面)。
  */
@@ -74,10 +93,12 @@ export function installModelSwitchToolGuide(ctx: Context): void {
     if (typeof to !== 'string' || to.length === 0) return
     const from = lastRoute.get(id)
     lastRoute.set(id, to)
+    trimToCap(lastRoute)
     if (from === to) return
     // 与 CodeBuddy 无关的切换(如原生模型之间):不注入,仅更新路由记忆。
     if (guideText(from, to) === undefined) return
     pending.set(id, { from, to })
+    trimToCap(pending)
   })
 
   ctx.on('agent/pre-step', async ({ agent, messages, signal, step }, next) => {
@@ -91,17 +112,30 @@ export function installModelSwitchToolGuide(ctx: Context): void {
     pending.delete(id)
     const text = guideText(target.from, target.to)
     if (text === undefined) return decision
+    const ours = createUserMessage({
+      content: [{ type: 'text', text }],
+      source: {
+        kind: 'plugin',
+        plugin: PLUGIN_NAME,
+        form: 'notice',
+        summary: boundContextSummary(`tools: ${target.from ?? '(new)'} → ${target.to}`),
+      },
+    })
+    // 顺序:插到"本步最后一条真实输入"之前——注入若排在真实用户消息之后,
+    // 模型回看历史时会把最后一条 user 消息(=注入)当成"用户的最新发言"而搁置
+    // 真实输入(与 prompt-inject 25aca6d 同因;核心 UI 会把这类前置注入重锚到
+    // 用户气泡之后渲染,故界面观感不变,模型侧顺序才是关键)。
+    const list = decision.messages
+    let at = -1
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const kind = (list[i] as { source?: { kind?: unknown } } | undefined)?.source?.kind
+      if (kind === 'user' || kind === 'agent-message') { at = i; break }
+    }
     return {
       ...decision,
-      messages: [...decision.messages, createUserMessage({
-        content: [{ type: 'text', text }],
-        source: {
-          kind: 'plugin',
-          plugin: PLUGIN_NAME,
-          form: 'notice',
-          summary: boundContextSummary(`tools: ${target.from ?? '(new)'} → ${target.to}`),
-        },
-      })],
+      messages: at >= 0
+        ? [...list.slice(0, at), ours, ...list.slice(at)]
+        : [...list, ours],
     }
   })
 }

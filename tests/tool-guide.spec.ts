@@ -53,18 +53,21 @@ const inlineTexts = (decision: Record<string, unknown>): string[] =>
     .flatMap(m => (m.content ?? []).map(c => c.text ?? ''))
 
 describe('工具面切换注入(CodeBuddy ↔ dsh 原生)', () => {
-  it('切到 codebuddy:注入"改用 dsh 桥工具"说明', async () => {
+  it('切到 codebuddy:注入"改用 dsh 桥工具"说明,且在真实输入之前', async () => {
     const { ctx, emit, prep } = makeCtx()
     installModelSwitchToolGuide(ctx)
     emit('session/event', SESSION, { type: 'model/selection', data: { provider: 'codebuddy', model: 'deepseek-v4.1-flash' } })
     const d = await runPreStep(prep, { agent: AGENT, messages: [], signal: SIGNAL, step: 2 }, BASE([userMsg('hi')]))
     const texts = inlineTexts(d)
     expect(texts).toHaveLength(2)
-    expect(texts[1]).toContain('CodeBuddy 桥')
-    expect(texts[1]).toContain('mcp__dsh__')
+    // 顺序:注入必须排在真实输入之前——排在后面会被模型当成"用户的最新发言"
+    // 而盖住真实任务(与 prompt-inject 25aca6d 同因)。
+    expect(texts[0]).toContain('CodeBuddy 桥')
+    expect(texts[0]).toContain('mcp__dsh__')
+    expect(texts[1]).toBe('hi')
   })
 
-  it('切离 codebuddy(→ dsh 原生):注入"恢复原生工具、勿用 cli_"说明', async () => {
+  it('切离 codebuddy(→ dsh 原生):注入"恢复原生工具、勿用 cli_"说明,且在真实输入之前', async () => {
     const { ctx, emit, prep } = makeCtx()
     installModelSwitchToolGuide(ctx)
     emit('session/event', SESSION, { type: 'model/selection', data: { provider: 'codebuddy', model: 'm' } })
@@ -72,8 +75,9 @@ describe('工具面切换注入(CodeBuddy ↔ dsh 原生)', () => {
     const d = await runPreStep(prep, { agent: AGENT, messages: [], signal: SIGNAL, step: 2 }, BASE([userMsg('hi')]))
     const texts = inlineTexts(d)
     expect(texts).toHaveLength(2)
-    expect(texts[1]).toContain('dsh 原生')
-    expect(texts[1]).toContain('cli_')
+    expect(texts[0]).toContain('dsh 原生')
+    expect(texts[0]).toContain('cli_')
+    expect(texts[1]).toBe('hi')
   })
 
   it('与 CodeBuddy 无关的切换(原生模型之间):不注入', async () => {
@@ -83,6 +87,16 @@ describe('工具面切换注入(CodeBuddy ↔ dsh 原生)', () => {
     emit('session/event', SESSION, { type: 'model/selection', data: { provider: 'pixel', model: 'gpt-6-astra' } })
     const d = await runPreStep(prep, { agent: AGENT, messages: [], signal: SIGNAL, step: 2 }, BASE([userMsg('hi')]))
     expect(inlineTexts(d)).toHaveLength(1)
+  })
+
+  it('同一 step 已有上下文注入时,仍插到最后一条真实输入之前', async () => {
+    const { ctx, emit, prep } = makeCtx()
+    installModelSwitchToolGuide(ctx)
+    emit('session/event', SESSION, { type: 'model/selection', data: { provider: 'codebuddy', model: 'm' } })
+    const context = { id: 'c1', role: 'user', content: [{ type: 'text', text: 'ctx' }], source: { kind: 'plugin', plugin: 'x' } }
+    const d = await runPreStep(prep, { agent: AGENT, messages: [userMsg('task')], signal: SIGNAL, step: 2 }, BASE([userMsg('task'), context]))
+    const texts = inlineTexts(d)
+    expect(texts).toEqual([expect.stringContaining('工具面切换'), 'task', 'ctx'])
   })
 
   it('空步不注入、保留到下一步(注入不随空步丢失)', async () => {
