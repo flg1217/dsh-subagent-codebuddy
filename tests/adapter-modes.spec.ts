@@ -62,6 +62,8 @@ interface Harness {
   savedImages: Array<{ mediaType: string; bytes: number }>
   /** per-agent 注册的回放工具(name → 定义)。 */
   registeredTools: Map<string, Record<string, unknown>>
+  /** 全部注册尝试的名字(含中途抛错的;注销不影响本记录)。 */
+  registerAttempts: string[]
   promptParams: Array<Record<string, unknown>>
   spawns: () => number
   /** 触发一次 session/event(真工具直发的结果交付通道)。 */
@@ -84,6 +86,7 @@ function makeAdapter(
   const shadowEvents: Array<{ type: string; data: unknown }> = []
   const savedImages: Array<{ mediaType: string; bytes: number }> = []
   const registeredTools = new Map<string, Record<string, unknown>>()
+  const registerAttempts: string[] = []
   const promptParams: Array<Record<string, unknown>> = []
   /** 会话事件通道:pump 订阅 session/event(真工具直发的结果交付)。 */
   const sessionEventHandlers = new Set<(...args: unknown[]) => void>()
@@ -108,6 +111,7 @@ function makeAdapter(
   let registerThrew = false
   const toolsFace = {
     register: (definition: Record<string, unknown>): (() => void) => {
+      registerAttempts.push(String(definition['name']))
       if (toolsHooks?.registerThrowsOnce === true && !registerThrew) {
         registerThrew = true
         throw new Error('agent scope not ready')
@@ -152,7 +156,7 @@ function makeAdapter(
     ...(timeouts !== undefined ? { timeouts } : {}),
   })
   return {
-    adapter, appended, events, createdMetas, shadowEvents, savedImages, registeredTools, promptParams,
+    adapter, appended, events, createdMetas, shadowEvents, savedImages, registeredTools, registerAttempts, promptParams,
     spawns: () => mockedSpawn.mock.results.length,
     emitSessionEvent: (event: { type: string; data: unknown }) => {
       const session = { header: { id: 's1' }, id: 's1' }
@@ -429,8 +433,10 @@ describe('回放工具:结果与别名', () => {
       c.settle()
     })
     await step(h.adapter, makeOptions('s1'))
-    // 第一次注册抛错被吞(不记账),第二次调用补注册成功。
-    expect(h.registeredTools.has('cli_read')).toBe(true)
+    // 第一次注册抛错被吞(不记账),第二次调用补注册成功(注册尝试两次)。
+    expect(h.registerAttempts.filter(n => n === 'cli_read')).toHaveLength(2)
+    // 回合已收尾:泵释放时镜像随之注销,工具面不残留(切模型后不会被误选)。
+    expect(h.registeredTools.has('cli_read')).toBe(false)
   }, 15_000)
 
   it('空 DelegateTool 调用(无 toolId)→ 回放工具立即以错误收尾,不等 CLI 更新', async () => {

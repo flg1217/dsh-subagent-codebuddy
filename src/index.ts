@@ -30,6 +30,7 @@ import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.j
 import { registerCodebuddyModelsRoute } from './models-route.js'
 import { registerDshMcpServer } from '@flg1217/dsh-mcp'
 import { sweepStaleMcpConfigs } from './mcp-config.js'
+import { installModelSwitchToolGuide } from './tool-guide.js'
 import type {} from '@deepseek-ai/dsh-settings'
 
 export const name = 'subagent-codebuddy'
@@ -132,6 +133,9 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => registerDshMcpServer(ctx))
   // 清扫陈旧的 --mcp-config 文件(本插件方言:文件名含会话+内容摘要、只增不删)。
   sweepStaleMcpConfigs()
+  // 路由在 CodeBuddy 与 dsh 原生之间切换时,注入工具面说明(核心只注入
+  // "模型变了";工具面差异不注入,切后的第一步就会按旧习惯选错工具)。
+  installModelSwitchToolGuide(ctx)
 
   // opt-in 工具的注册状态:设置面板开关实时同步(开 → 注册,关 → 注销)。
   let toolCtx: Context | undefined

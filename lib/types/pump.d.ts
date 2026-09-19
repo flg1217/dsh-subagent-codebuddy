@@ -292,6 +292,15 @@ export declare class TurnPump {
     private disposeEventHook;
     /** MCP→loop 转发器的注销句柄(泵生命周期内有效)。 */
     private disposeLoopDispatcher;
+    /**
+     * 本泵注册的回放工具(`cli_*` 镜像)注销器。
+     *
+     * 镜像只在 CodeBuddy 回合内可用——泵释放时统一注销;不注销则回合结束/
+     * 切模型后它们仍留在会话工具面里,被模型选中后只能拿"没有运行中的
+     * CodeBuddy 回合"错误(实测:codebuddy → dsh 原生切模型后,读图类调用
+     * 误中残留镜像而损坏)。
+     */
+    private readonly replayToolDisposers;
     /** steer 在飞防重:同一条消息不等响应完成不重复发起。 */
     private readonly inFlightForwards;
     /**
