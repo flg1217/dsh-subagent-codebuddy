@@ -44,10 +44,18 @@ import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFail
 import { toolResultBlocksFromText } from './tool-image.js'
 import type { AttachmentsSaveFace } from './tool-image.js'
 import { announceDelegateTools, DELEGATE_TOOL_METHOD } from './delegate.js'
-import { blocksToText, bridgeTargetTool, CLI_MIRROR_TOOL_PREFIX, listDshBridgeTools } from './dsh-tools-bridge.js'
-import type { DshToolRunResult } from './dsh-tools-bridge.js'
+import {
+  blocksToText,
+  bridgeTargetTool,
+  CLI_MIRROR_TOOL_PREFIX,
+  DSH_MCP_SERVER_NAME,
+  listDshBridgeTools,
+  McpDispatchTimeoutError,
+  registerMcpLoopDispatcher,
+} from '@flg1217/dsh-mcp'
+import type { DshToolRunResult } from '@flg1217/dsh-mcp'
 import { syncCliIntegrations } from './cli-integrations.js'
-import { DSH_MCP_SERVER_NAME, McpDispatchTimeoutError, mcpConfigArgs, registerMcpLoopDispatcher } from './mcp-server.js'
+import { mcpConfigArgs } from './mcp-config.js'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
 /** 工具结果(ACP 报来的原始形态)。 */

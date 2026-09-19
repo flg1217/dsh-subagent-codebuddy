@@ -78,5 +78,8 @@
     "@deepseek-ai/dsh-shell": ">=0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.0.0",
     "@deepseek-ai/cordis": ">=0.1.0-rc.6"
+  },
+  "dependencies": {
+    "@flg1217/dsh-mcp": "link:../dsh-mcp"
   }
 }

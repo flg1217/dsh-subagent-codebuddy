@@ -41,7 +41,7 @@ import { buildPrompt, lastUserPrompt, resumeReplayPrompt, systemInstructionsText
 import { TodoListState } from './todo-bridge.js'
 import { AttachmentsSaveFace } from './tool-image.js'
 import { AcpConnection, DEFAULT_ACP_RUN_TIMEOUTS, cliToolPolicyArgs, isProgressUpdate, usageOfUpdate } from './acp.js'
-import { mcpConfigArgs } from './mcp-server.js'
+import { mcpConfigArgs } from './mcp-config.js'
 import type { AcpPromptResult, AcpTimeouts, AcpUpdate } from './acp.js'
 import { failureOfError, formatFailureLine, isFailureOutcome, parseCodebuddyFailure } from './failure.js'
 import type { CodebuddyFailure } from './failure.js'

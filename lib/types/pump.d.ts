@@ -32,7 +32,7 @@ import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { AcpTimeouts } from './acp.js';
 import type { TodoListState } from './todo-bridge.js';
 import type { AttachmentsSaveFace } from './tool-image.js';
-import type { DshToolRunResult } from './dsh-tools-bridge.js';
+import type { DshToolRunResult } from '@flg1217/dsh-mcp';
 /** 会话面(todo 折叠/插话轮询需要 ownEvents;todo 快照写入需要 append)。 */
 export interface PumpSessionFace {
     ownEvents?: () => readonly {

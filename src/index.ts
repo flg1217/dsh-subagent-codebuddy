@@ -28,7 +28,8 @@ import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
 import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.js'
 import { registerCodebuddyModelsRoute } from './models-route.js'
-import { registerDshMcpServer } from './mcp-server.js'
+import { registerDshMcpServer } from '@flg1217/dsh-mcp'
+import { sweepStaleMcpConfigs } from './mcp-config.js'
 import type {} from '@deepseek-ai/dsh-settings'
 
 export const name = 'subagent-codebuddy'
@@ -124,12 +125,13 @@ export function apply(ctx: Context, config: Config): void {
   // 每个 CodeBuddy 进程启动前(pump/adapter)还会再同步,保证读到最新。
   syncCliIntegrations()
 
-  // dsh MCP server:把会话可见的 dsh 工具以 MCP 暴露给 CLI(bridgeMode=mcp 时
-  // spawn 以 --mcp-config 连接;动态注册/发现见 mcp-server.ts 模块头)。
+  // dsh MCP server(共享包 @flg1217/dsh-mcp):把会话可见的 dsh 工具以 MCP
+  // 暴露给 CLI(bridgeMode=mcp 时 spawn 以 --mcp-config 连接)。注册幂等:
+  // 共享包 / llm-agy / 本插件同时调用时只有第一个生效,key 不会被覆盖。
   // 用 ctx.effect 接管释放函数:插件卸载/热重载时摘掉路由并作废端点 key。
-  // (registerDshMcpServer 内部还会把路由 disposer 挂到自己的 inject 子 fiber,
-  // 这里是显式兜底——不接的话路由会一直挂在 webserver 上。)
   ctx.effect(() => registerDshMcpServer(ctx))
+  // 清扫陈旧的 --mcp-config 文件(本插件方言:文件名含会话+内容摘要、只增不删)。
+  sweepStaleMcpConfigs()
 
   // opt-in 工具的注册状态:设置面板开关实时同步(开 → 注册,关 → 注销)。
   let toolCtx: Context | undefined
