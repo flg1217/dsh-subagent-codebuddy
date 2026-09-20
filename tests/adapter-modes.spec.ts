@@ -11,7 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
 import { ConversationStore } from '../src/conversations.ts'
-import { TurnPump, resetPumpStateForTests } from '../src/pump.ts'
+import { TurnPump, INTERACTIVE_MCP_CALL_TIMEOUT_MS, resetPumpStateForTests } from '../src/pump.ts'
 import { asSpawnResult, autoHandshake, fakeAcpProc, lastFake, message, phase, sessionEnd, thought, toolCall, toolUpdate, usage } from './fake-acp.ts'
 import type { FakeAcp } from './fake-acp.ts'
 
@@ -1170,6 +1170,48 @@ describe('真工具直发(delegate → dsh 原生工具/卡片)', () => {  it('d
     expect(late).toEqual([
       { tool: 'ask_user_question', text: '{"answers":[{"id":"q1","selected":["红色"]}]}' },
     ])
+    settleFn?.()
+  }, 15_000)
+
+  it('交互式调用默认不设上限:答案提交即解析等待者,同一条对话恢复(不走迟到口)', async () => {
+    // 设计定稿(2026-09-20,用户纠正"应该提交答案时再发起对话"):真人就是时钟。
+    // 交互式调用不该被桥侧上限掐断;答案由 tool/result 解析等待者、MCP 响应把
+    // 答案直接交回 CLI 的模型继续同一条对话。30 分钟上限会把这条链提前掐断,
+    // 答案只能靠"迟到补投"绕路(实测丢过一次 61 分钟的作答)。
+    expect(INTERACTIVE_MCP_CALL_TIMEOUT_MS).toBe(0)
+    const h = makeAdapter({}, {
+      ...FAST, maxAttempts: 1, tailQuietMs: 5_000, boundaryQuietMs: 5_000,
+    })
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.update(message('段一'))
+    })
+    const firstP = step(h.adapter, makeOptions('s1'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const pump = TurnPump.forSession('s1')!
+    const late: Array<{ tool: string; text: string }> = []
+    const pending = pump.dispatchMcpCall('ask_user_question', { questions: [] }, (tool, text) => {
+      late.push({ tool, text })
+    })
+    const first = await firstP
+    const block = first.find(c => c.includes('"name":"ask_user_question"') && c.includes('mcp_'))
+    expect(block).toBeDefined()
+    const callId = (JSON.parse(block!) as { block: { id: string } }).block.id
+    // 用户作答(任意晚) → 等待者直接解析为 MCP 结果;迟到口一次都不触发。
+    h.emitSessionEvent({
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          source: { kind: 'tool', callId },
+          content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: '{"answers":[{"id":"q1","selected":["蓝色"]}]}' }] }],
+        },
+      },
+    })
+    await expect(pending).resolves.toMatchObject({ output: '{"answers":[{"id":"q1","selected":["蓝色"]}]}' })
+    expect(late).toEqual([])
     settleFn?.()
   }, 15_000)
 

@@ -83,8 +83,10 @@ export interface AcpTimeouts {
    */
   mcpCallTimeoutMs?: number
   /**
-   * 交互式工具(等真人作答,如 ask_user_question)的转发兜底超时(毫秒,
-   * 默认 30 分钟;<=0 用默认)。宽松的原因见 pump.ts 常量处的说明。
+   * 交互式工具(等真人作答,如 ask_user_question)的转发兜底超时(毫秒)。
+   * **默认不设上限**(未配置或 <=0 = 不超时):真人就是时钟,答案提交时解析
+   * 等待者、直接把答案交回 CLI 的模型继续对话;>0 才按该值计时。
+   * 取舍理由见 pump.ts 的 {@link INTERACTIVE_MCP_CALL_TIMEOUT_MS} 说明。
    */
   interactiveMcpCallTimeoutMs?: number
   /**
