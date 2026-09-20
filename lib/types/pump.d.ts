@@ -33,6 +33,31 @@ import type { AcpTimeouts } from './acp.js';
 import type { TodoListState } from './todo-bridge.js';
 import type { AttachmentsSaveFace } from './tool-image.js';
 import type { DshToolRunResult } from '@flg1217/dsh-mcp';
+/**
+ * 泵释放后继续盯一条迟到结果(独立于泵的一次性订阅)。
+ *
+ * MCP 调用转发超时/回合收尾时,工具可能仍在 loop 侧执行;其结果到达时泵已
+ * 释放、事件订阅已被摘除——若不接管,"真实结果"永远不会进会话(CLI 收到的
+ * 只有超时错误,交互式工具的回答更是无人接续)。这里用一次性 session/event
+ * 订阅盯到该 callId 的 tool/result 即补投,超过 TTL 无果自动摘除(防泄漏)。
+ *
+ * **TTL 必须覆盖"真人作答"的时长**(2026-09-20 实测事故):`ask_user_question`
+ * 转发 1800s 超时后,泵随即释放并把这条转给本订阅;用户 61 分钟后才作答,
+ * 而当时的 TTL 只有 10 分钟——订阅早已自毁,答案落地进会话但**从未到达 CLI
+ * 的模型**(下一步补发只剩"继续完成之前未完成的任务"框架文本,模型以为消息
+ * 丢了)。24h 的代价只是每条超时调用一个闭包+订阅(事件本就罕见),远小于
+ * 丢一条真人答案的代价。
+ */
+export declare const LATE_MCP_RESULT_TTL_MS: number;
+/**
+ * @param ctx - 插件上下文(事件面)。
+ * @param sessionId - 目标 dsh 会话。
+ * @param callId - 等待中的调用 id。
+ * @param toolName - 工具名(补投文案)。
+ * @param sink - 补投口(经会话注入把结果交给模型)。
+ * @param ttlMs - 订阅存活时长(测试可注入;默认 {@link LATE_MCP_RESULT_TTL_MS})。
+ */
+export declare function watchLateMcpResult(ctx: Context, sessionId: string, callId: string, toolName: string, sink?: (toolName: string, text: string) => void, ttlMs?: number): void;
 /** 会话面(todo 折叠/插话轮询需要 ownEvents;todo 快照写入需要 append)。 */
 export interface PumpSessionFace {
     ownEvents?: () => readonly {
