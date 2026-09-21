@@ -4,8 +4,9 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { spawn } from 'node:child_process'
-import { asSpawnResult, autoHandshake, fakeAcpProc } from './fake-acp.ts'
+import { asSpawnResult, autoHandshake, fakeAcpProc, message } from './fake-acp.ts'
 import { makeRecordingAdapter } from './recording-fixture.ts'
+import type { RecordedEvent } from './recording-fixture.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -147,5 +148,95 @@ describe('adapter(ACP):失败原因透出', () => {
     const chunks = await drainFail(adapter, 's-ok')
     expect(chunks.at(-1)?.reason?.kind).toBe('stop')
     expect(mockedSpawn).toHaveBeenCalledTimes(1)
+  }, 15_000)
+})
+
+/** 从记录的事件里取 assistant/message 的纯文本(只可能是插件补写的)。 */
+function closingTexts(events: readonly RecordedEvent[]): string[] {
+  return events
+    .filter(event => event.type === 'assistant/message')
+    .map((event) => {
+      const blocks = (event.data as { message?: { content?: readonly { type: string; text?: string }[] } })
+        .message?.content ?? []
+      return blocks.filter(block => block.type === 'text').map(block => block.text ?? '').join('')
+    })
+}
+
+describe('子代理失败的临终遗言(失败原因必须回到主代理)', () => {
+  it('零产出失败 → 补一条带原因的 assistant/message', async () => {
+    // 事故(2026-09-21 用户报障):子代理 401 失败,主代理只收到
+    // "Background subagent X failed before it finished. / It left no closing
+    // message." —— dsh 的结算通知只带通用结论 + 子代理最后一条 assistant 消息,
+    // 而硬失败时 agent-loop 直接 throw、不产生 assistant 消息,原因整条丢失。
+    // 补写这条后 AssistantOutputFold 会选中它,原因随通知回主代理。
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(msg => {
+        if (msg.method === 'session/prompt') {
+          setTimeout(() => {
+            p.respond(msg.id, {
+              stopReason: 'refusal',
+              _meta: { 'codebuddy.ai/errorMessage': QUOTA_JSON, 'codebuddy.ai/traceId': 't-2' },
+            })
+          }, 5)
+        }
+      })
+      return asSpawnResult(p)
+    })
+    const { adapter, events } = makeRecordingAdapter({ maxAttempts: 1, retryDelayMs: 10 })
+    const chunks = await drainFail(adapter, 's-child-fail')
+    expect(chunks.at(-1)?.reason?.kind).toBe('error')
+    const texts = closingTexts(events)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('CodeBuddy 回合失败')
+    expect(texts[0]).toContain('category=quota')
+  }, 15_000)
+
+  it('主会话失败 → 不补(UI 已有"本轮运行失败"卡,补写只会污染转录)', async () => {
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(msg => {
+        if (msg.method === 'session/prompt') {
+          setTimeout(() => {
+            p.respond(msg.id, {
+              stopReason: 'refusal',
+              _meta: { 'codebuddy.ai/errorMessage': QUOTA_JSON },
+            })
+          }, 5)
+        }
+      })
+      return asSpawnResult(p)
+    })
+    const { adapter, events } = makeRecordingAdapter({ maxAttempts: 1, retryDelayMs: 10, mainSession: true })
+    const chunks = await drainFail(adapter, 's-main-fail')
+    expect(chunks.at(-1)?.reason?.kind).toBe('error')
+    expect(closingTexts(events)).toHaveLength(0)
+  }, 15_000)
+
+  it('失败前已有文本 → 不补(agent-loop 的 assistant/attempt 流文本才是临终遗言)', async () => {
+    // AssistantOutputFold 优先选 assistant/message;此时补写会把真实的
+    // 半截产出顶掉,通知里只剩失败原因、丢掉子代理已经干出来的活。
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      autoHandshake(p)
+      p.onRequest(msg => {
+        if (msg.method === 'session/prompt') {
+          setTimeout(() => p.update(message('正在处理')), 5)
+          setTimeout(() => {
+            p.respond(msg.id, {
+              stopReason: 'refusal',
+              _meta: { 'codebuddy.ai/errorMessage': QUOTA_JSON },
+            })
+          }, 30)
+        }
+      })
+      return asSpawnResult(p)
+    })
+    const { adapter, events } = makeRecordingAdapter({ maxAttempts: 1, retryDelayMs: 10 })
+    const chunks = await drainFail(adapter, 's-child-partial')
+    expect(chunks.at(-1)?.reason?.kind).toBe('error')
+    expect(closingTexts(events)).toHaveLength(0)
   }, 15_000)
 })

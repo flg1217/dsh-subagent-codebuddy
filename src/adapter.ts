@@ -299,8 +299,9 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     if (options.purpose === undefined && sessionId !== undefined) {
       const session = this.ctx.get('sessions')?.get(sessionId) as TurnSessionFace | undefined
       const ownEvents = (session?.ownEvents?.() ?? []) as unknown as readonly SessionEvent[]
-      if (session !== undefined && findOpenStep(ownEvents) !== undefined) {
-        const started = await this.startTurn(options, sessionId, session)
+      const openStep = findOpenStep(ownEvents)
+      if (session !== undefined && openStep !== undefined) {
+        const started = await this.startTurn(options, sessionId, session, openStep)
         if (started.kind === 'skip') {
           // 本 step 输入全是「已插话投递」的消息:模型已在运行中读到并处理过它,
           // 重启 CLI 再补发 CONTINUE_PROMPT 会把模型从插话上拽回旧任务(实测
@@ -330,6 +331,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     options: GenerateOptions,
     sessionId: string,
     childSession: TurnSessionFace,
+    turnStep: { turn: number; step: number },
   ): Promise<{ kind: 'skip' } | { kind: 'pump'; pump: TurnPump }> {
     const existing = TurnPump.forSession(sessionId)
     if (existing !== undefined) return { kind: 'pump', pump: existing }
@@ -436,10 +438,12 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
           ? {}
           : { append: (type: string, data: unknown) => childSession.append?.(type, data) },
       },
+      turnStep,
       childSession: {
         header: {
           ...childSession.header.agentPreset === undefined ? {} : { agentPreset: childSession.header.agentPreset },
           ...childSession.header.delegationDepth === undefined ? {} : { delegationDepth: childSession.header.delegationDepth },
+          ...childSession.header.parentSession === undefined ? {} : { parentSession: childSession.header.parentSession },
         },
       },
       attachmentsOf: () => attachments,

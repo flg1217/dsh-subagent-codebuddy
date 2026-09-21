@@ -123,11 +123,20 @@ export interface PumpHost {
     forgetConversation: () => void;
     sentCount: number;
     session?: PumpSessionFace;
+    /**
+     * 本回合打开着的 turn/step(adapter 用 `findOpenStep` 从会话事件算出)。
+     * 补写 `assistant/message` 要用它对齐会话事件的字段。
+     */
+    turnStep?: {
+        turn: number;
+        step: number;
+    };
     /** 子会话 header(镜像用)。 */
     childSession?: {
         header?: {
             agentPreset?: string;
             delegationDepth?: number;
+            parentSession?: string;
         };
     };
     attachmentsOf: () => AttachmentsSaveFace | undefined;
@@ -394,6 +403,28 @@ export declare class TurnPump {
     private finishTurn;
     /** 失败:首段无产出 → 重启;否则整体失败(消费方抛出,loop 收错误回合)。 */
     private failRun;
+    /**
+     * 子代理会话的「临终遗言」:零产出失败时补一条 assistant 文本,让失败原因
+     * 随 dsh 的结算通知回到主代理。
+     *
+     * **为什么必须补**(2026-09-21 实测):dsh 的通知构造
+     * (`subagent/src/continuation-messages.ts`)只带一句通用结论 + 子代理**最后一
+     * 条 assistant 消息**;而硬失败(401/配额/传输错)时 agent-loop 直接
+     * `throw LlmError`,不产生 assistant 消息 → 主代理只收到
+     * "Background subagent X failed before it finished. / It left no closing
+     * message.",**失败原因整条丢失**(用户报障:子代理错误完全没反馈)。
+     * 补写后 `AssistantOutputFold` 会选中它,通知里出现 "Its closing message:
+     * CodeBuddy 中断:…401…"。
+     *
+     * **两道闸门**:
+     * - 只在**子会话**(header.parentSession 存在)补:主会话的失败 UI 本来就有
+     *   "本轮运行失败"卡,补一条"模型没说过的话"只会污染转录。
+     * - 只在**本回合零文本产出**时补:`hasText` 为真时 agent-loop 的
+     *   `assistant/attempt` 流文本已经是临终遗言,而 `AssistantOutputFold`
+     *   优先选 `assistant/message`——补写会把它顶掉。
+     * @param error - 本回合的失败(已含可读原因,如 failure.ts 分类后的文案)。
+     */
+    private appendFailureClosingMessage;
     /** 重启资格:失败可续跑、仍是首段、本回合无任何产出、还有重试次数。 */
     private canRestart;
     private restart;

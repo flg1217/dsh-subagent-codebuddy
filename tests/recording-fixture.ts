@@ -22,6 +22,8 @@ export function makeRecordingAdapter(opts?: {
   maxAttempts?: number
   /** 重试间隔毫秒(默认 3s;测试传小值)。 */
   retryDelayMs?: number
+  /** 造主会话(header 不带 parentSession):验证"只给子代理补临终遗言"。 */
+  mainSession?: boolean
 }): {
   adapter: CodebuddyLlmAdapter
   events: RecordedEvent[]
@@ -43,7 +45,9 @@ export function makeRecordingAdapter(opts?: {
   record('step/start', { turn: 1, step: 1 })
 
   const session = {
-    header: { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
+    header: opts?.mainSession === true
+      ? { cwd: process.cwd(), origin: 'user' }
+      : { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
     append: (type: string, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: readonly number[] }) => {
       record(type, data, opts)
       return { seq: events.length - 1 }
