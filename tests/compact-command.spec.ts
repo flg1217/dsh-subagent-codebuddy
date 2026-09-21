@@ -96,12 +96,18 @@ function makeDeps(compaction?: unknown): CompactCommandDeps & { store: Conversat
   }
 }
 
-function makeInvocation(sessionId: string, rawInput = ''): CompactInvocation {
+function makeInvocation(sessionId: string, rawInput = '', provider?: string): CompactInvocation {
   return {
     commandId: 'cmd-1',
     rawInput,
     signal: new AbortController().signal,
-    agent: { session: { id: sessionId, header: { cwd: process.cwd() } } },
+    agent: {
+      session: {
+        id: sessionId,
+        header: { cwd: process.cwd() },
+        ...provider === undefined ? {} : { requestHeader: () => ({ config: { provider } }) },
+      },
+    },
   }
 }
 
@@ -177,11 +183,15 @@ describe('handleCompactCommand:分流', () => {
   /** 带 runMaintenance 面的 invocation(模拟真实 agent:进入 maintenance 后消息排队)。 */
   function makeMaintenanceInvocation(
     sessionId: string,
-    options?: { fail?: boolean },
+    options?: { fail?: boolean; provider?: string },
   ): { invocation: CompactInvocation; state: { calls: number } } {
     const state = { calls: 0 }
     const agent = {
-      session: { id: sessionId, header: { cwd: process.cwd() } },
+      session: {
+        id: sessionId,
+        header: { cwd: process.cwd() },
+        requestHeader: () => ({ config: { provider: options?.provider ?? 'codebuddy' } }),
+      },
       runMaintenance: async <T>(job: (signal: AbortSignal) => Promise<T>): Promise<T> => {
         state.calls += 1
         if (options?.fail === true) throw new Error(`agent "${sessionId}" already has active work`)
@@ -213,10 +223,27 @@ describe('handleCompactCommand:分流', () => {
     const compactNow = vi.fn()
     const deps = makeDeps({ compactNow })
     deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })
-    const result = await handleCompactCommand(deps, makeInvocation('s-1'))
+    const result = await handleCompactCommand(deps, makeInvocation('s-1', '', 'codebuddy'))
     expect(result.kind).toBe('success')
     expect(prompts).toEqual(['/compact'])
     expect(compactNow).not.toHaveBeenCalled()
+  })
+
+  it('回归:切走 provider 后手动 /compact 回落 dsh(不按会话映射判定)', async () => {
+    // 事故(2026-09-21 用户报障):会话**先跑过 codebuddy**(映射记录持久化),
+    // 之后切到 cpa。手动 /compact 当时用 `conversations.get(sessionId)` 当判据
+    // → 仍被判成 codebuddy 会话 → 转发 CLI(CLI 侧 401)→ 压缩什么都没发生,
+    // 会话里一条 compaction/* 都没有。自动路径早已改成按路由判定,手动路径漏改。
+    // 判据必须与自动路径统一:最新一次请求的路由 provider。
+    mockCompactCli()
+    const compactNow = vi.fn().mockResolvedValue({ shadowedSeqs: [1], shadowedTokenCount: 999 })
+    const deps = makeDeps({ compactNow })
+    deps.store.set('s-1', { acpId: 'cb-1', sentCount: 1 })   // 映射记录仍在
+    const result = await handleCompactCommand(deps, makeInvocation('s-1', '', 'cpa'))
+    expect(result.kind).toBe('success')
+    if (result.kind === 'success') expect(result.text).toContain('999')
+    expect(compactNow).toHaveBeenCalledTimes(1)
+    expect(mockedSpawn).not.toHaveBeenCalled()
   })
 
   it('非 codebuddy 会话 → 回落 dsh 压缩(行为不变)', async () => {

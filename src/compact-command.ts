@@ -530,7 +530,13 @@ export async function handleCompactCommand(
     return { kind: 'error', text: 'Usage: /compact (no arguments)' }
   }
   const sessionId = invocation.agent.session.id
-  if (deps.conversations.get(sessionId) === undefined) return await dshCompact(deps, invocation)
+  // 判据与自动路径(`compactIfNeeded` 覆盖)**统一**:按最新一次请求的路由
+  // provider 判定,而不是按会话映射。会话映射在"codebuddy 会话切回别的
+  // provider"之后依然存在,拿它当判据会把**原生会话**的 /compact 转发给 CLI
+  // (实测 2026-09-21 用户报障:原生会话压缩被交给 codebuddy,CLI 侧 401 时
+  // 压缩静默失败、会话里一条 compaction/* 事件都没有)。理由与 isCodebuddyOwned
+  // 的注释同源。
+  if (!isCodebuddyOwned(deps, invocation.agent)) return await dshCompact(deps, invocation)
   const cwd = invocation.agent.session.header.cwd ?? process.cwd()
   const agent = invocation.agent as unknown as MaintenanceAgentFace
   if (agent.runMaintenance === undefined) return await forwardCompactToCli(deps, sessionId, cwd, invocation.signal)
