@@ -262,6 +262,23 @@ describe('handleCompactCommand:分流', () => {
     expect(result.kind).toBe('error')
   })
 
+  it('压缩失败的回执要带 cause 链(dsh 的包装层会吞掉真因)', async () => {
+    // 实测(2026-09-22 用户报障):回执只有 "manual compaction could not produce a
+    // smaller summary",而会话里 compaction/end.error 记的是真因
+    // "upstream stream closed before a terminal event" —— 真因被 ManualCompactionError
+    // 的 cause 吞了。回执必须把整条链带出来,否则用户只能看到一句无信息量的包装文案。
+    const cause = new Error('upstream stream closed before a terminal event')
+    const wrapped = new Error('manual compaction could not produce a smaller summary', { cause })
+    const compactNow = vi.fn().mockRejectedValue(wrapped)
+    const deps = makeDeps({ compactNow })
+    const result = await handleCompactCommand(deps, makeInvocation('plain-session'))
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.text).toContain('could not produce a smaller summary')
+      expect(result.text).toContain('upstream stream closed before a terminal event')
+    }
+  })
+
   it('压缩跑在 agent 的 maintenance 相位里(消息排队,不抢跑)', async () => {
     const { prompts } = mockCompactCli()
     const deps = makeDeps()
