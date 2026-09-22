@@ -366,6 +366,12 @@ export declare class TurnPump {
      * 已投 id 挤出后会重复投递旧消息;增量扫描同时解决性能与重投。
      */
     private lastScannedIndex;
+    /**
+     * 上次 steer 轮询停摆的原因(空 = 在轮询)。只在**状态变化**时写一行诊断,
+     * 否则每 1.2s 刷一条。2026-09-22「插队消息收不到」排查时缺的就是这个:
+     * 轮询到底有没有在跑、被哪个守卫挡住,当时完全没有落盘痕迹。
+     */
+    private lastSteerBail;
     /** 悬挂折叠的短路键(events 长度 + 尾 seq):未变化则复用上轮折叠结果。 */
     private lastFoldKey;
     /** 上轮折叠出的悬挂插入(events 未变化时复用)。 */

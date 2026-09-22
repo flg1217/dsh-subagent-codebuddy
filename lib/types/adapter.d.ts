@@ -32,11 +32,6 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { ConversationStore } from './conversations.js';
 import type { AcpTimeouts } from './acp.js';
 /**
- * 插话链路诊断日志(临时):`~/.dsh/codebuddy/steer-debug.log`。
- * 静默失败会让"点了插话没反应"无从定位,这里把每次轮询的判定写盘。
- */
-export declare function steerDebug(line: string): void;
-/**
  * 会话中最后一个已打开(尚无配对 step/end)的 turn/step。
  *
  * 它是「调用方是 agent-loop 的对话轮」的判据:只有这种调用才走回合泵

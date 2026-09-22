@@ -57,6 +57,7 @@ import {
 } from '@flg1217/dsh-mcp'
 import type { DshToolRunResult } from '@flg1217/dsh-mcp'
 import { syncCliIntegrations } from './cli-integrations.js'
+import { steerDebug } from './steer-debug.js'
 import { mcpConfigArgs } from './mcp-config.js'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
@@ -561,6 +562,12 @@ export class TurnPump {
    * 已投 id 挤出后会重复投递旧消息;增量扫描同时解决性能与重投。
    */
   private lastScannedIndex = -1
+  /**
+   * 上次 steer 轮询停摆的原因(空 = 在轮询)。只在**状态变化**时写一行诊断,
+   * 否则每 1.2s 刷一条。2026-09-22「插队消息收不到」排查时缺的就是这个:
+   * 轮询到底有没有在跑、被哪个守卫挡住,当时完全没有落盘痕迹。
+   */
+  private lastSteerBail = ''
   /** 悬挂折叠的短路键(events 长度 + 尾 seq):未变化则复用上轮折叠结果。 */
   private lastFoldKey = ''
   /** 上轮折叠出的悬挂插入(events 未变化时复用)。 */
@@ -1938,7 +1945,23 @@ export class TurnPump {
     const now = Date.now()
     if (now - this.lastSteerPoll < this.steerPollMs) return
     this.lastSteerPoll = now
-    if (this.aborted || this.acpSessionId === '' || this.conn === undefined) return
+    // 停摆原因只记状态跳变,避免每轮一条刷屏(见 lastSteerBail 注释)。
+    const bail = this.aborted
+      ? 'aborted'
+      : this.acpSessionId === ''
+        ? 'no-acp-session'
+        : this.conn === undefined ? 'no-conn' : ''
+    if (bail !== '') {
+      if (this.lastSteerBail !== bail) {
+        this.lastSteerBail = bail
+        steerDebug(`steer 轮询停摆 session=${this.deps.dshSessionId} 原因=${bail}`)
+      }
+      return
+    }
+    if (this.lastSteerBail !== '') {
+      steerDebug(`steer 轮询恢复 session=${this.deps.dshSessionId}(此前停摆=${this.lastSteerBail})`)
+      this.lastSteerBail = ''
+    }
     try {
       const events = this.deps.session?.ownEvents?.() ?? []
       // 首次:用锚点/构造时间定位回合内新注入的水位线;之后**增量**推进
@@ -1969,6 +1992,8 @@ export class TurnPump {
         if (typeof data?.id !== 'string' || data.id.length === 0) continue
         const text = textOfContent(data.content)
         if (text.trim().length === 0) continue
+        steerDebug(`steer 扫描命中 session=${this.deps.dshSessionId} id=${data.id}`
+          + ` text=${JSON.stringify(text.slice(0, 40))}`)
         this.steerMessage(data.id, text)
       }
       this.lastScannedIndex = events.length
@@ -1999,15 +2024,25 @@ export class TurnPump {
    * inFlightForwards 防重复发起。
    */
   private steerMessage(id: string, text: string): void {
-    if (this.inFlightForwards.has(id) || this.deps.isForwarded?.(id) === true) return
+    if (this.inFlightForwards.has(id) || this.deps.isForwarded?.(id) === true) {
+      steerDebug(`steer 跳过(已投/在飞)id=${id}`)
+      return
+    }
     const conn = this.conn
-    if (conn === undefined) return
+    if (conn === undefined) {
+      steerDebug(`steer 放弃(无连接,留给下回合补发)id=${id}`)
+      return
+    }
     this.inFlightForwards.add(id)
     const fallback = (): void => {
       this.inFlightForwards.delete(id)
       const current = this.conn
       // 连接已散:不标记,留给下回合补发。
-      if (current === undefined) return
+      if (current === undefined) {
+        steerDebug(`steer 回退失败(连接已散,不标记)id=${id}`)
+        return
+      }
+      steerDebug(`steer 回退为独立 prompt id=${id}`)
       this.deps.markForwarded(id)
       // sendPrompt 请求层失败(连接抖动)时回滚标记:重试/下回合补发仍会带上。
       void this.sendPrompt(text, []).then(ok => {
@@ -2023,11 +2058,16 @@ export class TurnPump {
         if (result?.steered === true) {
           this.inFlightForwards.delete(id)
           this.deps.markForwarded(id)
+          steerDebug(`steer 成功(ACP session/steer)id=${id}`)
           return
         }
+        steerDebug(`steer 被拒(steered=${String(result?.steered)})id=${id}`)
         fallback()
       },
-      () => fallback(),
+      (error: unknown) => {
+        steerDebug(`steer 请求失败 id=${id} err=${String(error).slice(0, 120)}`)
+        fallback()
+      },
     )
   }
 

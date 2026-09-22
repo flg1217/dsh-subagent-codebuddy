@@ -29,8 +29,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
 import { appendFileSync, mkdirSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { steerDebug } from './steer-debug.js'
 import { ReasoningEffortId, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -92,18 +93,6 @@ function throwFailure(prefix: string, failure: CodebuddyFailure | undefined, suf
   const message = `${prefix}${formatFailureLine(failure, suffix)}`
   if (failure.retryable) throw new RetryableError(message)
   throw new Error(message)
-}
-
-/**
- * 插话链路诊断日志(临时):`~/.dsh/codebuddy/steer-debug.log`。
- * 静默失败会让"点了插话没反应"无从定位,这里把每次轮询的判定写盘。
- */
-export function steerDebug(line: string): void {
-  try {
-    mkdirSync(join(homedir(), '.dsh', 'codebuddy'), { recursive: true })
-    appendFileSync(join(homedir(), '.dsh', 'codebuddy', 'steer-debug.log'),
-      `${new Date().toISOString()} ${line}\n`)
-  } catch { /* 诊断不影响主流程 */ }
 }
 
 /** listModels 成功缓存时长。 */
