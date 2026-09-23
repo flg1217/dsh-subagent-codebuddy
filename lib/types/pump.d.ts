@@ -361,21 +361,24 @@ export declare class TurnPump {
      */
     private readonly lateMcpCalls;
     /**
-     * 增量扫描水位:timeline(events 只 append)已处理到的下标;-1 = 未初始化。
-     * 早前每轮从锚点全量重扫,长回合里 markForwarded(256 条上限)把最早的
-     * 已投 id 挤出后会重复投递旧消息;增量扫描同时解决性能与重投。
+     * 待投递的插话(id → 文本):**事件驱动探测 + 显式重试**。
+     *
+     * ## 为什么不再用轮询 + 水位线(2026-09-22 用户报障后重写)
+     * 旧实现靠定时轮询,并用水位线在 `ownEvents()` 里**按下标增量扫描**已 claim 的
+     * `user/message`。用户报障「插队消息收不到」时:dsh 侧消息被正常 claim 进 step
+     * 输入,CLI 侧一个字都没到,而轮询/水位线那套**不落任何痕迹**,只能读源码猜。
+     * 更根本的是,下标水位线依赖一个隐含前提——"泵读到的 events 视图会持续增长"。
+     * 一旦该视图冻结(或轮询被守卫长期挡住),扫描就**永久跳过**新消息且毫无症状。
+     *
+     * ## 现在的分工
+     * - **探测**:订阅 `session/event`(泵本来就有该订阅,见 subscribeSessionEvents)。
+     *   事件到达即入队 —— 不依赖 ownEvents() 视图、不依赖水位线、不依赖轮询周期。
+     * - **投递**:入队后立刻尝试 steer;无连接/在飞就**留在队列里**,由 tick 重试,
+     *   直到投出或回合结束。投不出就是投不出,不会静默消失(steer-debug 有痕迹)。
      */
-    private lastScannedIndex;
-    /**
-     * 上次 steer 轮询停摆的原因(空 = 在轮询)。只在**状态变化**时写一行诊断,
-     * 否则每 1.2s 刷一条。2026-09-22「插队消息收不到」排查时缺的就是这个:
-     * 轮询到底有没有在跑、被哪个守卫挡住,当时完全没有落盘痕迹。
-     */
-    private lastSteerBail;
-    /** 悬挂折叠的短路键(events 长度 + 尾 seq):未变化则复用上轮折叠结果。 */
-    private lastFoldKey;
-    /** 上轮折叠出的悬挂插入(events 未变化时复用)。 */
-    private lastFolded;
+    private readonly pendingSteers;
+    /** 本轮"投不出去"是否已写过诊断(连接恢复后复位,避免每 tick 刷屏)。 */
+    private steerBlockedLogged;
     private readonly tickTimer;
     private wake;
     /** 外部 abort(agent-loop 的回合信号)。 */
@@ -520,7 +523,7 @@ export declare class TurnPump {
     private openSegment;
     private closeOpenBlock;
     private closeSegment;
-    /** 心跳:steer 轮询 → 看门狗 → 收段判定 → tail 收尾。 */
+    /** 心跳:插话重试 → 看门狗 → 收段判定 → tail 收尾。 */
     private tick;
     /**
      * 疑似卡住时的现场诊断:真实活动静默 >20s 且回合未收尾时,每 30s 打一行
@@ -536,23 +539,25 @@ export declare class TurnPump {
     private stall;
     private armProgress;
     /**
-     * 回合内生**所有**未投递的新 user/message → ACP `session/steer`(下一个内部
-     * 边界注入)。
+     * 入队一条待投递的插话/注入,并立刻尝试投递。
      *
-     * 对齐官方架构:dsh 原生链路里 agent-loop 每个 step 都重新组装 messages
-     * (含本步前新注入的一切——用户插话、子代理结算通知、agent 间消息、插件
-     * 上下文:UI 上显示为"上下文注入"),模型每步都看得到。codebuddy 链路的
-     * prompt 只在回合开始发一次,回合中途的新消息没有重发通道——实测漏投后果:
-     * 子代理做完并结算,主代理同回合内永远收不到通知,一直"等待"到下个回合。
-     *
-     * 两个来源都要覆盖:inbox 悬挂(next-step 未 claim,毫秒级 step 边界 claim
-     * 前就被轮询抢到的窗口)与已 claim 的 `user/message`(timeline 里的正式
-     * 消息——claim 发生在 step 边界,1.2s 轮询窗口内几乎必然已被 claim)。
-     * 统一按 id 去重(markForwarded):下回合补发时由 skipIds 再兜一次不重复。
+     * 探测来自 `session/event`(见 onSessionEvent):回合中途新注入的一切
+     * ——用户插话、子代理结算通知、agent 间消息、插件上下文(UI 上显示为
+     * "上下文注入")——模型每步都该看到,而 codebuddy 链路的 prompt 只在回合
+     * 开始发一次,中途没有重发通道(实测漏投后果:子代理做完并结算,主代理
+     * 同回合内永远收不到通知,一直"等待"到下个回合)。
+     * @param id - 消息 id(与 `user/message` 事件同 id,用于去重)。
+     * @param text - 文本内容(空白串不入队)。
      */
-    private pollInsertions;
-    /** 回合内新注入的水位线:发送锚点之后;锚点不可用时按构造时间。 */
-    private insertionFloorIndex;
+    private queueSteer;
+    /**
+     * 重试队列里的每一条待投递。
+     *
+     * 由 tick 按 `steerPollMs` 节流驱动:投不出去(无连接/在飞)就留在队列里,
+     * 下轮再试——**这是"投不出"与"静默消失"的分界**。旧的轮询扫描在守卫挡住时
+     * 只是 return,消息再也无人过问。
+     */
+    private flushPendingSteers;
     /**
      * 单条消息的 steer 投递。
      *
@@ -562,6 +567,8 @@ export declare class TurnPump {
      * inFlightForwards 防重复发起。
      */
     private steerMessage;
+    /** 投递成功:落去重标记并从重试队列摘除。 */
+    private markDelivered;
     private replayTodos;
     private emitTodo;
     private landTodo;

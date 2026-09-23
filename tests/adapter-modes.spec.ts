@@ -78,10 +78,6 @@ function makeAdapter(
   toolsHooks?: { registerThrowsOnce?: boolean },
 ): Harness {
   const appended: Array<{ type: string; data: unknown; opts?: unknown }> = []
-  const events: Array<{ type: string; data?: unknown }> = [
-    { type: 'turn/start', data: { turn: 1 } },
-    ...(shape.openStep === false ? [] : [{ type: 'step/start', data: { turn: 1, step: 1 } }]),
-  ]
   const createdMetas: Array<Record<string, unknown> | undefined> = []
   const shadowEvents: Array<{ type: string; data: unknown }> = []
   const savedImages: Array<{ mediaType: string; bytes: number }> = []
@@ -90,6 +86,30 @@ function makeAdapter(
   const promptParams: Array<Record<string, unknown>> = []
   /** 会话事件通道:pump 订阅 session/event(真工具直发的结果交付)。 */
   const sessionEventHandlers = new Set<(...args: unknown[]) => void>()
+  /**
+   * 会话自身事件。**push 会同时触发 `session/event`** —— 与生产语义一致
+   * (append 一条事件必然伴随一次 session/event 广播)。插话投递的探测是
+   * 事件驱动的,所以测试"注入一条消息"必须走这条路径,而不是只改数组。
+   */
+  const rawEvents: Array<{ type: string; data?: unknown }> = []
+  const events = new Proxy(rawEvents, {
+    get: (target, key, receiver) => {
+      if (key === 'push') {
+        return (...items: Array<{ type: string; data?: unknown }>): number => {
+          const length = target.push(...items)
+          for (const item of items) {
+            const face = { header: { id: 's1' }, id: 's1' }
+            for (const handler of [...sessionEventHandlers]) handler(face, item)
+          }
+          return length
+        }
+      }
+      return Reflect.get(target, key, receiver)
+    },
+  }) as Array<{ type: string; data?: unknown }>
+  // 调用方(agent-loop)已打开 turn/step —— 走泵路径的判据。
+  rawEvents.push({ type: 'turn/start', data: { turn: 1 } })
+  if (shape.openStep !== false) rawEvents.push({ type: 'step/start', data: { turn: 1, step: 1 } })
   const session = {
     header: shape.header ?? { cwd: process.cwd(), parentSession: 'p1', origin: 'subagent', delegationDepth: 1 },
     append: (type: string, data: unknown, opts?: unknown) => {
@@ -1430,5 +1450,84 @@ describe('回放工具的等待面', () => {
     expect(settled).toBe(false) // 仍在等待 ACP 结果
     await vi.waitFor(() => { expect(TurnPump.forSession('s1')).toBeUndefined() }, { timeout: 3_000 })
     await expect(waiting).rejects.toThrow()
+  }, 15_000)
+})
+
+describe('插话投递:事件驱动(不依赖 ownEvents 视图)', () => {
+  it('回归:消息只发 session/event、不进事件数组,也必须投出去', async () => {
+    // 事故(2026-09-22 用户报障):dsh 侧消息被正常 claim 进 step 输入,CLI 侧
+    // 一个字都没到。旧实现靠 ownEvents() 的**下标水位线**扫描探测,一旦该视图
+    // 冻结/滞后(或轮询被守卫长期挡住),消息就永久扫不到,且不产生任何症状。
+    // 新实现订阅 session/event 探测 —— 本用例刻意**不碰 h.events**,只发事件,
+    // 证明投递不再依赖那个视图。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    const steers: Array<Record<string, unknown>> = []
+    let settleFn: (() => void) | undefined
+    mockTurn((c) => {
+      settleFn = () => c.settle()
+      c.p.onRequest(msg => {
+        if (msg.method === 'session/steer') {
+          steers.push(msg.params)
+          c.p.respond(msg.id, { steered: true })
+        }
+      })
+      c.p.update(message('第一段'))
+      c.p.update(toolCall('call_1', 'Bash', { command: 'echo hi' }))
+      c.p.update(phase('tool_executing'))
+      c.p.update(toolUpdate('call_1', 'completed', 'hi'))
+      setTimeout(() => c.p.update(message('第二段')), 300)
+    })
+    await step(h.adapter, makeOptions('s1'))
+    // 只走事件通道:事件数组里没有这条,ownEvents() 看不到它。
+    h.emitSessionEvent({
+      type: 'user/message',
+      data: {
+        id: 'evt-only-1',
+        role: 'user',
+        content: [{ type: 'text', text: '视图外的插话' }],
+        source: { kind: 'user' },
+      },
+    } as never)
+    await new Promise(resolve => setTimeout(resolve, 120))
+    expect(steers.length).toBe(1)
+    expect(steers[0]).toMatchObject({ contentBlocks: [{ type: 'text', text: '视图外的插话' }] })
+    settleFn?.()
+  }, 15_000)
+
+  it('连接未就绪时不丢:入队后由 tick 重试投出', async () => {
+    // 旧实现在守卫挡住时只是 return,消息再也无人过问(静默消失)。
+    // 新实现留在 pendingSteers,连接就绪后由 tick 重试。
+    // 构造"连接未就绪"窗口:session/new 延迟 400ms 才回,这段里 acpSessionId 为空。
+    const h = makeAdapter({}, { ...FAST, maxAttempts: 1, tailQuietMs: 5_000 })
+    const steers: Array<Record<string, unknown>> = []
+    let settleFn: (() => void) | undefined
+    mockedSpawn.mockImplementation(() => {
+      const p = fakeAcpProc()
+      p.onRequest(msg => {
+        if (msg.method === 'initialize') p.respond(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: true } })
+        else if (msg.method === 'session/new') setTimeout(() => p.respond(msg.id, { sessionId: 'cb-1' }), 400)
+        else if (msg.method === 'session/load') p.respond(msg.id, {})
+        else if (msg.method === 'session/steer') {
+          steers.push(msg.params)
+          p.respond(msg.id, { steered: true })
+        } else if (msg.method === 'session/prompt') settleFn = () => p.respond(msg.id, { stopReason: 'end_turn' })
+      })
+      setTimeout(() => p.update(message('处理中')), 10)
+      setTimeout(() => p.update(toolCall('call_1', 'Bash', { command: 'echo hi' })), 700)
+      setTimeout(() => p.update(phase('tool_executing')), 710)
+      setTimeout(() => p.update(toolUpdate('call_1', 'completed', 'hi')), 720)
+      return asSpawnResult(p)
+    })
+    const pending = step(h.adapter, makeOptions('s1'))
+    // 等泵建起来(订阅已装),但握手还没完成 —— 此刻投递必须**入队**而不是丢弃。
+    await vi.waitFor(() => { expect(TurnPump.forSession('s1')).toBeDefined() }, { timeout: 2_000 })
+    h.emitSessionEvent({
+      type: 'user/message',
+      data: { id: 'early-1', role: 'user', content: [{ type: 'text', text: '早到的插话' }], source: { kind: 'user' } },
+    } as never)
+    await pending
+    await vi.waitFor(() => { expect(steers.length).toBe(1) }, { timeout: 3_000 })
+    expect(steers[0]).toMatchObject({ sessionId: 'cb-1', contentBlocks: [{ type: 'text', text: '早到的插话' }] })
+    settleFn?.()
   }, 15_000)
 })
