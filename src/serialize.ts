@@ -11,6 +11,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import type { ImageReadGuidance } from './pump.js'
 
 /** 续跑兜底:仅当没有可补发内容时使用。 */
 export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推进直到任务完全完成或遇到必须用户决策的阻塞——不要每轮只做一小步就停下汇报。基于当前工作区状态继续,不要重复已完成的工作;全部完成后给出最终结果报告。启动 dev server 等长驻进程时必须用 dsh_bash 的 run_in_background: true 参数后台运行——前台运行永不返回会卡死整个任务。'
@@ -22,14 +23,24 @@ export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推�
  * 告诉模型原生工具一律不可用、对等能力走哪套 dsh 名字。放在 system 位置
  * (权威)而不是只靠每条 prompt 尾注——CLI 内置提示词在 user 位置的指令
  * 面前占优,实测尾注拦不住模型直调原生 Bash/Edit。
+ * @param bridgeMode - 工具桥接模式(决定工具名前缀)。
+ * @param guidance - 读图引导:多模态模型用原生 read_image(图片直进上下文),
+ *   仅文本模型用 read_image_agy(AGY 转述)。
+ * @returns 工具路由说明全文。
  */
-function toolRoutingNote(bridgeMode: 'mcp' | 'delegate'): string {
+function toolRoutingNote(bridgeMode: 'mcp' | 'delegate', guidance: ImageReadGuidance): string {
   const target = bridgeMode === 'mcp'
     ? '对等能力一律用 MCP 工具(mcp__dsh__bash、mcp__dsh__pwsh、mcp__dsh__read、mcp__dsh__read_image、mcp__dsh__edit、mcp__dsh__write、mcp__dsh__glob、mcp__dsh__grep)'
     : '对等能力一律用 dsh 前缀版本(dsh_bash、dsh_pwsh、dsh_read、dsh_read_image、dsh_edit、dsh_write、dsh_glob、dsh_grep)'
+  const prefix = bridgeMode === 'mcp' ? 'mcp__dsh__' : 'dsh_'
+  const imageLine = guidance === 'native'
+    ? `读图片用 ${prefix}read_image:结果以图片卡片呈现给用户,并作为图片直接进入你的上下文(你的模型原生支持图片输入)——不要用 ${prefix}read_image_agy 让 AGY 转述。`
+    : guidance === 'agy'
+      ? `读图片一律用 ${prefix}read_image_agy:AGY 读图后以文字描述返回(可用 prompt 指定关注点);你的模型是纯文本模型,${prefix}read_image 会被拒绝,不要尝试。`
+      : '读图片:本会话没有可用的读图工具(模型不支持图片输入且未启用 AGY 读图)——需要读图时如实告知用户。'
   return [
     '[工具路由(本环境强制)]',
-    `CLI 原生工具(含 Bash/PowerShell/Read/Edit/Write/NotebookEdit/Glob/Grep)已**全部禁用**:${target}——它们在 dsh 侧执行,受审批/沙箱约束,进会话日志与后台任务面板;调用不存在的原生工具会失败,不要换别的方式绕过。读图片用 read_image:结果以图片卡片呈现给用户,并作为图片进入你的上下文。`,
+    `CLI 原生工具(含 Bash/PowerShell/Read/Edit/Write/NotebookEdit/Glob/Grep)已**全部禁用**:${target}——它们在 dsh 侧执行,受审批/沙箱约束,进会话日志与后台任务面板;调用不存在的原生工具会失败,不要换别的方式绕过。${imageLine}`,
   ].join('\n')
 }
 
@@ -41,16 +52,20 @@ function toolRoutingNote(bridgeMode: 'mcp' | 'delegate'): string {
  * (见 adapter 的 systemHash),重复发送时不加标题会让模型当成两条并行指令。
  * @param system - system prompt 全文。
  * @param updated - 是否是对已发过版本的更新(内容变了才为 true)。
+ * @param bridgeMode - 工具桥接模式(决定工具名前缀)。
+ * @param guidance - 读图引导(按当前模型是否支持图片输入分流)。
+ * @returns 可直接作为 prompt 前缀的文本块。
  */
 export function systemInstructionsText(
   system: string,
   updated = false,
   bridgeMode: 'mcp' | 'delegate' = 'delegate',
+  guidance: ImageReadGuidance = 'native',
 ): string {
   const header = updated
     ? 'System instructions (updated — 以本版为准,忽略早前版本):'
     : 'System instructions:'
-  return `${header}\n${system}\n\n${toolRoutingNote(bridgeMode)}`
+  return `${header}\n${system}\n\n${toolRoutingNote(bridgeMode, guidance)}`
 }
 
 /** 序列化结果:prompt 文本 + ACP 原生图片内容块(base64)。 */

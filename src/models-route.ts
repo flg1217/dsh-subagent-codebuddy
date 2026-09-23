@@ -17,6 +17,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { listCodebuddyModelIdsAsync } from './models.js'
 import { resolveSpawnableCommand } from './settings.js'
+import type { ModelCapabilityIndex } from './model-capabilities.js'
 
 /** webStartup 服务面(只读本路由需要的字段)。 */
 interface WebStartupFace {
@@ -102,6 +103,7 @@ function isTrustedApiRequest(req: IncomingMessage, trustedHosts: readonly string
 export function registerCodebuddyModelsRoute(
   ctx: Context,
   readCommand: () => string,
+  capabilities: ModelCapabilityIndex,
 ): () => void {
   const injectable = ctx as unknown as {
     inject?: (deps: string[], fn: (injected: Context) => void) => void
@@ -129,7 +131,15 @@ export function registerCodebuddyModelsRoute(
       try {
         const ids = await listCodebuddyModelIdsAsync(resolved.command, resolved.args)
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, models: ids.map(id => ({ id, name: id })) }))
+        // 名称带模态后缀:设置卡"获取所有模型"是用户挑默认模型的地方,
+        // 图片能力(多模态/仅文本)必须在这里可见。
+        res.end(JSON.stringify({
+          ok: true,
+          models: ids.map((id) => {
+            const capability = capabilities.capabilityOf(id)
+            return { id, name: `${id}${capability.supportsImages ? ' · 支持图片输入' : ' · 仅文本'}` }
+          }),
+        }))
       } catch (error) {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))

@@ -22,6 +22,7 @@ import { dirname, join } from 'node:path'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { writeImageBlob } from './image-blob.js'
 import { systemInstructionsText } from './serialize.js'
+import type { ImageReadGuidance } from './pump.js'
 
 /** 一条 CodeBuddy 原生记录(宽松结构,字段与 CLI 写出的一致)。 */
 export type NativeRecord = Record<string, unknown> & { type: string; id: string }
@@ -101,6 +102,7 @@ export async function messagesToRecords(
   images?: NativeSessionImages,
   system?: string,
   bridgeMode: 'mcp' | 'delegate' = 'delegate',
+  guidance: ImageReadGuidance = 'native',
 ): Promise<NativeRecord[]> {
   const records: NativeRecord[] = []
   const toolNames = new Map<string, string>()
@@ -129,7 +131,7 @@ export async function messagesToRecords(
       timestamp: stamp(),
       type: 'message',
       role: 'user',
-      content: [{ type: 'input_text', text: systemInstructionsText(system, false, bridgeMode) }],
+      content: [{ type: 'input_text', text: systemInstructionsText(system, false, bridgeMode, guidance) }],
       __codebuddyLocal: { sensitiveUserInputReviewed: true },
       providerData: { agent: 'cli' },
       ...base(),

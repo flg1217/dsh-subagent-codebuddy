@@ -28,6 +28,7 @@ import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
 import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.js'
 import { registerCodebuddyModelsRoute } from './models-route.js'
+import { createModelCapabilityIndex } from './model-capabilities.js'
 import { registerDshMcpServer } from '@flg1217/dsh-mcp'
 import { sweepStaleMcpConfigs } from './mcp-config.js'
 import { installModelSwitchToolGuide } from './tool-guide.js'
@@ -147,9 +148,13 @@ export function apply(ctx: Context, config: Config): void {
   const eff = settingsOf()
   const resolved = resolveSpawnableCommand(eff.command)
 
+  // 模型图片能力索引(读 CLI 的 models.json):适配器声明 inputModalities、
+  // 目录条目文案、设置卡模型列表共用同一份,避免多处各读一次。
+  const capabilities = createModelCapabilityIndex()
+
   // 设置面板的模型列表路由:插件卡槽位拿不到会话级 remote,发现只能自建
   // (围栏与 /api 网关行为一致,见 models-route.ts 模块头)。
-  ctx.effect(() => registerCodebuddyModelsRoute(ctx, () => settingsOf().command))
+  ctx.effect(() => registerCodebuddyModelsRoute(ctx, () => settingsOf().command, capabilities))
 
   // LLM provider 路由:主代理选择与子代理委派的推理都走 CodeBuddy。
   // /compact 转发与 adapter 共用同一会话映射(acpId → dsh 会话)。
@@ -162,6 +167,7 @@ export function apply(ctx: Context, config: Config): void {
     extraArgs: config.extraArgs ?? [],
     bridgeMode: eff.bridgeMode,
     store: conversations,
+    capabilities,
     // 静默长工具硬顶(分钟 → 毫秒;0 = 关闭)。看门狗超顶时 cancel+强杀,走
     // stall 重试自动续跑——防止 CLI 卡死时进程泄漏、子会话回合悬空。
     // 尾巴窗口(秒/分钟 → 毫秒;0 = 关闭)见 Config.tailQuietSeconds。

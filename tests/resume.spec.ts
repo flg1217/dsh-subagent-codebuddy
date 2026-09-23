@@ -15,7 +15,17 @@ import { CodebuddyLlmAdapter } from '../src/adapter.ts'
 import { ConversationStore } from '../src/conversations.ts'
 import { projectSlug } from '../src/native-session.ts'
 import { asSpawnResult, fakeAcpProc, message } from './fake-acp.ts'
-import { DSH_DELEGATION_NOTE } from '../src/pump.ts'
+import { promptTailFor } from '../src/pump.ts'
+import type { ModelCapabilityIndex } from '../src/model-capabilities.ts'
+
+/** 假能力索引:测试里的模型按多模态处理(读图引导 = 原生 read_image)。 */
+function imageCapable(): ModelCapabilityIndex {
+  return {
+    capabilityOf: () => ({ supportsImages: true, known: true }),
+    path: () => '(fake)',
+    invalidate: () => {},
+  }
+}
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -84,6 +94,7 @@ function makeHarness(
     extraArgs: [],
     store,
     maxAttempts: 1,
+    capabilities: imageCapable(),
     ...(nativeBaseDir !== undefined ? { nativeBaseDir } : {}),
   })
   mockedSpawn.mockImplementation(() => {
@@ -192,7 +203,7 @@ describe('原生会话种子(已有历史切换)', () => {
       expect(requests()).not.toContain('session/new')
       // prompt 只带当前输入,历史不在提示词里。
       expect(prompts.at(-1)?.startsWith('当前问题')).toBe(true)
-      expect(prompts.at(-1)?.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
+      expect(prompts.at(-1)?.endsWith(promptTailFor('delegate', 'native'))).toBe(true)
       // 原生文件已写入:含历史消息,不含当前输入(它作为 prompt 发送)。
       const dir = join(baseDir, projectSlug(process.cwd()))
       const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
@@ -331,7 +342,7 @@ describe('跨重启恢复', () => {
     expect(prompt).toContain('压缩后的新问题')
     expect(prompt).not.toContain('很长的问题一')
     expect(prompt).not.toContain('问题二')
-    expect(prompt.endsWith(DSH_DELEGATION_NOTE)).toBe(true)
+    expect(prompt.endsWith(promptTailFor('delegate', 'native'))).toBe(true)
   })
 })
 

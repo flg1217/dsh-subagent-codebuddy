@@ -7,6 +7,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { listCodebuddyModelIdsAsync, parseCodebuddyModelIds } from '../src/models.ts'
 import { CodebuddyLlmAdapter } from '../src/adapter.ts'
+import type { ModelCapabilityIndex } from '../src/model-capabilities.ts'
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>()
@@ -33,7 +34,19 @@ function fakeHelpProcess(text: string | undefined, ok = true): EventEmitter & { 
   return proc
 }
 
-function makeAdapter(modelOf = () => 'glm-5.3'): CodebuddyLlmAdapter {
+/** 假能力索引:表里没有的 id 一律按仅文本(与真实实现同口径,不读真实 models.json)。 */
+function fakeCapabilities(table: Record<string, boolean> = {}): ModelCapabilityIndex {
+  return {
+    capabilityOf: (id: string) => ({ supportsImages: table[id] === true, known: Object.hasOwn(table, id) }),
+    path: () => '(fake)',
+    invalidate: () => {},
+  }
+}
+
+function makeAdapter(
+  modelOf = () => 'glm-5.3',
+  capabilities: ModelCapabilityIndex = fakeCapabilities(),
+): CodebuddyLlmAdapter {
   const ctx = { get: () => undefined } as unknown as Context
   return new CodebuddyLlmAdapter(ctx, {
     command: 'codebuddy.js',
@@ -41,6 +54,7 @@ function makeAdapter(modelOf = () => 'glm-5.3'): CodebuddyLlmAdapter {
     modelOf,
     permissionMode: 'bypassPermissions',
     extraArgs: [],
+    capabilities,
   })
 }
 
@@ -73,7 +87,7 @@ describe('listCodebuddyModelIdsAsync', () => {
 
 describe('adapter.resolveModel', () => {
   it('暴露推理强度档位(low..ultracode),不设默认(保持 CLI 默认)', async () => {
-    const adapter = makeAdapter()
+    const adapter = makeAdapter(() => 'glm-5.3', fakeCapabilities({ 'glm-5.3': true }))
     const info = await adapter.resolveModel('codebuddy', 'glm-5.3')
     expect(info.reasoning?.efforts.map(effort => effort.id)).toEqual([
       'low', 'medium', 'high', 'xhigh', 'max', 'ultracode',
@@ -81,15 +95,29 @@ describe('adapter.resolveModel', () => {
     expect(info.reasoning?.defaultEffort).toBeUndefined()
     expect(info.inputModalities).toEqual(['text', 'image'])
   })
+
+  it('按 models.json 能力声明模态:多模态 → text+image;未登记 → 仅文本', async () => {
+    const capable = makeAdapter(() => 'deepseek-v4.1-flash', fakeCapabilities({ 'deepseek-v4.1-flash': true }))
+    expect((await capable.resolveModel('codebuddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
+    expect(capable.imageCapableOf('deepseek-v4.1-flash')).toBe(true)
+
+    const textOnly = makeAdapter(() => 'glm-5.3', fakeCapabilities({ 'deepseek-v4.1-flash': true }))
+    expect((await textOnly.resolveModel('codebuddy', 'glm-5.3')).inputModalities).toEqual(['text'])
+    expect(textOnly.imageCapableOf('glm-5.3')).toBe(false)
+  })
 })
 
 describe('adapter.listModels', () => {
-  it('目录 = CLI ids ∪ 配置默认模型', async () => {
+  it('目录 = CLI ids ∪ 配置默认模型,描述带模态后缀', async () => {
     mockedSpawn.mockImplementation(() => fakeHelpProcess(HELP_TEXT) as never)
-    const adapter = makeAdapter(() => 'custom-model')
+    const adapter = makeAdapter(() => 'custom-model', fakeCapabilities({ 'glm-5.3': true }))
     const models = await adapter.listModels('codebuddy')
     expect(models.map(m => m.id)).toEqual(['glm-5.3', 'deepseek-v4-flash', 'kimi-k3', 'custom-model'])
     expect(models.every(m => m.provider === 'codebuddy')).toBe(true)
+    expect(models[0]?.description).toBe('CodeBuddy (ACP) model glm-5.3 · 支持图片输入')
+    expect(models[1]?.description).toBe('CodeBuddy (ACP) model deepseek-v4-flash · 仅文本')
+    expect(models[0]?.inputModalities).toEqual(['text', 'image'])
+    expect(models[3]?.inputModalities).toEqual(['text'])
   })
 
   it('成功结果带 TTL 缓存:第二次调用不重新 spawn', async () => {

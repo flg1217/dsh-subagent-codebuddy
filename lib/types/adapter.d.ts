@@ -31,6 +31,7 @@ import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk }
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { ConversationStore } from './conversations.js';
 import type { AcpTimeouts } from './acp.js';
+import type { ModelCapabilityIndex } from './model-capabilities.js';
 /**
  * 会话中最后一个已打开(尚无配对 step/end)的 turn/step。
  *
@@ -73,6 +74,11 @@ export interface CodebuddyAdapterOptions {
     store?: ConversationStore;
     /** 原生会话文件根目录(默认 `~/.codebuddy/projects`;测试注入临时目录)。 */
     nativeBaseDir?: string;
+    /**
+     * 模型能力索引(默认读 `<configDir>/models.json` 的 `supportsImages`;
+     * 测试注入假索引,避免读真实 `~/.codebuddy`)。
+     */
+    capabilities?: ModelCapabilityIndex;
 }
 /**
  * CodeBuddy 模型适配器。stream() 每次调用:
@@ -109,7 +115,20 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     private isForwarded;
     /** 撤销一条转发标记(投递确认失败时回滚,留给补发路径)。 */
     private unmarkForwarded;
+    /** 模型图片能力索引(`models.json` 的 `supportsImages`;未知按仅文本)。 */
+    private readonly capabilities;
     constructor(ctx: Context, options: CodebuddyAdapterOptions);
+    /** 该模型是否原生支持图片输入(未登记/字段缺失按 false)。 */
+    imageCapableOf(model: string): boolean;
+    /**
+     * 读图引导:多模态模型 → 原生 read_image(图片直进上下文);仅文本模型且
+     * AGY 读图工具在场 → read_image_agy(AGY 转述);两者都不可用 → 如实说明。
+     * @param model - 本次请求路由到的 CodeBuddy 模型 id。
+     * @returns 读图引导档位。
+     */
+    private imageGuidanceFor;
+    /** dsh tools 服务里是否存在该工具(缺席时不指路不存在的工具)。 */
+    private hasTool;
     /**
      * 绑定模型元数据与分发流入口(rc.2+ 的 LlmAdapter 接口)。
      * 显式实现而非依赖基类:插件对宿主 dsh-llm 版本保持兼容

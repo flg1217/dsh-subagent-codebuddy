@@ -91,6 +91,8 @@ export interface PumpHost {
     /** dsh 会话 id(泵的键,也是回放工具注册的 scope)。 */
     dshSessionId: string;
     model: string;
+    /** 读图引导:按当前模型是否支持图片输入分流(缺省 native,保持旧行为)。 */
+    imageGuidance?: ImageReadGuidance;
     cwd: string;
     acpCwd: string;
     /** 已有 CodeBuddy 会话(load 复用);否则 session/new。 */
@@ -212,6 +214,11 @@ export declare const MCP_CALL_TIMEOUT_MS = 300000;
  */
 export declare const INTERACTIVE_MCP_CALL_TIMEOUT_MS = 0;
 /**
+ * 读图引导:多模态模型用原生 `read_image`(图片直接进上下文);仅文本模型用
+ * `read_image_agy`(AGY 转述);两者都不可用时如实说明(不指路不存在的工具)。
+ */
+export type ImageReadGuidance = 'native' | 'agy' | 'unavailable';
+/**
  * dsh 发起的调用的固定尾注(附在每条 prompt 末端)。
  *
  * CodeBuddy CLI 自带子代理体系(Task/Agent 团队)与自带后台任务(bash
@@ -221,16 +228,23 @@ export declare const INTERACTIVE_MCP_CALL_TIMEOUT_MS = 0;
  * 下一轮。尾注同时声明"回合结束后不会自动恢复"的落点:否则模型会承诺
  * "等 X 完成后继续汇报",而外部任务没有完成事件,用户只能主动催。
  * 位置固定在末尾——模型对最新一条输入的尾部指令最敏感。
+ * @param guidance - 读图引导(按当前模型是否支持图片输入分流)。
+ * @returns 完整尾注文本。
  */
-export declare const DSH_DELEGATION_NOTE: string;
+export declare function dshDelegationNote(guidance: ImageReadGuidance): string;
 /**
  * MCP 模式(dsh HTTP MCP server)下的固定尾注:与 delegate 版同构,工具名
  * 换成 CLI 呈现的 `mcp__dsh__<工具名>`(参数走各工具的 MCP schema,不再有
  * toolId 中转),并去掉 DelegateTool 形态专属条款。
  */
-export declare const MCP_DELEGATION_NOTE: string;
-/** 按桥接模式取 prompt 尾注(dsh 运行环境说明)。 */
-export declare function promptTailFor(bridgeMode: 'mcp' | 'delegate' | undefined): string;
+export declare function mcpDelegationNote(guidance: ImageReadGuidance): string;
+/**
+ * 按桥接模式取 prompt 尾注(dsh 运行环境说明)。
+ * @param bridgeMode - 工具桥接模式(delegate 用 `dsh_` 前缀,mcp 用 `mcp__dsh__`)。
+ * @param guidance - 读图引导(按当前模型是否支持图片输入分流)。
+ * @returns 以空行开头的尾注文本。
+ */
+export declare function promptTailFor(bridgeMode: 'mcp' | 'delegate' | undefined, guidance?: ImageReadGuidance): string;
 /** 重启跨 attempt 保留的执行状态(重试是同一任务的延续,已学到的间隔不丢)。 */
 export interface PumpStepState {
     mirroredCalls: Set<string>;

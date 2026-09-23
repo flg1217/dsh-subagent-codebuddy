@@ -15,7 +15,7 @@
 | **子代理 provider** | 通用 dsh `subagent` 工具可传 `provider: codebuddy` 委派（配合 `subagent-model-selection` 设置）；进程内 child agent、可并行、`send_message` 续聊 |
 | **模型目录** | adapter 实现 `listModels()`（带缓存、永不抛错），主选择器与 `list_subagent_models` 共用 |
 | **推理强度** | CLI `--effort` 档位（low / medium / high / xhigh / max / ultracode）暴露到 dsh 模型选择器；子代理可用 `reasoning_effort` 参数指定 |
-| **图片输入/读取** | 输入：图片块读字节后以 **ACP 原生 image 内容块**（base64）随 prompt 发送（`promptCapabilities.image`，不落盘）；读取：模型用 dsh 的 `read_image`，图片以 **MCP image 内容块**回到 CLI 侧模型、同时进 dsh 会话出图片卡片；历史种子与子代理转录里的图片经 CodeBuddy blob（内容寻址）双向原生转换，两侧均可预览 |
+| **图片输入/读取** | 输入：图片块读字节后以 **ACP 原生 image 内容块**（base64）随 prompt 发送（`promptCapabilities.image`，不落盘）；读取：**按模型模态分流**——多模态模型（CLI `models.json` 的 `supportsImages: true`）用 dsh 的 `read_image`，图片以 **MCP image 内容块**回到 CLI 侧模型、同时进 dsh 会话出图片卡片；仅文本/未登记模型用 `read_image_agy`（AGY 转述成文字）。历史种子与子代理转录里的图片经 CodeBuddy blob（内容寻址）双向原生转换，两侧均可预览 |
 | **子代理可视化** | codebuddy 轮里的 `Agent` 委派镜像为 **dsh 子会话**（`parentSession` 血缘 + `subagent/descriptor`），侧边栏可点开完整转录（消息/工具/思考/任务），运行中近实时跟随 |
 | **任务/todo** | 走 dsh 原生 `todo_write`（工具桥一等公民，主轮与子代理会话都复用 dsh 的 TodoPanel 渲染）；CLI 侧 `TaskCreate`/`TaskUpdate` 已随内置工具禁用，`todo-bridge` 保留作旧会话重放兼容 |
 | **工具桥（MCP / delegate）** | 把本会话可见的 dsh 工具暴露给 CodeBuddy，使它的文件/命令类能力走 dsh 管线（审批/沙箱/审计/后台面板）。默认 `mcp`：dsh 起 HTTP MCP server，工具以 `mcp__dsh__<名>` 一等公民呈现（完整 JSON Schema 强约束）；`delegate` 为旧通道（`dsh_<名>` 合成 DelegateTool），保留作回退 |
@@ -29,8 +29,12 @@
 - 模型的全部工具面 = dsh 侧工具（MCP 模式下是 `mcp__dsh__bash` / `mcp__dsh__edit`
   / `mcp__dsh__read_image` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）。这些调用
   **在 dsh 侧执行，受 dsh 的沙箱与审批约束**，并进会话日志、审计与后台任务面板。
-- 读图片走 dsh 的 `read_image`：图片既作为图片进入 CLI 侧模型的上下文（MCP image 内容块），
-  也进 dsh 会话出图片卡片（`read_image` 是 dsh 原生工具名，UI 按名字渲染图片卡）。
+- 读图片按**模型模态**分流：多模态模型（`~/.codebuddy/models.json` 的 `supportsImages: true`）走 dsh 的
+  `read_image`——图片既作为图片进入 CLI 侧模型的上下文（MCP image 内容块），也进 dsh 会话出图片卡片；
+  仅文本或**未登记**的模型（`glm-5.3` 这类不在 models.json 的 id 一律按仅文本）走 `read_image_agy`
+  （AGY 读图后返回文字描述）。指路由尾注与 system 位下发，dsh-llm-agy 的闸门做硬校验
+  （见其 README「按模型模态分流读图工具」；想用 AGY 转述时可在设置里关掉该闸门）。
+  模型目录（主选择器 / `list_subagent_models` / 设置卡「获取所有模型」）都带 `· 支持图片输入` / `· 仅文本` 后缀。
 - 文本/思考/工具卡片仍以会话事件实时回传 dsh 界面。
 
 > 为什么全禁而不是白名单（2026-09-18）：CLI 原生工具要进 dsh 会话，必须在会话 scope 注册

@@ -184,3 +184,17 @@ describe('会话文件写入', () => {
     }
   })
 })
+
+describe('system 记录的读图引导', () => {
+  it('多模态/仅文本两种 system 记录各自指路对应工具', async () => {
+    const native = await messagesToRecords([user('u1', 'hi')], context, undefined, '系统纪律', 'delegate', 'native')
+    const nativeText = JSON.stringify(native[0]?.content)
+    expect(nativeText).toContain('系统纪律')
+    expect(nativeText).toContain('读图片用 dsh_read_image')
+    expect(nativeText).not.toContain('read_image_agy——')
+
+    const textOnly = await messagesToRecords([user('u1', 'hi')], context, undefined, '系统纪律', 'delegate', 'agy')
+    const textOnlyText = JSON.stringify(textOnly[0]?.content)
+    expect(textOnlyText).toContain('读图片一律用 dsh_read_image_agy')
+  })
+})
