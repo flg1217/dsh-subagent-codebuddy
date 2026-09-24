@@ -312,11 +312,12 @@ describe('resumeReplayPrompt:补发完整性(tool-call / 压缩 / own 过滤)', 
     expect(replay.prompt).not.toContain('own 的回答')
   })
 
-  it('数量锚遇到压缩 checkpoint 不可信:只发最后一条用户输入兜底(不整体重发)', async () => {
+  it('数量锚遇到压缩 checkpoint 不可信:从最后一次 checkpoint 起补发(摘要+其后)', async () => {
     const { ctx } = makeCtx()
     // 前 4 条"已发"(sentCount=4),但其中混入了压缩 checkpoint——遮蔽段落在
-    // 已发区内,索引已错位,数量锚不可信。CLI 有自己的持久上下文,整体重建会
-    // 重发已知内容并可能被当新任务重跑:改为兜底只发最后一条用户输入。
+    // 已发区内,索引已错位,数量锚不可信。此时补发起点取**最后一次 checkpoint**:
+    // 摘要本身 + 其后 CLI 没见过的一切。checkpoint 之前的内容 CLI 已有原文,
+    // 不重发(旧的"不整体重建"顾虑仍然成立)。
     const messages = [
       userMessage('u1', '第一问'),
       checkpoint('cp1', '压缩摘要内容'),
@@ -325,14 +326,21 @@ describe('resumeReplayPrompt:补发完整性(tool-call / 压缩 / own 过滤)', 
       userMessage('u4', '新问题'),
     ]
     const replay = await resumeReplayPrompt(ctx as never, messages, 4)
+    expect(replay.prompt).toContain('压缩摘要内容')
+    expect(replay.prompt).toContain('中间消息')
     expect(replay.prompt).toContain('新问题')
+    // checkpoint 之前的内容不重发;own 轮仍跳过。
     expect(replay.prompt).not.toContain('第一问')
-    expect(replay.prompt).not.toContain('压缩摘要内容')
     expect(replay.prompt).not.toContain('own 的回答')
-    expect(replay.prompt).not.toContain('中间消息')
   })
 
-  it('锚点被压缩移除:不整体重建,只发最后一条用户输入兜底', async () => {
+  it('锚点被压缩遮蔽:从最后一次 checkpoint 起补发,不再丢中途内容(回归)', async () => {
+    // 事故(2026-09-24 用户报障):从 cli 切到 dsh 再切回 cli,中途增量的消息与
+    // 压缩摘要都没补上。实测链条:
+    //   09:21 切回 codebuddy(锚点记在 seq 8284)
+    //   09:32 dsh 侧压缩,遮蔽 7941→8489 —— 锚点被吞
+    //   之后切回 CLI → findIndex 失败 → 旧实现只发最后一条用户输入 → 全丢
+    // 现在锚点找不到就退到"最后一次 checkpoint"(摘要 + 其后全部)。
     const { ctx } = makeCtx()
     const messages = [
       checkpoint('cp1', '压缩摘要内容'),
@@ -341,21 +349,38 @@ describe('resumeReplayPrompt:补发完整性(tool-call / 压缩 / own 过滤)', 
       userMessage('u2', '新问题'),
     ]
     const replay = await resumeReplayPrompt(ctx as never, messages, 3, new Set(['f1']), 'a-gone')
+    expect(replay.prompt).toContain('压缩摘要内容')
     expect(replay.prompt).toContain('新问题')
-    expect(replay.prompt).not.toContain('压缩摘要内容')
+    // own 轮与已转发插入仍不重发。
     expect(replay.prompt).not.toContain('own 的尾部回答')
     expect(replay.prompt).not.toContain('已转发的插话')
   })
 
-  it('锚点丢失且最后一条用户输入已插话投递过:置 skippedForwarded,调用方空跑', async () => {
+  it('锚点丢失 + checkpoint 之后全是已插话投递的消息:补发摘要(不再空跑)', async () => {
+    // checkpoint 本身就是要补的内容(CLI 没见过 dsh 侧的这次压缩),所以不再
+    // 置 skippedForwarded —— 那会让调用方空跑,摘要永远到不了 CLI。
     const { ctx } = makeCtx()
     const messages = [
       checkpoint('cp1', '压缩摘要内容'),
       userMessage('f1', '已转发的插话'),
     ]
     const replay = await resumeReplayPrompt(ctx as never, messages, 1, new Set(['f1']), 'a-gone')
-    expect(replay.skippedForwarded).toBe(true)
-    expect(replay.prompt).toContain('继续完成之前未完成的任务')
+    expect(replay.prompt).toContain('压缩摘要内容')
+    expect(replay.prompt).not.toContain('已转发的插话')
+    expect(replay.skippedForwarded).toBeFalsy()
+  })
+
+  it('锚点丢失且没有任何 checkpoint:才退回只发最后一条用户输入', async () => {
+    const { ctx } = makeCtx()
+    const messages = [
+      userMessage('u1', '第一问'),
+      ownAssistant('a1', 'own 的回答'),
+      userMessage('u2', '新问题'),
+    ]
+    const replay = await resumeReplayPrompt(ctx as never, messages, 3, undefined, 'a-gone')
+    expect(replay.prompt).toContain('新问题')
+    expect(replay.prompt).not.toContain('第一问')
+    expect(replay.prompt).not.toContain('own 的回答')
   })
 
   it('正常补发:起点之后穿插的 own 轮不重发(CLI 已有)', async () => {

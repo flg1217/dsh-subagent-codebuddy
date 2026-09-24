@@ -54,10 +54,11 @@ export declare function lastUserPrompt(ctx: Context, messages: readonly Message[
  * 数量锚(`sentCount`)在历史被压缩/编辑后不可靠——切到其他模型跑一段再切回时,
  * 数量锚越界会让补发退化成"只发最后一条",切换期间的上下文永久丢失(实测)。
  *
- * 锚点已被压缩移除 / 数量锚不可信(越界、已发区内出现压缩 checkpoint)时,
- * **不做整体重建**:CLI 侧对话是持久历史(它有完整上下文,压缩只发生在
- * dsh 视角)——重发 CLI 已知内容会膨胀上下文,且会被当作新任务从头重跑
- * (实测)。只发最后一条用户输入兜底,保证最新指令必达。
+ * 锚点已被压缩遮蔽 / 数量锚不可信(越界、已发区内出现压缩 checkpoint)时,
+ * **不做整体重建**(CLI 侧对话是持久历史,重发 CLI 已知内容会膨胀上下文,
+ * 且会被当作新任务从头重跑——实测),改为**从最后一次压缩 checkpoint 起补发**:
+ * 摘要 + 其后全部。checkpoint 正是那个边界,详见 replayFromCheckpoint。
+ * 连 checkpoint 都没有时才退回"只发最后一条用户输入",保证最新指令必达。
  *
  * 补发按 User/Assistant 序列化;CodeBuddy 自己产生的消息(assistant/tool)与
  * 已中途转发的插入消息(`skipIds`)跳过。
