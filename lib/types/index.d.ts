@@ -23,7 +23,7 @@ export declare const inject: string[];
 export interface Config {
     /** 可执行文件,默认 `codebuddy`。 */
     command?: string;
-    /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
+    /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4.1-flash`。 */
     model?: string;
     /**
      * 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`

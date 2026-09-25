@@ -42,7 +42,7 @@ export const inject = ['llm']
 export interface Config {
   /** 可执行文件,默认 `codebuddy`。 */
   command?: string
-  /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
+  /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4.1-flash`。 */
   model?: string
   /**
    * 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`
@@ -105,7 +105,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   command: z.string().default('codebuddy'),
-  model: z.string().default('deepseek-v4-flash'),
+  model: z.string().default('deepseek-v4.1-flash'),
   permissionMode: z.string().default('bypassPermissions'),
   extraArgs: z.array(z.string()).default([]),
   providerName: z.string().default('codebuddy'),
