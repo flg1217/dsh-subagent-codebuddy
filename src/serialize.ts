@@ -3,12 +3,16 @@
  * - 系统提示(可选)、对话消息按顺序拼接为文本;
  * - 图片块读字节后以 **ACP 原生 image 内容块**(base64)随 prompt 发送
  *   (`promptCapabilities.image` 实测支持,不再落盘走路径——避开 CodeBuddy
- *   Read 工具的 256KB 上限);
+ *   Read 工具的 256KB 上限);顶层图片与 **tool-result 内嵌图片**(read_image
+ *   等工具的结果)一并收集;
  * - 续聊补发(`resumeReplayPrompt`):从发送锚点切片,把切换模型期间缺失的
  *   轮次完整补上,同时跳过 CodeBuddy 自己产生的消息(其会话里已有)。
  * @module subagent-codebuddy/serialize
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import type { ImageReadGuidance } from './pump.js'
@@ -24,8 +28,8 @@ export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推�
  * (权威)而不是只靠每条 prompt 尾注——CLI 内置提示词在 user 位置的指令
  * 面前占优,实测尾注拦不住模型直调原生 Bash/Edit。
  * @param bridgeMode - 工具桥接模式(决定工具名前缀)。
- * @param guidance - 读图引导:多模态模型用原生 read_image(图片直进上下文),
- *   仅文本模型用 read_image_agy(AGY 转述)。
+ * @param guidance - 读图引导:read_image 在场即原生(CodeBuddy 侧适配图片
+ *   工具结果);AGY 转述仅兜底(read_image 缺席)或用户显式要求。
  * @returns 工具路由说明全文。
  */
 function toolRoutingNote(bridgeMode: 'mcp' | 'delegate', guidance: ImageReadGuidance): string {
@@ -34,9 +38,9 @@ function toolRoutingNote(bridgeMode: 'mcp' | 'delegate', guidance: ImageReadGuid
     : '对等能力一律用 dsh 前缀版本(dsh_bash、dsh_pwsh、dsh_read、dsh_read_image、dsh_edit、dsh_write、dsh_glob、dsh_grep)'
   const prefix = bridgeMode === 'mcp' ? 'mcp__dsh__' : 'dsh_'
   const imageLine = guidance === 'native'
-    ? `读图片用 ${prefix}read_image:结果以图片卡片呈现给用户,并作为图片直接进入你的上下文(你的模型原生支持图片输入)——不要用 ${prefix}read_image_agy 让 AGY 转述。`
+    ? `读图片用 Read 工具直接读图片文件路径(已放行):图片会进入你的上下文并由 CodeBuddy 侧适配——不要用 ${prefix}read_image_agy 让 AGY 转述,除非用户明确要求 AGY 转述。`
     : guidance === 'agy'
-      ? `读图片一律用 ${prefix}read_image_agy:AGY 读图后以文字描述返回(可用 prompt 指定关注点);你的模型是纯文本模型,${prefix}read_image 会被拒绝,不要尝试。`
+      ? `读图片用 ${prefix}read_image_agy:AGY 读图后以文字描述返回(可用 prompt 指定关注点);本会话没有可用的原生读图工具。`
       : '读图片:本会话没有可用的读图工具(模型不支持图片输入且未启用 AGY 读图)——需要读图时如实告知用户。'
   return [
     '[工具路由(本环境强制)]',
@@ -97,29 +101,103 @@ function messageText(message: Message): string {
   return parts.join('')
 }
 
-/** 读取一组消息里的图片块(失败跳过),返回 ACP 原生内容块数据。 */
-async function readImages(
+/** mediaType → 落盘扩展名。 */
+const IMAGE_EXT: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+}
+
+/** 已处理图片缓存:attachmentId → base64 + 落盘路径(进程内,内容寻址)。 */
+const materializedImages = new Map<string, { base64: string; mimeType: string; path: string }>()
+
+/** 图片收集结果:ACP 原生内容块 + 落盘路径(attachmentId → 路径)。 */
+interface CollectedImages {
+  images: Array<{ data: string; mimeType: string }>
+  paths: Map<string, string>
+}
+
+/**
+ * 收集一组消息里的图片(含 tool-result 内嵌):ACP 原生内容块(base64)+ 落盘路径。
+ *
+ * 为什么**同时**落盘:CLI 对"模型不支持图片"的路由会过滤 user message 与
+ * `function_call_result` 里的图片(`[Image content filtered - current model
+ * does not support images]`),但 **CLI 原生 Read 的图片不走该过滤**——落盘后
+ * 模型可按路径用 Read 读到图片内容(Read 通道见 acp.ts 的 `--tools` 策略)。
+ * 支持的模型仍直接看 ACP 图片内容块,两条通道并存。同一附件(内容寻址)
+ * 只读一次、只写一次;临时目录不主动清理(系统 temp 语义)。
+ */
+async function collectImages(
   ctx: Context,
   messages: readonly Message[],
-): Promise<Array<{ data: string; mimeType: string }>> {
+): Promise<CollectedImages> {
   const attachments = ctx.get('attachments')
-  if (attachments === undefined) return []
   const images: Array<{ data: string; mimeType: string }> = []
+  const paths = new Map<string, string>()
+  if (attachments === undefined) return { images, paths }
+  const push = async (block: Extract<Message['content'][number], { type: 'image' }>): Promise<void> => {
+    const id = String(block.attachment?.attachmentId ?? '')
+    if (id.length === 0) return
+    const cached = materializedImages.get(id)
+    if (cached !== undefined) {
+      images.push({ data: cached.base64, mimeType: cached.mimeType })
+      if (cached.path.length > 0) paths.set(id, cached.path)
+      return
+    }
+    try {
+      const stored = await attachments.readImage(block.attachment)
+      const base64 = Buffer.from(stored.data).toString('base64')
+      const mimeType = stored.ref.mediaType
+      // 落盘(Read 通道):失败不影响 ACP 图片通道。
+      let path = ''
+      try {
+        const ext = IMAGE_EXT[mimeType] ?? 'png'
+        const dir = join(tmpdir(), 'dsh-codebuddy-images')
+        mkdirSync(dir, { recursive: true })
+        const file = join(dir, `${id.replace(/[^a-zA-Z0-9]/g, '').slice(0, 32)}.${ext}`)
+        writeFileSync(file, stored.data)
+        path = file
+      } catch {
+        // 落盘失败则只走 ACP 图片通道。
+      }
+      materializedImages.set(id, { base64, mimeType, path })
+      images.push({ data: base64, mimeType })
+      if (path.length > 0) paths.set(id, path)
+    } catch {
+      // 附件不可读则跳过该图。
+    }
+  }
   for (const message of messages) {
     for (const block of message.content) {
-      if (block.type !== 'image') continue
-      try {
-        const stored = await attachments.readImage(block.attachment)
-        images.push({
-          data: Buffer.from(stored.data).toString('base64'),
-          mimeType: stored.ref.mediaType,
-        })
-      } catch {
-        // 附件不可读则跳过该图。
+      if (block.type === 'image') await push(block)
+      else if (block.type === 'tool-result') {
+        for (const inner of block.content) {
+          if (inner.type === 'image') await push(inner)
+        }
       }
     }
   }
-  return images
+  return { images, paths }
+}
+
+/** 该消息内图片的落盘路径(含 tool-result 内嵌,按出现顺序去重)。 */
+function imagePathsOf(message: Message, paths: ReadonlyMap<string, string>): string[] {
+  const found: string[] = []
+  const push = (block: { attachment?: { attachmentId?: unknown } }): void => {
+    const id = String(block.attachment?.attachmentId ?? '')
+    const path = id.length > 0 ? paths.get(id) : undefined
+    if (path !== undefined && !found.includes(path)) found.push(path)
+  }
+  for (const block of message.content) {
+    if (block.type === 'image') push(block)
+    else if (block.type === 'tool-result') {
+      for (const inner of block.content) {
+        if (inner.type === 'image') push(inner)
+      }
+    }
+  }
+  return found
 }
 
 /**
@@ -144,9 +222,15 @@ export async function lastUserPrompt(
     return { prompt: CONTINUE_PROMPT, images: [], skippedForwarded: true }
   }
   const text = messageText(last)
-  const images = await readImages(ctx, [last])
-  if (text.trim().length === 0 && images.length === 0) return { prompt: CONTINUE_PROMPT, images: [] }
-  return { prompt: text, images }
+  const { images, paths } = await collectImages(ctx, [last])
+  const imagePaths = imagePathsOf(last, paths)
+  const note = imagePaths.length > 0
+    ? `${text.length > 0 ? '\n' : ''}[图片已保存到本地文件:${imagePaths.join(', ')}(用 Read 工具读取查看)]`
+    : ''
+  if (text.trim().length === 0 && images.length === 0 && note.length === 0) {
+    return { prompt: CONTINUE_PROMPT, images: [] }
+  }
+  return { prompt: `${text}${note}`, images }
 }
 
 /**
@@ -266,17 +350,22 @@ export async function buildPrompt(
   return serializeParts(ctx, prefix, options.messages)
 }
 
-/** 序列化主体:前缀(系统提示)+ 消息文本;图片收集为原生内容块。 */
+/** 序列化主体:前缀(系统提示)+ 消息文本;图片收集为原生内容块 + 落盘路径。 */
 async function serializeParts(
   ctx: Context,
   parts: string[],
   messages: readonly Message[],
 ): Promise<SerializedPrompt> {
+  const { images, paths } = await collectImages(ctx, messages)
   for (const message of messages) {
     const text = messageText(message)
-    if (text.length === 0) continue
+    const imagePaths = imagePathsOf(message, paths)
+    const note = imagePaths.length > 0
+      ? `${text.length > 0 ? '\n' : ''}[图片已保存到本地文件:${imagePaths.join(', ')}(用 Read 工具读取查看)]`
+      : ''
+    if (text.length === 0 && note.length === 0) continue
     const label = message.role === 'assistant' ? 'Assistant' : 'User'
-    parts.push(`${label}: ${text}`)
+    parts.push(`${label}: ${text}${note}`)
   }
-  return { prompt: parts.join('\n\n'), images: await readImages(ctx, messages) }
+  return { prompt: parts.join('\n\n'), images }
 }

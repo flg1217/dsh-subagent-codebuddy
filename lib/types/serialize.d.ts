@@ -3,7 +3,8 @@
  * - 系统提示(可选)、对话消息按顺序拼接为文本;
  * - 图片块读字节后以 **ACP 原生 image 内容块**(base64)随 prompt 发送
  *   (`promptCapabilities.image` 实测支持,不再落盘走路径——避开 CodeBuddy
- *   Read 工具的 256KB 上限);
+ *   Read 工具的 256KB 上限);顶层图片与 **tool-result 内嵌图片**(read_image
+ *   等工具的结果)一并收集;
  * - 续聊补发(`resumeReplayPrompt`):从发送锚点切片,把切换模型期间缺失的
  *   轮次完整补上,同时跳过 CodeBuddy 自己产生的消息(其会话里已有)。
  * @module subagent-codebuddy/serialize

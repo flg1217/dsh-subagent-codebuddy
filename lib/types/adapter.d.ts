@@ -121,9 +121,12 @@ export declare class CodebuddyLlmAdapter extends LlmAdapter {
     /** 该模型是否原生支持图片输入(未登记/字段缺失按 false)。 */
     imageCapableOf(model: string): boolean;
     /**
-     * 读图引导:多模态模型 → 原生 read_image(图片直进上下文);仅文本模型且
-     * AGY 读图工具在场 → read_image_agy(AGY 转述);两者都不可用 → 如实说明。
-     * @param model - 本次请求路由到的 CodeBuddy 模型 id。
+     * 读图引导:读图走 **CLI 原生 Read**(`--tools` 白名单固定放行;CLI 内置
+     * 读图管线对任意模型适配,而 MCP 工具结果里的图片会被 CLI 按模型能力过滤
+     * ——`function_call_result` → `[Image content filtered]`)。dsh 的 read_image
+     * 工具在场即按原生档引导(它同时服务支持图片的模型);工具缺席时才退回
+     * AGY 转述/如实说明。tools 服务不可用(极简/测试上下文)时按模型能力回退。
+     * @param model - 本次请求路由到的 CodeBuddy 模型 id(仅回退路径使用)。
      * @returns 读图引导档位。
      */
     private imageGuidanceFor;

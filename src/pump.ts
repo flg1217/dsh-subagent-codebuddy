@@ -379,10 +379,11 @@ export type ImageReadGuidance = 'native' | 'agy' | 'unavailable'
  */
 function imageReadLine(guidance: ImageReadGuidance, prefix: 'dsh_' | 'mcp__dsh__'): string {
   if (guidance === 'native') {
-    return `读图片用 ${prefix}read_image——图片直接进入你的上下文并以图片卡片呈现给用户(你的模型原生支持图片输入),不要改用 ${prefix}read_image_agy 让 AGY 转述(会丢细节)`
+    return '读图片用 Read 工具直接读图片文件路径(已放行)——图片会进入你的上下文并由 CodeBuddy 侧适配;不要改用 '
+      + `${prefix}read_image_agy 让 AGY 转述,除非用户明确要求 AGY 转述`
   }
   if (guidance === 'agy') {
-    return `读图片一律用 ${prefix}read_image_agy——AGY 读图后返回文字描述(可用 prompt 参数指定关注点);你的模型是纯文本模型,${prefix}read_image 会被拒绝`
+    return `读图片用 ${prefix}read_image_agy——AGY 读图后返回文字描述(可用 prompt 参数指定关注点);本会话没有可用的原生读图工具`
   }
   return '读图片:本会话没有可用的读图工具(模型不支持图片输入且未启用 AGY 读图)——需要读图时如实告知用户'
 }

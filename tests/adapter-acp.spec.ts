@@ -360,13 +360,15 @@ describe('adapter(ACP):取消与错误', () => {
     })
   })
 
-  it('spawn 工具策略:内置工具全禁(实测 ACP 下 --disallowedTools 无效)', () => {
-    // mcp 模式:空列表 = 禁用全部内置工具,工具面只剩 MCP 通道的 dsh 工具。
-    expect(cliToolPolicyArgs()).toEqual(['--tools', ''])
-    expect(cliToolPolicyArgs('mcp')).toEqual(['--tools', ''])
+  it('spawn 工具策略:内置工具全禁、Read 例外放行(实测 ACP 下 --disallowedTools 无效)', () => {
+    // mcp 模式:白名单只剩 Read(读图必需——CLI 内置读图管线对任意模型适配,
+    // 而 MCP 工具结果的图片会被 CLI 按模型能力过滤),其余内置工具全禁,
+    // 工具面主体是 MCP 通道的 dsh 工具。
+    expect(cliToolPolicyArgs()).toEqual(['--tools', 'Read'])
+    expect(cliToolPolicyArgs('mcp')).toEqual(['--tools', 'Read'])
     // delegate 模式:必须放行委托工具合成器(白名单会连它一起过滤,
-    // 漏掉它 = 全部 dsh_* 委托工具不可见)。
-    expect(cliToolPolicyArgs('delegate')).toEqual(['--tools', 'DelegateTool'])
+    // 漏掉它 = 全部 dsh_* 委托工具不可见);Read 同样放行。
+    expect(cliToolPolicyArgs('delegate')).toEqual(['--tools', 'DelegateTool,Read'])
   })
 })
 

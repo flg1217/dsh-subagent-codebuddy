@@ -96,19 +96,19 @@ describe('adapter.resolveModel', () => {
     expect(info.inputModalities).toEqual(['text', 'image'])
   })
 
-  it('按 models.json 能力声明模态:多模态 → text+image;未登记 → 仅文本', async () => {
+  it('surface 恒声明 text+image(入口门放行);真实能力经 imageCapableOf 保留', async () => {
     const capable = makeAdapter(() => 'deepseek-v4.1-flash', fakeCapabilities({ 'deepseek-v4.1-flash': true }))
     expect((await capable.resolveModel('codebuddy', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
     expect(capable.imageCapableOf('deepseek-v4.1-flash')).toBe(true)
 
     const textOnly = makeAdapter(() => 'glm-5.3', fakeCapabilities({ 'deepseek-v4.1-flash': true }))
-    expect((await textOnly.resolveModel('codebuddy', 'glm-5.3')).inputModalities).toEqual(['text'])
+    expect((await textOnly.resolveModel('codebuddy', 'glm-5.3')).inputModalities).toEqual(['text', 'image'])
     expect(textOnly.imageCapableOf('glm-5.3')).toBe(false)
   })
 })
 
 describe('adapter.listModels', () => {
-  it('目录 = CLI ids ∪ 配置默认模型,描述带模态后缀', async () => {
+  it('目录 = CLI ids ∪ 配置默认模型,模态恒 text+image,描述带真实能力后缀', async () => {
     mockedSpawn.mockImplementation(() => fakeHelpProcess(HELP_TEXT) as never)
     const adapter = makeAdapter(() => 'custom-model', fakeCapabilities({ 'glm-5.3': true }))
     const models = await adapter.listModels('codebuddy')
@@ -116,8 +116,7 @@ describe('adapter.listModels', () => {
     expect(models.every(m => m.provider === 'codebuddy')).toBe(true)
     expect(models[0]?.description).toBe('CodeBuddy (ACP) model glm-5.3 · 支持图片输入')
     expect(models[1]?.description).toBe('CodeBuddy (ACP) model deepseek-v4-flash · 仅文本')
-    expect(models[0]?.inputModalities).toEqual(['text', 'image'])
-    expect(models[3]?.inputModalities).toEqual(['text'])
+    for (const m of models) expect(m.inputModalities).toEqual(['text', 'image'])
   })
 
   it('成功结果带 TTL 缓存:第二次调用不重新 spawn', async () => {

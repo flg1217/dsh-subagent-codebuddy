@@ -274,14 +274,23 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
   }
 
   /**
-   * 读图引导:多模态模型 → 原生 read_image(图片直进上下文);仅文本模型且
-   * AGY 读图工具在场 → read_image_agy(AGY 转述);两者都不可用 → 如实说明。
-   * @param model - 本次请求路由到的 CodeBuddy 模型 id。
+   * 读图引导:读图走 **CLI 原生 Read**(`--tools` 白名单固定放行;CLI 内置
+   * 读图管线对任意模型适配,而 MCP 工具结果里的图片会被 CLI 按模型能力过滤
+   * ——`function_call_result` → `[Image content filtered]`)。dsh 的 read_image
+   * 工具在场即按原生档引导(它同时服务支持图片的模型);工具缺席时才退回
+   * AGY 转述/如实说明。tools 服务不可用(极简/测试上下文)时按模型能力回退。
+   * @param model - 本次请求路由到的 CodeBuddy 模型 id(仅回退路径使用)。
    * @returns 读图引导档位。
    */
   private imageGuidanceFor(model: string): ImageReadGuidance {
-    if (this.imageCapableOf(model)) return 'native'
-    return this.hasTool('read_image_agy') ? 'agy' : 'unavailable'
+    const tools = (this.ctx as unknown as { get?: (key: string) => unknown }).get?.('tools') as
+      | { get?: (name: string, scope?: unknown) => unknown }
+      | undefined
+    if (tools === undefined) {
+      return this.imageCapableOf(model) ? 'native' : (this.hasTool('read_image_agy') ? 'agy' : 'unavailable')
+    }
+    if (tools.get?.('read_image') !== undefined) return 'native'
+    return tools.get?.('read_image_agy') !== undefined ? 'agy' : 'unavailable'
   }
 
   /** dsh tools 服务里是否存在该工具(缺席时不指路不存在的工具)。 */
@@ -372,7 +381,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     if (existing !== undefined) return { kind: 'pump', pump: existing }
 
     const model = options.model ?? this.options.modelOf()
-    // 读图引导随路由模型能力变化(多模态 → 原生 read_image;仅文本 → AGY)。
+    // 读图引导按工具在场情况变化(read_image 在场即原生;AGY 仅兜底)。
     const imageGuidance = this.imageGuidanceFor(model)
     const cwd = childSession.header.cwd ?? process.cwd()
     // dsh 的 system prompt 对齐原生语义:主代理轮也要带(工具桥已齐,旧注释
@@ -574,7 +583,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
     const { command, prefixArgs } = this.options
     // 请求级 model 优先(子代理可经 agentOptions.model 动态指定),回退到当前默认模型。
     const model = options.model ?? this.options.modelOf()
-    // 读图引导随路由模型能力变化(旁路会话同样要带,哈希与种子都要用)。
+    // 读图引导按工具在场情况变化(旁路会话同样要带,哈希与种子都要用)。
     const imageGuidance = this.imageGuidanceFor(model)
     // 辅助调用(会话标题/压缩)是**旁路查询**:必须用一次性会话,绝不读写
     // 本会话的续接映射、也绝不原生种子——否则会抢写映射(实测:标题调用把
@@ -994,15 +1003,15 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
   }
 
   override resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    // 能力真相来自 CLI 自己的 `models.json`(`supportsImages`),未知/未登记
-    // 一律按仅文本:声明 ['text'] 会让 dsh 在派发前把图片投影成文本占位
-    // (llm 的 projectImagesForTextModel),不把图片块送给只吃文本的 CLI 模型。
-    const imageCapable = this.imageCapableOf(model)
+    // Surface 一律声明 text+image:让 dsh 入口门放行带图消息,图片块进历史后
+    // 交给下游——CodeBuddy 侧有内置读图管线,对任意模型适配图片工具结果
+    // (实测纯文本模型经 CLI 读图同样能看到图片内容)。内部分流(读图引导
+    // 的回退路径、模型目录描述)仍用 imageCapableOf(models.json 真相)。
     return Promise.resolve({
       provider,
       id: model,
       name: model,
-      inputModalities: imageCapable ? ['text', 'image'] : ['text'],
+      inputModalities: ['text', 'image'],
       context: { contextWindow: 1_000_000 },
       // 推理强度:CLI `--effort` 的档位原样暴露(dsh 选择器/子代理 reasoning_effort
       // 参数据此校验与转发)。不设 defaultEffort:省略时保持 CLI 自身默认。
@@ -1039,6 +1048,8 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
         const all = [...new Set([...ids, ...(configured.length > 0 ? [configured] : [])])]
         // 目录条目带模态后缀:子代理模型目录(list_subagent_models)与主模型
         // 选择器都以 description 为唯一可见通道,父代理据此挑多模态模型。
+        // inputModalities 一律 text+image(入口门放行带图消息,与 resolveModel
+        // 的 surface 口径一致);真实能力只体现在 description 后缀。
         const models = all.map((id) => {
           const capability = this.capabilities.capabilityOf(id)
           return {
@@ -1046,7 +1057,7 @@ export class CodebuddyLlmAdapter extends LlmAdapter {
             id,
             name: id,
             description: `CodeBuddy (ACP) model ${id}${capability.supportsImages ? ' · 支持图片输入' : ' · 仅文本'}`,
-            inputModalities: capability.supportsImages ? ['text', 'image'] as const : ['text'] as const,
+            inputModalities: ['text', 'image'] as const,
           }
         })
         this.modelCache = { models, at: Date.now() }

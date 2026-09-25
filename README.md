@@ -22,25 +22,26 @@
 | **opt-in 工具** | `subagent_codebuddy` + `list_codebuddy_models`（`registerSubagentTools: true` 开启；默认关闭，推荐通用工具） |
 | **压缩归属** | codebuddy 会话的压缩由 **CLI 负责**（dsh 的自动压缩被插件接管，不压镜像）；CLI 压完之后镜像成 dsh 的标准压缩卡，**零 token**（见 §三「压缩归属」） |
 
-**语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**内置工具已全部禁用**
-（spawn 传 `--tools ""`；delegate 模式只放行委托工具合成器 `DelegateTool`，见 §三「工具桥」）。
+**语义说明（主代理轮，重要）**：ACP CLI 自带 agent 循环，但它的**内置工具只放行 `Read`**
+（spawn 传 `--tools Read`——读图必需，见下；delegate 模式为 `DelegateTool,Read`，见 §三「工具桥」）。
 因此：
 
-- 模型的全部工具面 = dsh 侧工具（MCP 模式下是 `mcp__dsh__bash` / `mcp__dsh__edit`
-  / `mcp__dsh__read_image` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）。这些调用
+- 模型的工具面 = dsh 侧工具（MCP 模式下是 `mcp__dsh__bash` / `mcp__dsh__edit`
+  / `mcp__dsh__read_image` …，delegate 模式下是 `dsh_bash` / `dsh_edit` …）+ CLI 原生 `Read`。dsh 工具调用
   **在 dsh 侧执行，受 dsh 的沙箱与审批约束**，并进会话日志、审计与后台任务面板。
-- 读图片按**模型模态**分流：多模态模型（`~/.codebuddy/models.json` 的 `supportsImages: true`）走 dsh 的
-  `read_image`——图片既作为图片进入 CLI 侧模型的上下文（MCP image 内容块），也进 dsh 会话出图片卡片；
-  仅文本或**未登记**的模型（`glm-5.3` 这类不在 models.json 的 id 一律按仅文本）走 `read_image_agy`
-  （AGY 读图后返回文字描述）。指路由尾注与 system 位下发，dsh-llm-agy 的闸门做硬校验
-  （见其 README「按模型模态分流读图工具」；想用 AGY 转述时可在设置里关掉该闸门）。
-  模型目录（主选择器 / `list_subagent_models` / 设置卡「获取所有模型」）都带 `· 支持图片输入` / `· 仅文本` 后缀。
+- 读图片走 **CLI 原生 `Read`**：CLI 的内置读图管线对任意模型适配（实测纯文本模型经
+  Read 读图也能看到图片内容），而 **MCP 工具结果里的图片会被 CLI 按模型能力过滤**
+  （`function_call_result` → `[Image content filtered - current model does not support
+  images]`）。dsh 的 `read_image` 仍可用（对支持图片的模型更直接：图片经 MCP image
+  内容块回传，与 CLI 原生读图落点相同）；`read_image_agy`（AGY 转述）作为兜底与用户
+  显式要求的选项保留。指路由尾注与 system 位下发。
+  模型目录（主选择器 / `list_subagent_models` / 设置卡「获取所有模型」）带 `· 支持图片输入` / `· 仅文本` 后缀。
 - 文本/思考/工具卡片仍以会话事件实时回传 dsh 界面。
 
-> 为什么全禁而不是白名单（2026-09-18）：CLI 原生工具要进 dsh 会话，必须在会话 scope 注册
+> 为什么几乎全禁而不是白名单（2026-09-18）：CLI 原生工具要进 dsh 会话，必须在会话 scope 注册
 > 「回放镜像」承接；镜像注册一旦丢失，该会话的原生调用就永久报 `unknown tool "cli_read"`
-> （偶发、不可复现）。全禁后这条路径不再被触发。
-> 逃生口：`extraArgs` 排在 `--tools` 之后，可用 `extraArgs: ['--tools', 'Read']` 覆盖本策略。
+> （偶发、不可复现）。全禁后这条路径不再被触发；`Read` 是唯一例外（读图通道，见上）。
+> 逃生口：`extraArgs` 排在 `--tools` 之后，可用 `extraArgs: ['--tools', 'default']` 覆盖本策略。
 > 历史注记：更早的版本让 CLI 用自己的工具链、dsh 沙箱不参与——**安全模型以本节为准**。
 
 ## 二、快速开始
@@ -120,7 +121,7 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 
 ```
 主代理轮:  会话模型选择器 → codebuddy/<id> → CodebuddyLlmAdapter
-              └─ spawn codebuddy --acp --tools "" [--mcp-config <会话专属配置>]
+              └─ spawn codebuddy --acp --tools Read [--mcp-config <会话专属配置>]
                    → initialize → session/new|load → session/prompt
                    └─ session/update(思考/文本/工具)→ 写入调用方已打开的 step
               └─ 工具调用回流:CLI 调 mcp__dsh__<名> ──HTTP JSON-RPC──▶ dsh MCP 端点
@@ -131,7 +132,8 @@ node scripts/link-profile.mjs            # 默认装配进 web profile
 
 ### 工具桥（MCP / delegate）
 
-CLI 内置工具已全部禁用（`--tools ""`，见 §一「语义说明」），模型的一切能力必须由 dsh 提供。
+CLI 内置工具只放行 `Read`（`--tools Read`，读图通道，见 §一「语义说明」），其余全部禁用，
+模型的能力面 = dsh 工具 + 原生 Read。
 插件把**当前会话可见的 dsh 工具**暴露给 CLI，两条通道：
 
 | | `mcp`（默认） | `delegate`（回退） |

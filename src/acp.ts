@@ -41,11 +41,13 @@ export const DEFAULT_ACP_RUN_TIMEOUTS = {
  * - CLI 原生工具要进 dsh 会话,必须在会话 scope 注册「回放镜像」承接;镜像
  *   注册一旦丢失,该会话的原生调用就永久报 `unknown tool "cli_read"`(偶发、
  *   难复现)。禁掉内置工具 = 镜像路径不再被触发,这一失败面整体消失;
- * - 原白名单里的 Read/ToolSearch/Skill/WebSearch 与 dsh 侧能力重复:走 dsh
+ * - 原白名单里的 ToolSearch/Skill/WebSearch 与 dsh 侧能力重复:走 dsh
  *   才有审批/沙箱/会话审计/后台面板;
- * - 图片改走 dsh 原生 `read_image`(经 MCP 通道回传 image 内容块,CLI 侧
- *   `convertMcpResult` 转 `image_url` 喂给它自己的模型——与走原生 Read 时
- *   看图的模型完全相同)。
+ * - **Read 例外(读图必需)**:MCP 工具结果里的图片会被 CLI 按模型能力过滤
+ *   (`function_call_result` → `[Image content filtered - current model does
+ *   not support images]`),而 CLI 内置 Read 的图片不走该过滤(实测纯文本
+ *   模型经 Read 读图也能看到图片内容)——读图走 Read 是唯一对任意模型
+ *   可用的通道;dsh 原生 `read_image` 仍保留(对支持图片的模型更直接)。
  *
  * 为什么用 `--tools` 而不是 `--disallowedTools`:实测(2026-09-13,ACP 对照
  * 实验)`--disallowedTools` 在 `--acp` 模式下**完全不生效**——模型仍报
@@ -61,13 +63,18 @@ export const DEFAULT_ACP_RUN_TIMEOUTS = {
  * **delegate 模式必须放行 `DelegateTool`**:白名单会连同"委托工具合成器"一起
  * 过滤——漏掉它模型只剩只读原生工具、全部 dsh_* 桥工具不可见(实测:模型自称
  * "只有只读权限";只加这一个名字即可放行全部 Dsh-* 委托工具)。mcp 模式不注册
- * 委托工具,故留空。
+ * 委托工具,故只有 Read。
  *
  * 版本升级若新增内置工具:默认不可见(比"漏禁"安全),不再逐个维护白名单。
- * 逃生口:用户 `extraArgs` 排在 `--tools` 之后,可用 `--tools Read` 覆盖本策略。
+ * 逃生口:用户 `extraArgs` 排在 `--tools` 之后,可用 `--tools default` 覆盖本策略。
  */
 export function cliToolPolicyArgs(bridgeMode: 'mcp' | 'delegate' | undefined = 'mcp'): string[] {
-  return ['--tools', bridgeMode === 'delegate' ? 'DelegateTool' : '']
+  // Read 放行(读图必需):CLI 内置读图管线对任意模型适配(实测纯文本模型经
+  // Read 读图也能看到图片内容),而 MCP 工具结果里的图片会被 CLI 按模型能力
+  // 过滤(function_call_result → "[Image content filtered - current model does
+  // not support images]")——对不支持图片的模型,Read 是唯一能拿到图片内容的
+  // 通道。其余内置工具仍全禁(对等能力走 dsh)。
+  return ['--tools', bridgeMode === 'delegate' ? 'DelegateTool,Read' : 'Read']
 }
 
 /** 动态空闲超时预算(测试注入小值压缩时间)。 */

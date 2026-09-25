@@ -59,8 +59,8 @@ describe('buildPrompt:文本序列化', () => {
   })
 })
 
-describe('buildPrompt:图片处理(ACP 原生内容块)', () => {
-  it('图片块转为 base64 内容块;prompt 里不含路径提示', async () => {
+describe('buildPrompt:图片处理(ACP 原生内容块 + 落盘 Read 通道)', () => {
+  it('图片块转为 base64 内容块,并落盘路径提示(Read 通道)', async () => {
     const { ctx, readImage } = makeCtx()
     const { prompt, images } = await buildPrompt(ctx as never, {
       messages: [{
@@ -72,7 +72,11 @@ describe('buildPrompt:图片处理(ACP 原生内容块)', () => {
       }],
     })
     expect(readImage).toHaveBeenCalledTimes(1)
-    expect(prompt).toBe('User: 看图')
+    expect(prompt).toContain('User: 看图')
+    // 落盘路径提示:CLI 对不支持图片的模型会过滤 ACP/工具结果图片,
+    // 模型按此路径用 Read 读图(CLI 原生 Read 不过滤)。
+    expect(prompt).toContain('[图片已保存到本地文件:')
+    expect(prompt).toContain('(用 Read 工具读取查看)]')
     expect(prompt).not.toContain('附带图片')
     expect(images).toEqual([{ data: Buffer.from([1, 2, 3, 4]).toString('base64'), mimeType: 'image/png' }])
   })
@@ -106,8 +110,37 @@ describe('buildPrompt:图片处理(ACP 原生内容块)', () => {
         source: { kind: 'user' },
       } as unknown as Message,
     ])
-    expect(prompt).toBe('新问题带图')
+    expect(prompt).toContain('新问题带图')
+    expect(prompt).toContain('[图片已保存到本地文件:')
     expect(images.length).toBe(1)
+  })
+
+  it('tool-result 内嵌图片(read_image 结果)被收集为内容块', async () => {
+    const { ctx, readImage } = makeCtx()
+    const { prompt, images } = await buildPrompt(ctx as never, {
+      messages: [
+        textMessage('user', '看这张图'),
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'c1',
+            content: [
+              { type: 'text', text: '[图片: 1272x2800]' },
+              { type: 'image', attachment: { attachmentId: 'img-tool-1' } },
+            ],
+          }],
+          source: { kind: 'tool', callId: 'c1' },
+        } as unknown as Message,
+      ],
+    })
+    expect(readImage).toHaveBeenCalledTimes(1)
+    expect(prompt).toContain('[图片: 1272x2800]')
+    expect(images).toEqual([{ data: Buffer.from([1, 2, 3, 4]).toString('base64'), mimeType: 'image/png' }])
   })
 })
 

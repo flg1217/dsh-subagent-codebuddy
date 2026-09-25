@@ -190,11 +190,11 @@ describe('system 记录的读图引导', () => {
     const native = await messagesToRecords([user('u1', 'hi')], context, undefined, '系统纪律', 'delegate', 'native')
     const nativeText = JSON.stringify(native[0]?.content)
     expect(nativeText).toContain('系统纪律')
-    expect(nativeText).toContain('读图片用 dsh_read_image')
+    expect(nativeText).toContain('读图片用 Read 工具')
     expect(nativeText).not.toContain('read_image_agy——')
 
     const textOnly = await messagesToRecords([user('u1', 'hi')], context, undefined, '系统纪律', 'delegate', 'agy')
     const textOnlyText = JSON.stringify(textOnly[0]?.content)
-    expect(textOnlyText).toContain('读图片一律用 dsh_read_image_agy')
+    expect(textOnlyText).toContain('读图片用 dsh_read_image_agy')
   })
 })
