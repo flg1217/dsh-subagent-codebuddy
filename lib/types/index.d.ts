@@ -16,28 +16,48 @@
  * 供主模型选择器与 list_subagent_models 使用(带缓存,永不抛错)。
  * @module subagent-codebuddy
  */
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Volatile } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 export declare const name = "subagent-codebuddy";
 export declare const inject: string[];
+/** 设置输入面(profile patch 条目 config / 表单写入的原始值;缺省走 schema 默认)。 */
+export interface CodebuddyConfigInput {
+    command?: string;
+    model?: string;
+    permissionMode?: string;
+    registerSubagentTools?: boolean;
+    bridgeMode?: 'mcp' | 'delegate';
+    extraArgs?: string[];
+    providerName?: string;
+    toolName?: string;
+    longToolCapMinutes?: number;
+    tailQuietSeconds?: number;
+    tailBgQuietMinutes?: number;
+    tailCapMinutes?: number;
+    idleWrapSeconds?: number;
+}
+/**
+ * 本插件配置面(profile 条目 id = `subagent-codebuddy`;即设置表单)。
+ * 前 5 个字段 volatile = 设置面板可编辑、读取即活引用;其余仅 profile
+ * patch 可编辑(不进表单,普通配置)。
+ */
 export interface Config {
     /** 可执行文件,默认 `codebuddy`。 */
-    command?: string;
+    command: Volatile<string>;
     /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
-    model?: string;
-    /**
-     * 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`
-     * (CodeBuddy 工具调用自动放行,不询问)。
-     */
-    permissionMode?: string;
+    model: Volatile<string>;
+    /** 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`(自动放行)。 */
+    permissionMode: Volatile<string>;
+    /** 是否注册 opt-in 委派工具(默认关闭)。 */
+    registerSubagentTools: Volatile<boolean>;
+    /** 工具桥接模式(默认 `mcp`)。 */
+    bridgeMode: Volatile<'mcp' | 'delegate'>;
     /** 追加的额外 CodeBuddy 参数。 */
-    extraArgs?: string[];
+    extraArgs: string[];
     /** LLM provider 路由名,默认 `codebuddy`。 */
-    providerName?: string;
+    providerName: string;
     /** opt-in 工具名,默认 `subagent_codebuddy`。 */
-    toolName?: string;
-    /** 是否注册 opt-in 委派工具(默认关闭;设置面板同名开关优先)。 */
-    registerSubagentTools?: boolean;
+    toolName: string;
     /**
      * 静默长工具硬顶(分钟,默认 30;0 = 关闭硬顶)。
      * 只影响「发起后零事件」的工具段——任何中间进展(文本/思考/工具 update)
@@ -45,7 +65,7 @@ export interface Config {
      * 并**自动续跑**(stall 重试);被误杀的工具通常工作已落盘,重跑代价可控。
      * 设为 0 则永不因静默中止(接受 CLI 卡死时进程泄漏、子会话回合悬空的风险)。
      */
-    longToolCapMinutes?: number;
+    longToolCapMinutes: number;
     /**
      * 尾巴窗口静默阈值(秒,默认 5;0 = 关闭)。
      *
@@ -56,7 +76,7 @@ export interface Config {
      * `idle` 且静默达到本阈值(普通回合的额外延迟就是这个值)、或 CLI 广播
      * `session_end`(真正空闲,立即收尾)、或撞上 {@link tailCapMinutes}。
      */
-    tailQuietSeconds?: number;
+    tailQuietSeconds: number;
     /**
      * 起了后台任务的回合的静默阈值(分钟,默认 10)。
      *
@@ -64,9 +84,9 @@ export interface Config {
      * (工具参数 `run_in_background`/`background`)后,尾巴窗口放宽到本阈值,
      * 等它跑完的自发续跑;续跑内容一出现即回到 tailQuietSeconds。
      */
-    tailBgQuietMinutes?: number;
+    tailBgQuietMinutes: number;
     /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
-    tailCapMinutes?: number;
+    tailCapMinutes: number;
     /**
      * 「prompt 结果挂起但 CLI 已空闲」的强制收尾预算(秒,默认 30;0 = 关闭)。
      *
@@ -74,14 +94,7 @@ export interface Config {
      * (工具名不存在 → ModelBehaviorError → error-recovery 重新请求模型,首个
      * 内容块 5-8s 才到)。预算太小会把重试连同进程一起杀掉,对话无声中断。
      */
-    idleWrapSeconds?: number;
-    /**
-     * 工具桥接模式(默认 `mcp`)。
-     * - `mcp`:dsh 起 HTTP MCP server,CLI 每回合以 `--mcp-config` 连接,
-     *   工具以 `mcp__dsh__<工具名>` 一等公民呈现(完整 schema 强约束);
-     * - `delegate`:旧通道(Dsh-* 委托工具 + DelegateTool 合成),保留作回退。
-     */
-    bridgeMode?: 'mcp' | 'delegate';
+    idleWrapSeconds: number;
 }
-export declare const Config: z<Config>;
+export declare const Config: z<CodebuddyConfigInput, Config>;
 export declare function apply(ctx: Context, config: Config): void;

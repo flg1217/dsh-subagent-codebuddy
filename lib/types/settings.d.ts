@@ -1,31 +1,14 @@
 /**
  * CodeBuddy 设置面板支持(服务端):
- * - 模型探测通道:客户端卡片按钮走 api.llm.discoverModels({
- *     settingsNs: 'codebuddy', provider: 'status' | 'test' }),
- *   服务端直接 spawn codebuddy CLI,不落会话、不动源码。
+ * - 模型探测通道:客户端卡片按钮走自建路由(见 models-route.ts);官方
+ *   discoverModels 通道一并保留(settingsNs = profile 条目 id)。
  * - provider 'status' → 检测安装/登录;provider 'test' → 真实连通性测试。
  * @module subagent-codebuddy/settings
  */
 import type { Context } from '@deepseek-ai/cordis';
-import z from '@deepseek-ai/schemastery';
-import type { Config } from './index.js';
-/** 模型探测通道的 settingsNs 键(客户端卡片与之对应)。 */
-export declare const CODEBUDDY_SETTINGS_NAMESPACE = "codebuddy";
-/** 设置表单 schema(与插件 Config 对齐;设置面板可编辑,重启后生效)。 */
-export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<NoInfer<{
-    command: z<string, string, "defined">;
-    model: z<string, string, "defined">;
-    permissionMode: z<string, string, "defined">;
-    registerSubagentTools: z<boolean, boolean, "defined">;
-    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate", "defined">;
-}>>, Schemastery.ObjectT<NoInfer<{
-    command: z<string, string, "defined">;
-    model: z<string, string, "defined">;
-    permissionMode: z<string, string, "defined">;
-    registerSubagentTools: z<boolean, boolean, "defined">;
-    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate", "defined">;
-}>>, "plain">;
-/** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
+/** 模型探测通道的 settingsNs 键 = profile 条目 id(客户端卡片与之对应)。 */
+export declare const CODEBUDDY_SETTINGS_NAMESPACE = "subagent-codebuddy";
+/** 当前生效的 CodeBuddy 配置(从 volatile 活引用实时读取)。 */
 export interface EffectiveCodebuddySettings {
     command: string;
     model: string;
@@ -58,12 +41,8 @@ export declare function codebuddyTest(command: string, prefixArgs: string[]): Pr
     output: string;
 }>;
 /**
- * 注册设置区与模型探测通道(客户端卡片按钮走 api.llm.discoverModels,不落会话)。
- * 设置区是卡片在"设置 → 插件"页出现的前提:该页按 settings namespace
- * 派发卡片(key = namespace);表单值优先于插件行配置,改动后重启生效。
+ * 注册模型探测通道(客户端卡片按钮走自建路由,不落会话)。
  * @param ctx - 插件上下文。
- * @param config - 插件行配置(兜底值)。
- * @param onSettingsChange - 设置保存后的回调(用于实时同步 opt-in 工具注册)。
- * @returns 读取当前生效配置的函数。
+ * @param settingsOf - 读取当前生效配置的 thunk(命令/模型实时,面板改动即时生效)。
  */
-export declare function registerCodebuddySettings(ctx: Context, config: Config, onSettingsChange?: () => void): () => EffectiveCodebuddySettings;
+export declare function registerCodebuddySettings(ctx: Context, settingsOf: () => EffectiveCodebuddySettings): void;

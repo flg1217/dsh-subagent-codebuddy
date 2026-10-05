@@ -17,7 +17,7 @@
  * @module subagent-codebuddy
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { CodebuddyLlmAdapter } from './adapter.js'
 import { ConversationStore } from './conversations.js'
@@ -27,6 +27,7 @@ import { syncCliIntegrations } from './cli-integrations.js'
 import { registerSubagentTool } from './subagent-tool.js'
 import { registerCodebuddyModelsTool } from './models.js'
 import { registerCodebuddySettings, resolveSpawnableCommand } from './settings.js'
+import type { EffectiveCodebuddySettings } from './settings.js'
 import { registerCodebuddyModelsRoute } from './models-route.js'
 import { registerDshMcpServer } from '@flg1217/dsh-mcp'
 import { sweepStaleMcpConfigs } from './mcp-config.js'
@@ -38,24 +39,45 @@ export const name = 'subagent-codebuddy'
 // 经 ctx.inject 惰性获取,LLM-only 组合下插件照常加载。
 export const inject = ['llm']
 
+/** 设置输入面(profile patch 条目 config / 表单写入的原始值;缺省走 schema 默认)。 */
+export interface CodebuddyConfigInput {
+  command?: string
+  model?: string
+  permissionMode?: string
+  registerSubagentTools?: boolean
+  bridgeMode?: 'mcp' | 'delegate'
+  extraArgs?: string[]
+  providerName?: string
+  toolName?: string
+  longToolCapMinutes?: number
+  tailQuietSeconds?: number
+  tailBgQuietMinutes?: number
+  tailCapMinutes?: number
+  idleWrapSeconds?: number
+}
+
+/**
+ * 本插件配置面(profile 条目 id = `subagent-codebuddy`;即设置表单)。
+ * 前 5 个字段 volatile = 设置面板可编辑、读取即活引用;其余仅 profile
+ * patch 可编辑(不进表单,普通配置)。
+ */
 export interface Config {
   /** 可执行文件,默认 `codebuddy`。 */
-  command?: string
+  command: Volatile<string>
   /** 默认 CodeBuddy 模型 ID,默认 `deepseek-v4-flash`。 */
-  model?: string
-  /**
-   * 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`
-   * (CodeBuddy 工具调用自动放行,不询问)。
-   */
-  permissionMode?: string
+  model: Volatile<string>
+  /** 传给 `--permission-mode` 的权限模式,默认 `bypassPermissions`(自动放行)。 */
+  permissionMode: Volatile<string>
+  /** 是否注册 opt-in 委派工具(默认关闭)。 */
+  registerSubagentTools: Volatile<boolean>
+  /** 工具桥接模式(默认 `mcp`)。 */
+  bridgeMode: Volatile<'mcp' | 'delegate'>
   /** 追加的额外 CodeBuddy 参数。 */
-  extraArgs?: string[]
+  extraArgs: string[]
   /** LLM provider 路由名,默认 `codebuddy`。 */
-  providerName?: string
+  providerName: string
   /** opt-in 工具名,默认 `subagent_codebuddy`。 */
-  toolName?: string
-  /** 是否注册 opt-in 委派工具(默认关闭;设置面板同名开关优先)。 */
-  registerSubagentTools?: boolean
+  toolName: string
   /**
    * 静默长工具硬顶(分钟,默认 30;0 = 关闭硬顶)。
    * 只影响「发起后零事件」的工具段——任何中间进展(文本/思考/工具 update)
@@ -63,7 +85,7 @@ export interface Config {
    * 并**自动续跑**(stall 重试);被误杀的工具通常工作已落盘,重跑代价可控。
    * 设为 0 则永不因静默中止(接受 CLI 卡死时进程泄漏、子会话回合悬空的风险)。
    */
-  longToolCapMinutes?: number
+  longToolCapMinutes: number
   /**
    * 尾巴窗口静默阈值(秒,默认 5;0 = 关闭)。
    *
@@ -74,7 +96,7 @@ export interface Config {
    * `idle` 且静默达到本阈值(普通回合的额外延迟就是这个值)、或 CLI 广播
    * `session_end`(真正空闲,立即收尾)、或撞上 {@link tailCapMinutes}。
    */
-  tailQuietSeconds?: number
+  tailQuietSeconds: number
   /**
    * 起了后台任务的回合的静默阈值(分钟,默认 10)。
    *
@@ -82,9 +104,9 @@ export interface Config {
    * (工具参数 `run_in_background`/`background`)后,尾巴窗口放宽到本阈值,
    * 等它跑完的自发续跑;续跑内容一出现即回到 tailQuietSeconds。
    */
-  tailBgQuietMinutes?: number
+  tailBgQuietMinutes: number
   /** 尾巴窗口硬顶(分钟,默认 30):后台任务最长可拖着回合不闭合的时长。 */
-  tailCapMinutes?: number
+  tailCapMinutes: number
   /**
    * 「prompt 结果挂起但 CLI 已空闲」的强制收尾预算(秒,默认 30;0 = 关闭)。
    *
@@ -92,35 +114,39 @@ export interface Config {
    * (工具名不存在 → ModelBehaviorError → error-recovery 重新请求模型,首个
    * 内容块 5-8s 才到)。预算太小会把重试连同进程一起杀掉,对话无声中断。
    */
-  idleWrapSeconds?: number
-  /**
-   * 工具桥接模式(默认 `mcp`)。
-   * - `mcp`:dsh 起 HTTP MCP server,CLI 每回合以 `--mcp-config` 连接,
-   *   工具以 `mcp__dsh__<工具名>` 一等公民呈现(完整 schema 强约束);
-   * - `delegate`:旧通道(Dsh-* 委托工具 + DelegateTool 合成),保留作回退。
-   */
-  bridgeMode?: 'mcp' | 'delegate'
+  idleWrapSeconds: number
 }
 
-export const Config: z<Config> = z.object({
-  command: z.string().default('codebuddy'),
-  model: z.string().default('deepseek-v4-flash'),
-  permissionMode: z.string().default('bypassPermissions'),
+export const Config: z<CodebuddyConfigInput, Config> = z.object({
+  command: z.string().default('codebuddy')
+    .description('codebuddy 可执行文件命令(默认 codebuddy)').volatile(),
+  model: z.string().default('deepseek-v4-flash')
+    .description('子代理使用的默认模型(委派时可传 model 参数覆盖)').volatile(),
+  permissionMode: z.string().default('bypassPermissions')
+    .description('--permission-mode:子代理工具调用自动放行').volatile(),
+  registerSubagentTools: z.boolean().default(false)
+    .description('提供旧版自定义委派工具(subagent_codebuddy / list_codebuddy_models);默认关闭,推荐用通用 subagent 工具 + 模型选择').volatile(),
+  bridgeMode: z.union([z.const('mcp'), z.const('delegate')]).default('mcp')
+    .description('工具桥接模式:mcp=dsh 提供 HTTP MCP server(完整 schema,推荐);delegate=旧 DelegateTool 通道(回退用)').volatile(),
   extraArgs: z.array(z.string()).default([]),
   providerName: z.string().default('codebuddy'),
   toolName: z.string().default('subagent_codebuddy'),
-  registerSubagentTools: z.boolean().default(false),
   longToolCapMinutes: z.number().default(30),
   tailQuietSeconds: z.number().default(5),
   tailBgQuietMinutes: z.number().default(10),
   tailCapMinutes: z.number().default(30),
   idleWrapSeconds: z.number().default(30),
-  bridgeMode: z.union([z.const('mcp'), z.const('delegate')]).default('mcp'),
 })
 
 export function apply(ctx: Context, config: Config): void {
-  const providerName = config.providerName ?? 'codebuddy'
-  const toolName = config.toolName ?? 'subagent_codebuddy'
+  const providerName = config.providerName
+  const toolName = config.toolName
+
+  // 设置面板:本插件自带页面(客户端 settings.plugins.tab),关掉按 schema
+  // 自动生成表单的策略(0.2.1 起替代旧 installSection;策略不移除配置读写)。
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
+  })
 
   // 装载时先同步一次 dsh→CodeBuddy 的原生接入(MCP 配置 / skills 目录);
   // 每个 CodeBuddy 进程启动前(pump/adapter)还会再同步,保证读到最新。
@@ -141,9 +167,18 @@ export function apply(ctx: Context, config: Config): void {
   let toolCtx: Context | undefined
   let disposers: Array<() => void> = []
 
-  // 设置面板通道 + 设置区:卡片显示的前提(该页按 settings namespace 派发卡片);
-  // 表单值优先于插件行配置,返回的 thunk 读取当前生效配置。onChange 实时同步工具。
-  const settingsOf = registerCodebuddySettings(ctx, config, () => syncTools())
+  // 设置通道:模型探测注册走 registerCodebuddySettings;生效配置从 volatile
+  // 活引用实时读取(空串视为未配置,回退内建默认;面板清空字段时不能因
+  // '' 覆盖兜底值导致 spawn ENOENT)。返回的 thunk 供 adapter / 路由实时读。
+  const filled = (value: string): string | undefined => value.trim().length > 0 ? value : undefined
+  const settingsOf = (): EffectiveCodebuddySettings => ({
+    command: filled(config.command.get()) ?? 'codebuddy',
+    model: filled(config.model.get()) ?? 'deepseek-v4-flash',
+    permissionMode: filled(config.permissionMode.get()) ?? 'bypassPermissions',
+    registerSubagentTools: config.registerSubagentTools.get(),
+    bridgeMode: config.bridgeMode.get(),
+  })
+  registerCodebuddySettings(ctx, settingsOf)
   const eff = settingsOf()
   const resolved = resolveSpawnableCommand(eff.command)
 
@@ -159,18 +194,18 @@ export function apply(ctx: Context, config: Config): void {
     prefixArgs: resolved.args,
     modelOf: () => settingsOf().model,
     permissionMode: eff.permissionMode,
-    extraArgs: config.extraArgs ?? [],
+    extraArgs: config.extraArgs,
     bridgeMode: eff.bridgeMode,
     store: conversations,
     // 静默长工具硬顶(分钟 → 毫秒;0 = 关闭)。看门狗超顶时 cancel+强杀,走
     // stall 重试自动续跑——防止 CLI 卡死时进程泄漏、子会话回合悬空。
     // 尾巴窗口(秒/分钟 → 毫秒;0 = 关闭)见 Config.tailQuietSeconds。
     timeouts: {
-      guardCapMs: (config.longToolCapMinutes ?? 30) * 60_000,
-      tailQuietMs: (config.tailQuietSeconds ?? 5) * 1_000,
-      tailBgQuietMs: (config.tailBgQuietMinutes ?? 10) * 60_000,
-      tailCapMs: (config.tailCapMinutes ?? 30) * 60_000,
-      idleWrapMs: (config.idleWrapSeconds ?? 30) * 1_000,
+      guardCapMs: config.longToolCapMinutes * 60_000,
+      tailQuietMs: config.tailQuietSeconds * 1_000,
+      tailBgQuietMs: config.tailBgQuietMinutes * 60_000,
+      tailCapMs: config.tailCapMinutes * 60_000,
+      idleWrapMs: config.idleWrapSeconds * 1_000,
     },
   }))
 
@@ -180,7 +215,7 @@ export function apply(ctx: Context, config: Config): void {
     ctx,
     command: resolved.command,
     prefixArgs: resolved.args,
-    extraArgs: config.extraArgs ?? [],
+    extraArgs: config.extraArgs,
     modelOf: () => settingsOf().model,
     conversations,
     providerName,
@@ -191,7 +226,7 @@ export function apply(ctx: Context, config: Config): void {
     ctx,
     command: resolved.command,
     prefixArgs: resolved.args,
-    extraArgs: config.extraArgs ?? [],
+    extraArgs: config.extraArgs,
     modelOf: () => settingsOf().model,
     conversations,
     providerName,
@@ -260,5 +295,11 @@ export function apply(ctx: Context, config: Config): void {
       disposers = []
       toolCtx = undefined
     }
+  })
+
+  // 设置保存后实时同步 opt-in 工具注册(旧 installSection onChange 的替代;
+  // 0.2.1 起设置事件名为 settings/document-updated,ns = profile 条目 id)。
+  ctx.on('settings/document-updated', (ns: string) => {
+    if (ns === 'subagent-codebuddy') syncTools()
   })
 }

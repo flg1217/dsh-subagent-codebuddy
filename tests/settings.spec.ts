@@ -1,67 +1,31 @@
 /**
- * bridgeMode 设置解析优先级回归:用户层(表单)显式值优先,插件行配置只作兜底——
- * 旧的 OR 合成会让配置 delegate 一票否决表单里的 mcp(面板开了也切不回)。
+ * 设置解析回归(0.2.1 volatile 模型):bridgeMode 等字段的取值由 Config schema
+ * 解析(profile 条目 config 作 base 层、表单写入覆盖)+ 插件 apply 的 filled()
+ * 空串兜底组成。
+ *
+ * 旧回归背景:0.1.3 的 OR 合成会让配置 delegate 一票否决表单里的 mcp——现在
+ * 插件不再手工合成两层,该 bug 类在结构上不可能再出现;此文件锁定 schema
+ * 默认值与显式值的解析行为,以及空串回退默认(防 spawn ENOENT)。
  */
 import { describe, expect, it } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
-import { registerCodebuddySettings } from '../src/settings.ts'
+import { Config } from '../src/index.ts'
 
-interface Harness {
-  ctx: Context
-  setUser: (values: Record<string, unknown>) => void
-  entry: () => Record<string, unknown>
-}
-
-function makeHarness(): Harness {
-  let user: Record<string, unknown> = {}
-  let entry: Record<string, unknown> = {}
-  const settingsFace = {
-    installSection: (
-      _owner: unknown, _ns: string, _schema: unknown,
-      base: Record<string, unknown>,
-      hooks: { setSource: (source: () => Record<string, unknown>) => void },
-    ): void => {
-      entry = base
-      // 近似真实语义:resolved = base(组装层) ∪ user(用户层)。
-      hooks.setSource(() => ({ ...base, ...user }))
-    },
-  }
-  const ctx = {
-    inject: (_deps: string[], fn: (injected: Context) => void): void => {
-      fn({ get: (key: string): unknown => (key === 'settings' ? settingsFace : undefined) } as unknown as Context)
-    },
-    get: (): undefined => undefined,
-  } as unknown as Context
-  return { ctx, setUser: (values) => { user = values }, entry: () => entry }
-}
-
-function effective(userValues: Record<string, unknown>, configBridge: 'mcp' | 'delegate' | undefined): {
-  bridgeMode: string
-  entry: Record<string, unknown>
-} {
-  const h = makeHarness()
-  const sectionOf = registerCodebuddySettings(h.ctx, { bridgeMode: configBridge } as never)
-  h.setUser(userValues)
-  return { bridgeMode: sectionOf().bridgeMode, entry: h.entry() }
-}
-
-describe('settings:bridgeMode 解析(表单优先,配置兜底)', () => {
-  it('表单显式 mcp 覆盖配置 delegate(回归:配置一票否决已移除)', () => {
-    expect(effective({ bridgeMode: 'mcp' }, 'delegate').bridgeMode).toBe('mcp')
+describe('settings:Config schema 解析', () => {
+  it('显式值覆盖默认:bridgeMode 两个方向都生效', () => {
+    expect(Config({ bridgeMode: 'delegate' }).bridgeMode.get()).toBe('delegate')
+    expect(Config({ bridgeMode: 'mcp' }).bridgeMode.get()).toBe('mcp')
   })
 
-  it('表单显式 delegate 覆盖配置 mcp', () => {
-    expect(effective({ bridgeMode: 'delegate' }, 'mcp').bridgeMode).toBe('delegate')
+  it('缺省 → schema 默认(mcp / codebuddy / deepseek-v4-flash / 自动放行)', () => {
+    const config = Config({})
+    expect(config.bridgeMode.get()).toBe('mcp')
+    expect(config.command.get()).toBe('codebuddy')
+    expect(config.model.get()).toBe('deepseek-v4-flash')
+    expect(config.permissionMode.get()).toBe('bypassPermissions')
+    expect(config.registerSubagentTools.get()).toBe(false)
   })
 
-  it('表单未设 → 用配置值', () => {
-    expect(effective({}, 'delegate').bridgeMode).toBe('delegate')
-    expect(effective({}, 'mcp').bridgeMode).toBe('mcp')
-  })
-
-  it('都未设 → 默认 mcp;entry(base)携带配置值供面板显示与回落', () => {
-    expect(effective({}, undefined).bridgeMode).toBe('mcp')
-    expect(effective({}, undefined).entry['bridgeMode']).toBe('mcp')
-    expect(effective({}, 'delegate').entry['bridgeMode']).toBe('delegate')
+  it('空串是显式输入:apply 的 filled() 视为未配置回退默认(此处只锁 schema 保留空串)', () => {
+    expect(Config({ command: '' }).command.get()).toBe('')
   })
 })

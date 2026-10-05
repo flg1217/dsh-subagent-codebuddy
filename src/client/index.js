@@ -1,4 +1,4 @@
-// CodeBuddy 子代理插件面板卡片(注册 settings.plugin.item,与 AntiGravity 卡片外观统一)。
+// CodeBuddy 子代理插件面板卡片(注册 settings.plugins.tab,与 AntiGravity 卡片外观统一)。
 // 复用 dsh primitives 组件(Button/图标/writeClipboard)与官方
 // ui-settings-plugins 的 PluginCard/fields CSS(注入同款样式类)。
 // 检测/测试走 api.llm.discoverModels({settingsNs:'codebuddy', provider:'status'|'test'}),
@@ -13,8 +13,8 @@ window.__ModuleLoader__.load({
     const P = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const {
-      Button, Input, Modal, IconLoadingOutline16, IconCheckOutline16, IconRefreshOutline16,
-      IconCopyOutline16, IconChevronDownOutline14, writeClipboard,
+      Button, Input, Modal, IconLoadingOutlineRegular, IconCheckOutlineRegular, IconRefreshOutlineRegular,
+      IconCopyOutlineRegular, IconChevronDownOutlineMedium, writeClipboard,
     } = P
 
     // ── 官方 PluginCard CSS(与 ui-settings-plugins 完全一致) ──
@@ -91,8 +91,8 @@ window.__ModuleLoader__.load({
           react.createElement(Button, {
             size: 'sm', variant: 'ghost', onClick: copy,
             icon: copied
-              ? react.createElement(IconCheckOutline16, { size: 12 })
-              : react.createElement(IconCopyOutline16, { size: 12 }),
+              ? react.createElement(IconCheckOutlineRegular, { size: 12 })
+              : react.createElement(IconCopyOutlineRegular, { size: 12 }),
           }, copied ? '已复制' : '复制'),
         ),
       )
@@ -225,7 +225,7 @@ window.__ModuleLoader__.load({
             react.createElement('span', { className: C.name }, 'CodeBuddy'),
             react.createElement('span', { className: C.description }, 'CodeBuddy 作为主模型(模型选择器可选)与子代理 provider;默认配置、检测安装/登录、连通性测试、安装命令与工具说明'),
           ),
-          react.createElement(IconChevronDownOutline14, { className: `${C.chevron} ${open ? C.chevronOpen : ''}` }),
+          react.createElement(IconChevronDownOutlineMedium, { className: `${C.chevron} ${open ? C.chevronOpen : ''}` }),
         ),
         open && react.createElement('div', { className: C.body },
           // 检测与测试
@@ -233,12 +233,12 @@ window.__ModuleLoader__.load({
             react.createElement(Button, {
               size: 'md', onClick: onStatus, disabled: checking,
               icon: checking
-                ? react.createElement(IconLoadingOutline16, { size: 14 })
-                : react.createElement(IconRefreshOutline16, { size: 14 }),
+                ? react.createElement(IconLoadingOutlineRegular, { size: 14 })
+                : react.createElement(IconRefreshOutlineRegular, { size: 14 }),
             }, checking ? '检测中...' : '检测安装/登录'),
             react.createElement(Button, {
               size: 'md', onClick: onTest, disabled: testing,
-              icon: testing ? react.createElement(IconLoadingOutline16, { size: 14 }) : undefined,
+              icon: testing ? react.createElement(IconLoadingOutlineRegular, { size: 14 }) : undefined,
             }, testing ? '测试中...' : '测试(回复 hi)'),
           ),
           react.createElement('p', { className: C.hint }, '若已安装仍提示未安装,请重启 dsh 服务(PATH 生效后需重启)'),
@@ -252,8 +252,8 @@ window.__ModuleLoader__.load({
               react.createElement(Button, {
                 size: 'sm', variant: 'ghost', onClick: openPicker, disabled: loadingModels,
                 icon: loadingModels
-                  ? react.createElement(IconLoadingOutline16, { size: 12 })
-                  : react.createElement(IconRefreshOutline16, { size: 12 }),
+                  ? react.createElement(IconLoadingOutlineRegular, { size: 12 })
+                  : react.createElement(IconRefreshOutlineRegular, { size: 12 }),
               }, loadingModels ? '获取中...' : '获取模型'),
             ),
             react.createElement(Input, {
@@ -333,7 +333,7 @@ window.__ModuleLoader__.load({
                       onClick: () => pickFromList(m),
                     },
                       react.createElement('span', { className: C.pickerLabel }, m),
-                      m === currentModel && react.createElement(IconCheckOutline16, { className: C.pickerCheck, size: 14 }),
+                      m === currentModel && react.createElement(IconCheckOutlineRegular, { className: C.pickerCheck, size: 14 }),
                     )),
                   ),
           ),
@@ -342,27 +342,26 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      const codebuddyScope = ctx.settingsScope.bind({ namespace: 'codebuddy' })
+      // 0.2.1:settingsScope 已移除;命名空间改为 profile 条目 id(subagent-codebuddy)。
+      const codebuddyScope = ctx.configForms.get('subagent-codebuddy')
       const sectionInject = () => ({
         scope: codebuddyScope,
       })
       ctx.effect(() => {
-        return ctx.slots.inject('settings.plugin.item', () => {
+        return ctx.slots.inject('settings.plugins.tab', () => {
           return ctx.slots.register({
-            name: 'settings.plugin.item',
-            // id(rc.6 list 槽)与 key(rc.7 keyed 槽)都传,兼容两种槽类型。
-            id: 'codebuddy',
-            key: 'codebuddy',
+            name: 'settings.plugins.tab',
+            id: 'subagent-codebuddy',
             order: 31,
             label: () => 'CodeBuddy',
             inject: sectionInject,
           }, CodebuddyCard)
         })
-      }, 'subagent-codebuddy-client: settings.plugin.item')
+      }, 'subagent-codebuddy-client: settings.plugins.tab')
     }
 
     exports.apply = apply
-    exports.inject = ['slots', 'settingsScope']
+    exports.inject = ['slots', 'configForms']
     exports.name = 'subagent-codebuddy-client'
     return module.exports
   },
