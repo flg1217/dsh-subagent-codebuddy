@@ -18,6 +18,21 @@
  * @module subagent-codebuddy/tool-guide
  */
 import type { Context } from '@deepseek-ai/cordis';
+import type { ContextFormed } from '@deepseek-ai/dsh-llm';
+/**
+ * 本插件注入消息的 source。
+ *
+ * 0.2.1 起 `MessageSourceMap` 是 merge-extensible 的:每个生产者在自己的
+ * 模块里声明 kind,通用的 `'plugin'` 兜底已退役(会话格式 v4 明确拒绝
+ * `kind: 'plugin'`)。UI 按 `form: 'notice' + summary` 渲染折叠行,与 kind 无关。
+ */
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        'codebuddy': {
+            kind: 'codebuddy';
+        } & ContextFormed;
+    }
+}
 /**
  * 安装"路由切换 → 工具面说明"注入。
  * @param ctx - 插件上下文(session/event 与 agent/pre-step 两个事件面)。

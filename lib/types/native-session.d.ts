@@ -14,7 +14,7 @@
  * - id 为 UUIDv7(时间序);parentId 串链到前一条记录。
  * @module subagent-codebuddy/native-session
  */
-import type { Message } from '@deepseek-ai/dsh-llm';
+import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 /** 一条 CodeBuddy 原生记录(宽松结构,字段与 CLI 写出的一致)。 */
 export type NativeRecord = Record<string, unknown> & {
     type: string;
@@ -56,7 +56,7 @@ export declare function conversationFilePath(sessionId: string, cwd: string, bas
  * @param images - 图片读取面(缺省时图片退化为 `[图片]` 文本占位)。
  * @returns 记录数组(按时间顺序,可直接写 JSONL)。
  */
-export declare function messagesToRecords(messages: readonly Message[], context: NativeSessionContext, images?: NativeSessionImages, system?: string, bridgeMode?: 'mcp' | 'delegate'): Promise<NativeRecord[]>;
+export declare function messagesToRecords(messages: readonly RequestMessage[], context: NativeSessionContext, images?: NativeSessionImages, system?: string, bridgeMode?: 'mcp' | 'delegate'): Promise<NativeRecord[]>;
 /** 会话文件的头部记录(CLI 自己也会写,合成时补一份保证结构完整)。 */
 export declare function sessionMetaRecords(context: NativeSessionContext): NativeRecord[];
 /** 写入(覆盖)会话文件;原子写(tmp + rename)。 */

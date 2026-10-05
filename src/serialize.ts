@@ -10,7 +10,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
 
 /** 续跑兜底:仅当没有可补发内容时使用。 */
 export const CONTINUE_PROMPT = '继续完成之前未完成的任务,持续推进直到任务完全完成或遇到必须用户决策的阻塞——不要每轮只做一小步就停下汇报。基于当前工作区状态继续,不要重复已完成的工作;全部完成后给出最终结果报告。启动 dev server 等长驻进程时必须用 dsh_bash 的 run_in_background: true 参数后台运行——前台运行永不返回会卡死整个任务。'
@@ -64,8 +64,10 @@ export interface SerializedPrompt {
   skippedForwarded?: boolean
 }
 
-/** 一条消息的可读文本(text + tool-call + tool-result 内嵌文本;图片走内容块)。 */
-function messageText(message: Message): string {
+/** 一条消息的可读文本(text + tool-call 内嵌文本;图片走内容块)。
+ * 工具结果在 0.2.1 起是独立的 `role: 'tool'` 消息,其 content 直接就是结果块,
+ * 由 text 分支天然收集。 */
+function messageText(message: RequestMessage): string {
   const parts: string[] = []
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
@@ -73,10 +75,6 @@ function messageText(message: Message): string {
       // 其他模型轮次的工具调用必须可见:不落文本的话纯工具调用的 assistant
       // 消息文本为空、整条被跳过,CLI 只见结果不见调用(实测丢失)。
       parts.push(`[tool call: ${block.name} ${block.arguments}]`)
-    } else if (block.type === 'tool-result') {
-      for (const inner of block.content) {
-        if (inner.type === 'text') parts.push(inner.text)
-      }
     }
   }
   return parts.join('')
@@ -85,7 +83,7 @@ function messageText(message: Message): string {
 /** 读取一组消息里的图片块(失败跳过),返回 ACP 原生内容块数据。 */
 async function readImages(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
 ): Promise<Array<{ data: string; mimeType: string }>> {
   const attachments = ctx.get('attachments')
   if (attachments === undefined) return []
@@ -114,16 +112,19 @@ async function readImages(
  * 工作区指令、技能目录)同样是 user 角色、且排在用户消息**之后**,
  * 按"最后一条 user 角色"取会把用户输入整条顶掉——实测:压缩完成后
  * 被 claim 的排队消息丢失,模型只看到技能目录提醒。
+ * 0.2.1 起请求级输入(`RequestUserInput`,无 id 无 source)也是用户输入,
+ * 同样命中;它不可能来自插件注入(注入必有 source)。
  *
  * 命中 skipIds(该输入已插话投递过,CLI 已见过)时返回 skippedForwarded,
  * 调用方空跑收尾,不重复发送。
  */
 export async function lastUserPrompt(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   skipIds?: ReadonlySet<string>,
 ): Promise<SerializedPrompt> {
-  const last = [...messages].reverse().find(message => message.role === 'user' && message.source.kind === 'user')
+  const last = [...messages].reverse().find(message =>
+    message.role === 'user' && (message.source === undefined || message.source.kind === 'user'))
   if (last === undefined) return { prompt: CONTINUE_PROMPT, images: [] }
   if (skipIds !== undefined && skipIds.has(String(last.id))) {
     return { prompt: CONTINUE_PROMPT, images: [], skippedForwarded: true }
@@ -158,7 +159,7 @@ export async function lastUserPrompt(
  */
 export async function resumeReplayPrompt(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   sentCount: number | undefined,
   skipIds?: ReadonlySet<string>,
   lastSentMessageId?: string,
@@ -209,7 +210,7 @@ export async function resumeReplayPrompt(
  */
 async function replayFromCheckpoint(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   skipIds: ReadonlySet<string> | undefined,
   ownProvider: string,
 ): Promise<SerializedPrompt> {
@@ -219,7 +220,7 @@ async function replayFromCheckpoint(
 }
 
 /** 最后一次压缩 checkpoint 的下标(没有则 -1)。 */
-function lastCompactionCheckpointIndex(messages: readonly Message[]): number {
+function lastCompactionCheckpointIndex(messages: readonly RequestMessage[]): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (isCompactionCheckpoint(messages[index]!)) return index
   }
@@ -227,13 +228,17 @@ function lastCompactionCheckpointIndex(messages: readonly Message[]): number {
 }
 
 /**
- * 该消息是否压缩 checkpoint(dsh 原生与镜像压缩的 replace 消息,source 同形)。
+ * 该消息是否压缩 checkpoint。
+ *
+ * 0.2.1 起每个生产者声明自己的 source kind,旧 `{ kind: 'plugin', plugin: 'compact' }`
+ * 由会话迁移重写为 `{ kind: 'compact-checkpoint' }`(session-format-v3-to-v4 的
+ * RENAMED_PRODUCERS),所以只认新 kind;旧会话在加载时已迁移。
  * @param message - 折叠视图里的一条消息。
  * @returns true 表示它是压缩 checkpoint。
  */
-function isCompactionCheckpoint(message: Message): boolean {
-  const source = message.source as { kind?: unknown; plugin?: unknown } | undefined
-  return source?.kind === 'plugin' && source.plugin === 'compact'
+function isCompactionCheckpoint(message: RequestMessage): boolean {
+  const source = message.source as { kind?: unknown } | undefined
+  return source?.kind === 'compact-checkpoint'
 }
 
 /**
@@ -242,7 +247,7 @@ function isCompactionCheckpoint(message: Message): boolean {
  * @param limit - 数量锚声明的"已发"条数。
  * @returns true 表示数量锚不可信。
  */
-function hasCompactionCheckpoint(messages: readonly Message[], limit: number): boolean {
+function hasCompactionCheckpoint(messages: readonly RequestMessage[], limit: number): boolean {
   for (let index = 0; index < Math.min(limit, messages.length); index += 1) {
     if (isCompactionCheckpoint(messages[index]!)) return true
   }
@@ -262,14 +267,14 @@ function hasCompactionCheckpoint(messages: readonly Message[], limit: number): b
  */
 async function replayFrom(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   start: number,
   skipIds: ReadonlySet<string> | undefined,
   ownProvider: string,
 ): Promise<SerializedPrompt> {
   let skippedForwarded = false
   let ownTurn = true
-  const selected: Message[] = []
+  const selected: RequestMessage[] = []
   for (let index = start; index < messages.length; index += 1) {
     const message = messages[index]!
     if (skipIds !== undefined && skipIds.has(String(message.id))) {
@@ -280,7 +285,7 @@ async function replayFrom(
       const source = message.source as { kind?: unknown; provider?: unknown } | undefined
       ownTurn = source?.kind === 'model' && source.provider === ownProvider
       if (ownTurn) continue
-    } else if (message.source.kind === 'tool' && ownTurn) {
+    } else if (message.source?.kind === 'tool' && ownTurn) {
       continue
     }
     selected.push(message)
@@ -311,7 +316,7 @@ export async function buildPrompt(
 async function serializeParts(
   ctx: Context,
   parts: string[],
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
 ): Promise<SerializedPrompt> {
   for (const message of messages) {
     const text = messageText(message)

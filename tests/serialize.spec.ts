@@ -278,21 +278,23 @@ describe('resumeReplayPrompt:补发完整性(tool-call / 压缩 / own 过滤)', 
   }
 
   function toolResultMessage(id: string, text: string): Message {
+    // 0.2.1:工具结果是独立的 tool 角色消息,callId/isError 在消息级。
     return {
       id,
-      role: 'user',
-      content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text }] }],
+      role: 'tool',
+      content: [{ type: 'text', text }],
       source: { kind: 'tool', callId: 'c1' },
+      toolCallId: 'c1',
     } as unknown as Message
   }
 
-  /** 压缩 checkpoint(与 dsh 原生/镜像压缩同形:plugin:'compact')。 */
+  /** 压缩 checkpoint(0.2.1 的 source kind 是 'compact-checkpoint')。 */
   function checkpoint(id: string, text: string): Message {
     return {
       id,
       role: 'user',
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'compact', compactionId: 'cp-1' },
+      source: { kind: 'compact-checkpoint', compactionId: 'cp-1' },
     } as unknown as Message
   }
 

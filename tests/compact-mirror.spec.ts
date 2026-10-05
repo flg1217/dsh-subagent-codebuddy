@@ -203,8 +203,8 @@ describe('registerCompactMirror:把 CLI 的压缩镜像成 dsh 压缩事务', ()
     expect(summary!.data['llmStreamCall']).toBeUndefined()
     expect(summary!.data['rawOutput']).toBeUndefined()
     expect(summary!.data['provider']).toBe('codebuddy')
-    // checkpoint 必须带 replace + 插件来源标记,UI 才认它是压缩卡。
-    expect(checkpoint!.data['source']).toEqual({ kind: 'plugin', plugin: 'compact', compactionId })
+    // checkpoint 必须带 replace + compact-checkpoint 来源标记,UI 才认它是压缩卡。
+    expect(checkpoint!.data['source']).toEqual({ kind: 'compact-checkpoint', compactionId })
     expect(checkpoint!.surfaceOp).toEqual({ op: 'replace', start: 1, end: 2 })
     expect(JSON.stringify(checkpoint!.data['content'])).toContain('automatically generated checkpoint')
     expect(end!.data['compactionId']).toBe(compactionId)

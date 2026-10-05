@@ -35,11 +35,13 @@ function msg(id: string, role: 'user' | 'assistant', text: string, source?: Reco
 }
 
 function toolResult(id: string, callId: string, text: string): Message {
+  // 0.2.1:工具结果是独立的 tool 角色消息,callId/isError 在消息级。
   return {
     id,
-    role: 'user',
-    content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text }] }],
+    role: 'tool',
+    content: [{ type: 'text', text }],
     source: { kind: 'tool', callId },
+    toolCallId: callId,
   } as unknown as Message
 }
 

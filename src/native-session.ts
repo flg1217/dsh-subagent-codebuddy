@@ -19,7 +19,7 @@ import { randomBytes } from 'node:crypto'
 import { appendFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import type { Message } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 import { writeImageBlob } from './image-blob.js'
 import { systemInstructionsText } from './serialize.js'
 
@@ -69,16 +69,12 @@ export function conversationFilePath(sessionId: string, cwd: string, baseDir?: s
   return join(root, projectSlug(cwd), `${sessionId}.jsonl`)
 }
 
-/** 一段消息的可读文本(text 块 + tool-result 内嵌文本;图片由调用方单独处理)。 */
-function messageText(message: Message): string {
+/** 一段消息的可读文本(text 块;图片由调用方单独处理)。工具结果是独立的
+ * `role: 'tool'` 消息,在下面按消息处理,不经过这里。 */
+function messageText(message: RequestMessage): string {
   const parts: string[] = []
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
-    else if (block.type === 'tool-result') {
-      for (const inner of block.content) {
-        if (inner.type === 'text') parts.push(inner.text)
-      }
-    }
   }
   return parts.join('')
 }
@@ -96,7 +92,7 @@ function messageText(message: Message): string {
  * @returns 记录数组(按时间顺序,可直接写 JSONL)。
  */
 export async function messagesToRecords(
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   context: NativeSessionContext,
   images?: NativeSessionImages,
   system?: string,
@@ -180,30 +176,26 @@ export async function messagesToRecords(
       }
       continue
     }
-    // user 角色:普通输入或工具结果。
-    if (message.source.kind === 'tool') {
-      for (const block of message.content) {
-        if (block.type !== 'tool-result') continue
-        const callId = String(block.toolCallId)
-        // 每条记录只带本块自己的文本(一条消息可能含多个 tool-result;
-        // 之前整条拼接会让每个记录重复全部结果)。
-        const resultParts: string[] = []
-        for (const inner of block.content) {
-          if (inner.type === 'text') resultParts.push(inner.text)
-        }
-        push({
-          timestamp: stamp(),
-          type: 'function_call_result',
-          name: toolNames.get(callId) ?? 'tool',
-          callId,
-          // 错误结果必须保留失败标记:seed 成 completed 会让 CLI 载入的历史
-          // 里失败调用看起来成功,模型据此继续推理。
-          status: block.isError === true ? 'failed' : 'completed',
-          output: { type: 'text', text: resultParts.join('') },
-          providerData: { agent: 'cli' },
-          ...base(),
-        })
+    // 工具结果:0.2.1 起是独立的 tool 角色消息(一消息一结果),
+    // callId/isError 在消息级,content 直接是结果块。
+    if (message.role === 'tool') {
+      const callId = String(message.toolCallId)
+      const resultParts: string[] = []
+      for (const inner of message.content) {
+        if (inner.type === 'text') resultParts.push(inner.text)
       }
+      push({
+        timestamp: stamp(),
+        type: 'function_call_result',
+        name: toolNames.get(callId) ?? 'tool',
+        callId,
+        // 错误结果必须保留失败标记:seed 成 completed 会让 CLI 载入的历史
+        // 里失败调用看起来成功,模型据此继续推理。
+        status: message.isError === true ? 'failed' : 'completed',
+        output: { type: 'text', text: resultParts.join('') },
+        providerData: { agent: 'cli' },
+        ...base(),
+      })
       continue
     }
     const text = messageText(message)

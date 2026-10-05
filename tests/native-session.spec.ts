@@ -26,16 +26,14 @@ function assistant(id: string, content: Message['content']): Message {
 }
 
 function toolResult(id: string, callId: string, text: string, isError = false): Message {
+  // 0.2.1:工具结果是独立的 tool 角色消息,callId/isError 在消息级。
   return {
     id,
-    role: 'user',
-    content: [{
-      type: 'tool-result',
-      toolCallId: callId,
-      content: [{ type: 'text', text }],
-      ...(isError ? { isError: true } : {}),
-    }],
+    role: 'tool',
+    content: [{ type: 'text', text }],
     source: { kind: 'tool', callId },
+    toolCallId: callId,
+    ...(isError ? { isError: true } : {}),
   } as unknown as Message
 }
 
@@ -118,7 +116,7 @@ describe('messagesToRecords', () => {
     expect(JSON.stringify(withImage)).toContain('[图片]')
   })
 
-  it('压缩 checkpoint(plugin 源的摘要用户消息)按用户消息转换、文本完整保留', async () => {
+  it('压缩 checkpoint(compact-checkpoint 源的摘要用户消息)按用户消息转换、文本完整保留', async () => {
     const checkpoint = {
       id: 'cp1',
       role: 'user',
@@ -126,7 +124,7 @@ describe('messagesToRecords', () => {
         type: 'text',
         text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation.\n\n<summary>要点 A;要点 B</summary>',
       }],
-      source: { kind: 'plugin' },
+      source: { kind: 'compact-checkpoint' },
     } as unknown as Message
     const records = await messagesToRecords([checkpoint, user('u9', '压缩后的新问题')], context)
     expect(records.map(r => r['type'])).toEqual(['message', 'message'])

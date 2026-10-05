@@ -9,7 +9,7 @@
  * @module subagent-codebuddy/serialize
  */
 import type { Context } from '@deepseek-ai/cordis';
-import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm';
 /** 续跑兜底:仅当没有可补发内容时使用。 */
 export declare const CONTINUE_PROMPT = "\u7EE7\u7EED\u5B8C\u6210\u4E4B\u524D\u672A\u5B8C\u6210\u7684\u4EFB\u52A1,\u6301\u7EED\u63A8\u8FDB\u76F4\u5230\u4EFB\u52A1\u5B8C\u5168\u5B8C\u6210\u6216\u9047\u5230\u5FC5\u987B\u7528\u6237\u51B3\u7B56\u7684\u963B\u585E\u2014\u2014\u4E0D\u8981\u6BCF\u8F6E\u53EA\u505A\u4E00\u5C0F\u6B65\u5C31\u505C\u4E0B\u6C47\u62A5\u3002\u57FA\u4E8E\u5F53\u524D\u5DE5\u4F5C\u533A\u72B6\u6001\u7EE7\u7EED,\u4E0D\u8981\u91CD\u590D\u5DF2\u5B8C\u6210\u7684\u5DE5\u4F5C;\u5168\u90E8\u5B8C\u6210\u540E\u7ED9\u51FA\u6700\u7EC8\u7ED3\u679C\u62A5\u544A\u3002\u542F\u52A8 dev server \u7B49\u957F\u9A7B\u8FDB\u7A0B\u65F6\u5FC5\u987B\u7528 dsh_bash \u7684 run_in_background: true \u53C2\u6570\u540E\u53F0\u8FD0\u884C\u2014\u2014\u524D\u53F0\u8FD0\u884C\u6C38\u4E0D\u8FD4\u56DE\u4F1A\u5361\u6B7B\u6574\u4E2A\u4EFB\u52A1\u3002";
 /**
@@ -42,11 +42,13 @@ export interface SerializedPrompt {
  * 工作区指令、技能目录)同样是 user 角色、且排在用户消息**之后**,
  * 按"最后一条 user 角色"取会把用户输入整条顶掉——实测:压缩完成后
  * 被 claim 的排队消息丢失,模型只看到技能目录提醒。
+ * 0.2.1 起请求级输入(`RequestUserInput`,无 id 无 source)也是用户输入,
+ * 同样命中;它不可能来自插件注入(注入必有 source)。
  *
  * 命中 skipIds(该输入已插话投递过,CLI 已见过)时返回 skippedForwarded,
  * 调用方空跑收尾,不重复发送。
  */
-export declare function lastUserPrompt(ctx: Context, messages: readonly Message[], skipIds?: ReadonlySet<string>): Promise<SerializedPrompt>;
+export declare function lastUserPrompt(ctx: Context, messages: readonly RequestMessage[], skipIds?: ReadonlySet<string>): Promise<SerializedPrompt>;
 /**
  * 续聊补发:把"CLI 尚未见过"的消息补发给 CodeBuddy。
  *
@@ -69,6 +71,6 @@ export declare function lastUserPrompt(ctx: Context, messages: readonly Message[
  * @param lastSentMessageId - 上次发送覆盖到的最后一条消息 id(主锚,可选)。
  * @returns 序列化结果(prompt + 原生图片块)。
  */
-export declare function resumeReplayPrompt(ctx: Context, messages: readonly Message[], sentCount: number | undefined, skipIds?: ReadonlySet<string>, lastSentMessageId?: string, ownProvider?: string): Promise<SerializedPrompt>;
+export declare function resumeReplayPrompt(ctx: Context, messages: readonly RequestMessage[], sentCount: number | undefined, skipIds?: ReadonlySet<string>, lastSentMessageId?: string, ownProvider?: string): Promise<SerializedPrompt>;
 /** 把 harness 消息序列化为 CodeBuddy 单轮 prompt;图片走原生内容块。 */
 export declare function buildPrompt(ctx: Context, options: GenerateOptions): Promise<SerializedPrompt>;

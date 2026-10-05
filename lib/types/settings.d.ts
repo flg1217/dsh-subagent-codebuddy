@@ -12,19 +12,19 @@ import type { Config } from './index.js';
 /** 模型探测通道的 settingsNs 键(客户端卡片与之对应)。 */
 export declare const CODEBUDDY_SETTINGS_NAMESPACE = "codebuddy";
 /** 设置表单 schema(与插件 Config 对齐;设置面板可编辑,重启后生效)。 */
-export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<{
-    command: z<string, string>;
-    model: z<string, string>;
-    permissionMode: z<string, string>;
-    registerSubagentTools: z<boolean, boolean>;
-    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate">;
-}>, Schemastery.ObjectT<{
-    command: z<string, string>;
-    model: z<string, string>;
-    permissionMode: z<string, string>;
-    registerSubagentTools: z<boolean, boolean>;
-    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate">;
-}>>;
+export declare const CodebuddySettingsConfig: z<Schemastery.ObjectS<NoInfer<{
+    command: z<string, string, "defined">;
+    model: z<string, string, "defined">;
+    permissionMode: z<string, string, "defined">;
+    registerSubagentTools: z<boolean, boolean, "defined">;
+    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate", "defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    command: z<string, string, "defined">;
+    model: z<string, string, "defined">;
+    permissionMode: z<string, string, "defined">;
+    registerSubagentTools: z<boolean, boolean, "defined">;
+    bridgeMode: z<"mcp" | "delegate", "mcp" | "delegate", "defined">;
+}>>, "plain">;
 /** 当前生效的 CodeBuddy 配置(表单值优先,插件行配置兜底)。 */
 export interface EffectiveCodebuddySettings {
     command: string;
