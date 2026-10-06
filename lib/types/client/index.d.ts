@@ -1,4 +1,5 @@
-// CodeBuddy 子代理插件面板卡片(注册 settings.plugins.tab,与 AntiGravity 卡片外观统一)。
+// CodeBuddy 子代理插件设置页(注册 plugins.item,进「内置插件 → 插件列表」条目详情,
+// 与官方 subagent/shell 设置页同机制)。
 // 复用 dsh primitives 组件(Button/图标/writeClipboard)与官方
 // ui-settings-plugins 的 PluginCard/fields CSS(注入同款样式类)。
 // 检测/测试走 api.llm.discoverModels({settingsNs:'codebuddy', provider:'status'|'test'}),
@@ -30,6 +31,7 @@ window.__ModuleLoader__.load({
       chevron: '.dshCb_chevron{color:var(--dsw-alias-label-tertiary);flex:none;transition:transform .16s}',
       chevronOpen: '.dshCb_chevronOpen{transform:rotate(180deg)}',
       body: '.dshCb_body{border-top:1px solid var(--dsw-alias-border-l2);margin:0 16px;padding-bottom:8px}',
+      page: '.dshCb_page{display:flex;flex-direction:column}',
       field: '.dshCb_field{flex-direction:column;gap:6px;padding:12px 0;display:flex}',
       fieldTop: '.dshCb_field+.dshCb_field{border-top:1px solid var(--dsw-alias-border-l2)}',
       fieldHead: '.dshCb_fieldHead{align-items:center;gap:8px;display:flex}',
@@ -60,6 +62,7 @@ window.__ModuleLoader__.load({
       card: 'dshCb_card', cardOpen: 'dshCb_cardOpen', header: 'dshCb_header',
       headText: 'dshCb_headText', name: 'dshCb_name', description: 'dshCb_description',
       chevron: 'dshCb_chevron', chevronOpen: 'dshCb_chevronOpen', body: 'dshCb_body',
+      page: 'dshCb_page',
       field: 'dshCb_field', fieldHead: 'dshCb_fieldHead', label: 'dshCb_label',
       hint: 'dshCb_hint', badge: 'dshCb_badge', code: 'dshCb_code',
       pre: 'dshCb_pre', row: 'dshCb_row', modelField: 'dshCb_modelField',
@@ -99,7 +102,8 @@ window.__ModuleLoader__.load({
     }
 
     function CodebuddyCard(props) {
-      const [open, setOpen] = react.useState(false)
+      // 列表摘要视图:一句话(官方 ItemCard 的 description 渲染此返回值)。
+      if (props.view === 'summary') return 'CodeBuddy 作为主模型与子代理 provider:默认模型/工具桥配置,检测与安装说明'
       const [checking, setChecking] = react.useState(false)
       const [testing, setTesting] = react.useState(false)
       const [statusText, setStatusText] = react.useState('')
@@ -159,10 +163,9 @@ window.__ModuleLoader__.load({
       }, [])
 
       react.useEffect(() => {
-        if (!open) return
         // 只加载存储的历史值,不自动拉取模型列表(点"获取模型"时才请求)。
         loadConfig()
-      }, [open, loadConfig])
+      }, [loadConfig])
 
       // 提交默认模型:非空 = set,空 = unset(重置为 schema 默认,不写空字符串)。
       const writeModel = react.useCallback(async (value) => {
@@ -214,20 +217,8 @@ window.__ModuleLoader__.load({
         setPickerOpen(false)
       }, [writeModel])
 
-      return react.createElement('li', { className: `${C.card} ${open ? C.cardOpen : ''}` },
-        // 卡片头(与官方 PluginCard 一致)
-        react.createElement('button', {
-          type: 'button', className: C.header, 'aria-expanded': open,
-          'aria-label': `${open ? '收起' : '展开'}: CodeBuddy`,
-          onClick: () => setOpen(!open),
-        },
-          react.createElement('span', { className: C.headText },
-            react.createElement('span', { className: C.name }, 'CodeBuddy'),
-            react.createElement('span', { className: C.description }, 'CodeBuddy 作为主模型(模型选择器可选)与子代理 provider;默认配置、检测安装/登录、连通性测试、安装命令与工具说明'),
-          ),
-          react.createElement(IconChevronDownOutlineMedium, { className: `${C.chevron} ${open ? C.chevronOpen : ''}` }),
-        ),
-        open && react.createElement('div', { className: C.body },
+      // 详情页:直接铺开字段(官方 plugins.item 详情页自带标题与说明,不画卡片头)。
+      return react.createElement('div', { className: C.page },
           // 检测与测试
           react.createElement('div', { className: C.row },
             react.createElement(Button, {
@@ -337,7 +328,6 @@ window.__ModuleLoader__.load({
                     )),
                   ),
           ),
-        ),
       )
     }
 
@@ -348,16 +338,16 @@ window.__ModuleLoader__.load({
         scope: codebuddyScope,
       })
       ctx.effect(() => {
-        return ctx.slots.inject('settings.plugins.tab', () => {
+        return ctx.slots.inject('plugins.item', () => {
           return ctx.slots.register({
-            name: 'settings.plugins.tab',
-            id: 'subagent-codebuddy',
-            order: 31,
+            name: 'plugins.item',
+            id: 'codebuddy',
+            order: 54,
             label: () => 'CodeBuddy',
             inject: sectionInject,
           }, CodebuddyCard)
         })
-      }, 'subagent-codebuddy-client: settings.plugins.tab')
+      }, 'subagent-codebuddy-client: plugins.item')
     }
 
     exports.apply = apply
