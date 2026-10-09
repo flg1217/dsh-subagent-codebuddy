@@ -262,8 +262,11 @@ export function registerCompactDelegation(deps: CompactCommandDeps): void {
   // agent/created 让接管在首个 step 之前就位(compaction 的 pre-step 监听器
   // 注册得比我们早,晚一步就要多压一次)。recompose 等"先创建后 join preset"
   // 的路径此时还取不到实例,由下面的 step 边界复核补上。
+  // 末尾的 `return undefined` 是 0.2.1 的事件契约:handler 必须返回
+  // `Promise<undefined> | undefined`,块体箭头推断出的 `void` 不可赋值。
   deps.ctx.on('agent/created', ({ agent }) => {
     ensureTakeover(deps, engineForAgent(deps, agent), 'agent/created')
+    return undefined
   })
   // 自愈复核:每个 step 边界检查一次接管是否仍在(命中缓存即返回,零成本)。
   // 覆盖服务被替换、热重载、接管被清掉等"静默丢失"的路径——压缩风暴的代价
@@ -574,7 +577,7 @@ export function mountCompactCommand(deps: CompactCommandDeps): void {
       // cordis 的服务访问必须在 inject 作用域内(直接读 agent.ctx.commands 会抛
       // "cannot get property \"commands\" without inject",并让 session/create 失败)。
       const agentCtx = (payload.agent as { ctx?: Context } | undefined)?.ctx
-      if (agentCtx?.inject === undefined) return
+      if (agentCtx?.inject === undefined) return undefined
       agentCtx.inject(['commands'], (scoped: Context) => {
         const face = scoped as unknown as { commands?: ScopedCommandsFace }
         if (face.commands?.register === undefined) return
@@ -586,6 +589,8 @@ export function mountCompactCommand(deps: CompactCommandDeps): void {
           })
         } catch { /* 重复挂载/名字冲突:保留全局命令 */ }
       })
+      // 0.2.1 事件契约要求 handler 返回 `Promise<undefined> | undefined`。
+      return undefined
     })
   })
 }

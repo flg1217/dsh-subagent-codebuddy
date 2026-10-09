@@ -352,7 +352,8 @@ function appendMirroredCompaction(
   })
   // checkpoint 必须与 dsh 原生压缩逐字同形:
   // - createUserMessage 带 role:'user' 与稳定 id(会话层校验 user/message 形状);
-  // - source 带 compact 标记(UI 靠它识别成压缩卡而不是普通用户消息);
+  // - source 带 compact-checkpoint 标记(0.2.1 起 UI 与序列化层靠这个 kind
+  //   识别压缩卡/压缩边界,旧 `{ kind:'plugin', plugin:'compact' }` 已退役);
   // - sourceEventSeqs 必须覆盖每一个被遮蔽节点(会话层强校验),写法与
   //   region.ts 一致:[startSeq, summarySeq, ...shadowedSeqs]。
   const checkpoint = createUserMessage({
@@ -361,7 +362,9 @@ function appendMirroredCompaction(
       { type: 'text', text: summaryText },
       { type: 'text', text: SUMMARY_CLOSE_TAG },
     ],
-    source: { kind: 'plugin', plugin: 'compact', compactionId },
+    // ponytail: kind 字面量 + as never(不引 @deepseek-ai/dsh-compaction 依赖);
+    // 该包升级改名时这里要靠会话迁移表 RENAMED_PRODUCERS 同步。
+    source: { kind: 'compact-checkpoint', compactionId },
   } as never)
   session.append('user/message', checkpoint, {
     surfaceOp: { op: 'replace', start: range.start, end: range.end },

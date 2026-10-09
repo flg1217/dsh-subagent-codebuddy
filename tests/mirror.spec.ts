@@ -301,9 +301,10 @@ describe('SubagentMirror:工具结果图片', () => {
       await mirror.syncOnce()
       await mirror.finish()
       const result = events.find(e => e.type === 'tool/result')
+      // 0.2.1:tool/result 消息的 content 直接是结果块数组(无旧 tool-result 包装)。
       const blocks = (result!.data as {
-        message: { content: Array<{ content?: Array<Record<string, unknown>> }> }
-      }).message.content[0]!.content ?? []
+        message: { content: Array<Record<string, unknown>> }
+      }).message.content
       expect(blocks.some(b => b['type'] === 'image')).toBe(true)
       expect(JSON.stringify(blocks).includes('data:image')).toBe(false)
       expect(saved).toEqual([{ mediaType: 'image/png', bytes: Buffer.from(png, 'base64').byteLength }])

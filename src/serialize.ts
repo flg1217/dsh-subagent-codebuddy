@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, Message, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageReadGuidance } from './pump.js'
 
 /** 续跑兜底:仅当没有可补发内容时使用。 */
@@ -83,8 +83,10 @@ export interface SerializedPrompt {
   skippedForwarded?: boolean
 }
 
-/** 一条消息的可读文本(text + tool-call + tool-result 内嵌文本;图片走内容块)。 */
-function messageText(message: Message): string {
+/** 一条消息的可读文本(text + tool-call 内嵌文本;图片走内容块)。
+ * 工具结果在 0.2.1 起是独立的 `role: 'tool'` 消息,其 content 直接就是结果块,
+ * 由 text 分支天然收集。 */
+function messageText(message: RequestMessage): string {
   const parts: string[] = []
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
@@ -92,10 +94,6 @@ function messageText(message: Message): string {
       // 其他模型轮次的工具调用必须可见:不落文本的话纯工具调用的 assistant
       // 消息文本为空、整条被跳过,CLI 只见结果不见调用(实测丢失)。
       parts.push(`[tool call: ${block.name} ${block.arguments}]`)
-    } else if (block.type === 'tool-result') {
-      for (const inner of block.content) {
-        if (inner.type === 'text') parts.push(inner.text)
-      }
     }
   }
   return parts.join('')
@@ -130,7 +128,7 @@ interface CollectedImages {
  */
 async function collectImages(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
 ): Promise<CollectedImages> {
   const attachments = ctx.get('attachments')
   const images: Array<{ data: string; mimeType: string }> = []
@@ -171,18 +169,13 @@ async function collectImages(
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === 'image') await push(block)
-      else if (block.type === 'tool-result') {
-        for (const inner of block.content) {
-          if (inner.type === 'image') await push(inner)
-        }
-      }
     }
   }
   return { images, paths }
 }
 
-/** 该消息内图片的落盘路径(含 tool-result 内嵌,按出现顺序去重)。 */
-function imagePathsOf(message: Message, paths: ReadonlyMap<string, string>): string[] {
+/** 该消息内图片的落盘路径(按出现顺序去重;0.2.1 起 tool 结果已是独立消息,图片直接在其 content 里)。 */
+function imagePathsOf(message: RequestMessage, paths: ReadonlyMap<string, string>): string[] {
   const found: string[] = []
   const push = (block: { attachment?: { attachmentId?: unknown } }): void => {
     const id = String(block.attachment?.attachmentId ?? '')
@@ -191,11 +184,6 @@ function imagePathsOf(message: Message, paths: ReadonlyMap<string, string>): str
   }
   for (const block of message.content) {
     if (block.type === 'image') push(block)
-    else if (block.type === 'tool-result') {
-      for (const inner of block.content) {
-        if (inner.type === 'image') push(inner)
-      }
-    }
   }
   return found
 }
@@ -207,16 +195,19 @@ function imagePathsOf(message: Message, paths: ReadonlyMap<string, string>): str
  * 工作区指令、技能目录)同样是 user 角色、且排在用户消息**之后**,
  * 按"最后一条 user 角色"取会把用户输入整条顶掉——实测:压缩完成后
  * 被 claim 的排队消息丢失,模型只看到技能目录提醒。
+ * 0.2.1 起请求级输入(`RequestUserInput`,无 id 无 source)也是用户输入,
+ * 同样命中;它不可能来自插件注入(注入必有 source)。
  *
  * 命中 skipIds(该输入已插话投递过,CLI 已见过)时返回 skippedForwarded,
  * 调用方空跑收尾,不重复发送。
  */
 export async function lastUserPrompt(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   skipIds?: ReadonlySet<string>,
 ): Promise<SerializedPrompt> {
-  const last = [...messages].reverse().find(message => message.role === 'user' && message.source.kind === 'user')
+  const last = [...messages].reverse().find(message =>
+    message.role === 'user' && (message.source === undefined || message.source.kind === 'user'))
   if (last === undefined) return { prompt: CONTINUE_PROMPT, images: [] }
   if (skipIds !== undefined && skipIds.has(String(last.id))) {
     return { prompt: CONTINUE_PROMPT, images: [], skippedForwarded: true }
@@ -240,10 +231,11 @@ export async function lastUserPrompt(
  * 数量锚(`sentCount`)在历史被压缩/编辑后不可靠——切到其他模型跑一段再切回时,
  * 数量锚越界会让补发退化成"只发最后一条",切换期间的上下文永久丢失(实测)。
  *
- * 锚点已被压缩移除 / 数量锚不可信(越界、已发区内出现压缩 checkpoint)时,
- * **不做整体重建**:CLI 侧对话是持久历史(它有完整上下文,压缩只发生在
- * dsh 视角)——重发 CLI 已知内容会膨胀上下文,且会被当作新任务从头重跑
- * (实测)。只发最后一条用户输入兜底,保证最新指令必达。
+ * 锚点已被压缩遮蔽 / 数量锚不可信(越界、已发区内出现压缩 checkpoint)时,
+ * **不做整体重建**(CLI 侧对话是持久历史,重发 CLI 已知内容会膨胀上下文,
+ * 且会被当作新任务从头重跑——实测),改为**从最后一次压缩 checkpoint 起补发**:
+ * 摘要 + 其后全部。checkpoint 正是那个边界,详见 replayFromCheckpoint。
+ * 连 checkpoint 都没有时才退回"只发最后一条用户输入",保证最新指令必达。
  *
  * 补发按 User/Assistant 序列化;CodeBuddy 自己产生的消息(assistant/tool)与
  * 已中途转发的插入消息(`skipIds`)跳过。
@@ -256,7 +248,7 @@ export async function lastUserPrompt(
  */
 export async function resumeReplayPrompt(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   sentCount: number | undefined,
   skipIds?: ReadonlySet<string>,
   lastSentMessageId?: string,
@@ -265,9 +257,8 @@ export async function resumeReplayPrompt(
   if (lastSentMessageId !== undefined && lastSentMessageId.length > 0) {
     const at = messages.findIndex(message => String(message.id) === lastSentMessageId)
     if (at >= 0) return await replayFrom(ctx, messages, at + 1, skipIds, ownProvider)
-    // 锚点已被压缩移除:定位不到"CLI 尚未见过"的边界,只发最后一条
-    // 用户输入兜底(CLI 有自己的完整上下文,见上)。
-    return await lastUserPrompt(ctx, messages, skipIds)
+    // 锚点已被压缩遮蔽:定位不到"CLI 尚未见过"的精确边界。
+    return await replayFromCheckpoint(ctx, messages, skipIds, ownProvider)
   }
   if (sentCount === undefined) return await lastUserPrompt(ctx, messages, skipIds)
   // 数量锚在两种历史收缩下不可信,都不按它切片:
@@ -275,19 +266,79 @@ export async function resumeReplayPrompt(
   // - 前 sentCount 条里出现压缩 checkpoint(遮蔽段落在已发区内的小幅压缩):
   //   折叠把后续消息拉进"已发"区,未发送的消息会被数量锚静默吞掉。
   if (sentCount > messages.length || hasCompactionCheckpoint(messages, sentCount)) {
-    return await lastUserPrompt(ctx, messages, skipIds)
+    return await replayFromCheckpoint(ctx, messages, skipIds, ownProvider)
   }
   return await replayFrom(ctx, messages, sentCount, skipIds, ownProvider)
 }
 
 /**
- * 前 limit 条里是否有压缩 checkpoint(dsh 原生与镜像压缩的 replace 消息,
- * source 同形:`{ kind:'plugin', plugin:'compact' }`)。数量锚遇到它即不可信。
+ * 锚点不可用时的补发起点:**最后一次压缩 checkpoint**(含它自己)。
+ *
+ * ## 为什么是 checkpoint 而不是"只发最后一条用户输入"(2026-09-24 修)
+ * 旧实现在锚点被压缩吞掉时退化成 `lastUserPrompt` —— **只发最后一条用户输入,
+ * 中途的全部内容丢失**。实测(用户报障「从 cli 切到 dsh 再切回 cli,中途增量的
+ * 消息和上下文压缩都没有正确转换到」):
+ *
+ * ```
+ * 09:21 切回 codebuddy(锚点记在 seq 8284)
+ * 09:32 dsh 侧发生一次压缩,遮蔽 7941→8489 —— 锚点被吞
+ * 之后切回 CLI → findIndex 失败 → 只发最后一条用户输入
+ * ```
+ *
+ * 而 checkpoint 恰好是**正确的边界**:压缩遮蔽了锚点,说明该次压缩发生在锚点
+ * 之后(即会话跑在别的 provider 上的那段时间)——被遮蔽的内容 CLI 侧本来就有
+ * 完整原文,而 checkpoint 之后的一切 CLI 都没见过。所以"摘要 + 其后全部"正好
+ * 是 CLI 缺的那段,既补全又不整体重发(旧的"不整体重建"顾虑仍然成立)。
+ *
+ * 没有任何 checkpoint(锚点被编辑/裁剪等其他原因丢失)→ 才退回只发最后一条。
+ * @param ctx - 插件上下文(读取附件服务)。
+ * @param messages - 当前 dsh 折叠视图的完整消息序列。
+ * @param skipIds - 已在生成中转发过的插入消息 id 集合(可选)。
+ * @param ownProvider - 本插件的 provider 名(用于跳过 CLI 自己的轮次)。
+ * @returns 序列化结果(prompt + 原生图片块)。
  */
-function hasCompactionCheckpoint(messages: readonly Message[], limit: number): boolean {
+async function replayFromCheckpoint(
+  ctx: Context,
+  messages: readonly RequestMessage[],
+  skipIds: ReadonlySet<string> | undefined,
+  ownProvider: string,
+): Promise<SerializedPrompt> {
+  const at = lastCompactionCheckpointIndex(messages)
+  if (at < 0) return await lastUserPrompt(ctx, messages, skipIds)
+  return await replayFrom(ctx, messages, at, skipIds, ownProvider)
+}
+
+/** 最后一次压缩 checkpoint 的下标(没有则 -1)。 */
+function lastCompactionCheckpointIndex(messages: readonly RequestMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (isCompactionCheckpoint(messages[index]!)) return index
+  }
+  return -1
+}
+
+/**
+ * 该消息是否压缩 checkpoint。
+ *
+ * 0.2.1 起每个生产者声明自己的 source kind,旧 `{ kind: 'plugin', plugin: 'compact' }`
+ * 由会话迁移重写为 `{ kind: 'compact-checkpoint' }`(session-format-v3-to-v4 的
+ * RENAMED_PRODUCERS),所以只认新 kind;旧会话在加载时已迁移。
+ * @param message - 折叠视图里的一条消息。
+ * @returns true 表示它是压缩 checkpoint。
+ */
+function isCompactionCheckpoint(message: RequestMessage): boolean {
+  const source = message.source as { kind?: unknown } | undefined
+  return source?.kind === 'compact-checkpoint'
+}
+
+/**
+ * 前 limit 条里是否有压缩 checkpoint(数量锚遇到它即不可信)。
+ * @param messages - 折叠视图的完整消息序列。
+ * @param limit - 数量锚声明的"已发"条数。
+ * @returns true 表示数量锚不可信。
+ */
+function hasCompactionCheckpoint(messages: readonly RequestMessage[], limit: number): boolean {
   for (let index = 0; index < Math.min(limit, messages.length); index += 1) {
-    const source = messages[index]!.source as { kind?: unknown; plugin?: unknown } | undefined
-    if (source?.kind === 'plugin' && source.plugin === 'compact') return true
+    if (isCompactionCheckpoint(messages[index]!)) return true
   }
   return false
 }
@@ -305,14 +356,14 @@ function hasCompactionCheckpoint(messages: readonly Message[], limit: number): b
  */
 async function replayFrom(
   ctx: Context,
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
   start: number,
   skipIds: ReadonlySet<string> | undefined,
   ownProvider: string,
 ): Promise<SerializedPrompt> {
   let skippedForwarded = false
   let ownTurn = true
-  const selected: Message[] = []
+  const selected: RequestMessage[] = []
   for (let index = start; index < messages.length; index += 1) {
     const message = messages[index]!
     if (skipIds !== undefined && skipIds.has(String(message.id))) {
@@ -323,7 +374,7 @@ async function replayFrom(
       const source = message.source as { kind?: unknown; provider?: unknown } | undefined
       ownTurn = source?.kind === 'model' && source.provider === ownProvider
       if (ownTurn) continue
-    } else if (message.source.kind === 'tool' && ownTurn) {
+    } else if (message.source?.kind === 'tool' && ownTurn) {
       continue
     }
     selected.push(message)
@@ -354,7 +405,7 @@ export async function buildPrompt(
 async function serializeParts(
   ctx: Context,
   parts: string[],
-  messages: readonly Message[],
+  messages: readonly RequestMessage[],
 ): Promise<SerializedPrompt> {
   const { images, paths } = await collectImages(ctx, messages)
   for (const message of messages) {

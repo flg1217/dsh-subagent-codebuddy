@@ -20,9 +20,23 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 
-/** 消息 source.plugin 名。 */
+/** 消息 source 名(也是本插件注册的 provider/路由名)。 */
 const PLUGIN_NAME = 'codebuddy'
+
+/**
+ * 本插件注入消息的 source。
+ *
+ * 0.2.1 起 `MessageSourceMap` 是 merge-extensible 的:每个生产者在自己的
+ * 模块里声明 kind,通用的 `'plugin'` 兜底已退役(会话格式 v4 明确拒绝
+ * `kind: 'plugin'`)。UI 按 `form: 'notice' + summary` 渲染折叠行,与 kind 无关。
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'codebuddy': { kind: 'codebuddy' } & ContextFormed
+  }
+}
 
 /** 从 session/event 载荷取会话 id(与 pump 的取法一致)。 */
 function sessionIdOf(session: unknown): string | undefined {
@@ -115,8 +129,7 @@ export function installModelSwitchToolGuide(ctx: Context): void {
     const ours = createUserMessage({
       content: [{ type: 'text', text }],
       source: {
-        kind: 'plugin',
-        plugin: PLUGIN_NAME,
+        kind: 'codebuddy',
         form: 'notice',
         summary: boundContextSummary(`tools: ${target.from ?? '(new)'} → ${target.to}`),
       },
